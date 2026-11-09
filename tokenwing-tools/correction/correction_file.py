@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""The correction file: the trained ridge correction of the router-trick guess, one matrix per (target layer, lead).
+Built for Ling 3.0 Flash: the model's shape (NE, ND below) is built in.  This module is the reference WRITER and the reference LOADER (what the engine must do at load).
+
+    write_correction(path, model_info, pairs, extra)   pairs: {(target, lead): Bt float32 [n_expert, n_embd]} plus per-pair meta
+    load_correction(path, gguf_path)                   -> (header dict, {(target, lead): Bt memmap}); raises CorrectionFileError
+
+The guess of target layer X made `lead` layers early from source layer L = X - lead:
+    x0 = RMSNorm(residual + shared expert of L)            (the normed base WITHOUT any gain)
+    plain logits      = W_X (g_X * x0)                     (g_X = blk.X.ffn_norm.weight)
+    corrected logits  = plain + x0 @ B = (W_X diag(g_X) + Bt) x0          Bt = B^T  [n_expert, n_embd]  (what the file holds)
+"""
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "gguf-py"))
+import hashlib, json, os, struct
+import numpy as np
+
+MAGIC = b"TWCORR01"
+FORMAT = 1
+ALIGN = 4096
+NE, ND = 512, 2560
+
+
+class CorrectionFileError(Exception):
+    pass
+
+
+def _gguf(path):
+    from gguf import GGUFReader
+    return GGUFReader(path)
+
+
+def _field(rd, key, default=None):
+    f = rd.fields.get(key)
+    if f is None:
+        return default
+    try:
+        v = f.parts[f.data[0]]
+        if f.types and f.types[0].name == "STRING":
+            return bytes(v).decode()
+        return v.tolist()[0] if v.size == 1 else v.tolist()
+    except Exception:
+        return default
+
+
+def model_info(gguf_path, layers):
+    """The identity of a model for the file: architecture, sizes, and a sha256 over the router tensors of `layers` (ffn_gate_inp.weight,
+    exp_probs_b.bias, ffn_norm.weight, as stored, in this order, for X in `layers`).  All three must be F32."""
+    rd = _gguf(gguf_path)
+    tn = {t.name: t for t in rd.tensors}
+    arch = _field(rd, "general.architecture", "?")
+    h = hashlib.sha256()
+    shape = None
+    for X in layers:
+        for nm in ("blk.%d.ffn_gate_inp.weight" % X, "blk.%d.exp_probs_b.bias" % X, "blk.%d.ffn_norm.weight" % X):
+            if nm not in tn:
+                raise CorrectionFileError("model has no tensor %s" % nm)
+            t = tn[nm]
+            if t.tensor_type.name != "F32":
+                raise CorrectionFileError("tensor %s is %s, not F32" % (nm, t.tensor_type.name))
+            h.update(np.ascontiguousarray(np.asarray(t.data)).tobytes())
+            if nm.endswith("ffn_gate_inp.weight"):
+                shape = [int(x) for x in t.shape][::-1]            # [n_expert, n_embd]
+    return {"arch": arch, "name": _field(rd, "general.name", ""), "n_layer": _field(rd, "%s.block_count" % arch),
+            "n_expert": shape[0], "n_embd": shape[1], "layers": list(layers), "router_sha256": h.hexdigest(),
+            "hash_of": "sha256 over, for X in layers: blk.X.ffn_gate_inp.weight, blk.X.exp_probs_b.bias, blk.X.ffn_norm.weight (raw F32 bytes)"}
+
+
+def write_correction(path, minfo, pairs, extra):
+    """pairs: {(target, lead): (Bt float32 [NE, ND], meta dict)}.  Writes atomically (tmp + rename)."""
+    keys = sorted(pairs)
+    nbytes = NE * ND * 4
+    # header first with provisional offsets to learn its size; the JSON length is fixed by padding the offsets to a constant width
+    def build(payload_start):
+        off = payload_start
+        plist = []
+        for (X, d) in keys:
+            plist.append({"target": X, "lead": d, "source": X - d, "offset": off, "nbytes": nbytes, "shape": [NE, ND], "dtype": "f32", **pairs[(X, d)][1]})
+            off += nbytes
+        return plist, off
+    payload_start = ALIGN * 16
+    while True:
+        plist, size = build(payload_start)
+        hdr = {"format": FORMAT, "model": minfo, "fold": "W' = W_X diag(g_X) + Bt  (applied to x0 = the normed base without gain); lead d: source layer = X - d",
+               "pairs": plist, "payload_start": payload_start, "file_size": size, **extra}
+        # payload hash needs the payload: hash the pairs in order (all pairs are contiguous, each nbytes, no padding between)
+        h = hashlib.sha256()
+        for k in keys:
+            h.update(np.ascontiguousarray(pairs[k][0], dtype="<f4").tobytes())
+        hdr["payload_sha256"] = h.hexdigest()
+        js = json.dumps(hdr, sort_keys=True).encode()
+        if 64 + len(js) <= payload_start:
+            break
+        payload_start += ALIGN * 16
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(MAGIC + struct.pack("<QQQ", len(js), payload_start, size) + hashlib.sha256(js).digest() + js)
+        f.write(b"\0" * (payload_start - f.tell()))
+        for k in keys:
+            f.write(np.ascontiguousarray(pairs[k][0], dtype="<f4").tobytes())
+        assert f.tell() == size, (f.tell(), size)
+    os.replace(tmp, path)
+    return size
+
+
+def load_correction(path, gguf_path, verify_payload=True):
+    """The loader contract.  Refuses (CorrectionFileError, message says why): short file, wrong magic, size differs from the header's
+    (truncated / extended), header hash, unknown format, another model (arch, sizes, router hash), a pair table that does not fit the file
+    or the model, payload hash.  Returns (header, {(target, lead): memmap [NE, ND] float32 read-only})."""
+    sz = os.path.getsize(path)
+    if sz < 64:
+        raise CorrectionFileError("file is %d bytes: shorter than the 64-byte preamble" % sz)
+    with open(path, "rb") as f:
+        pre = f.read(64)
+        if pre[:8] != MAGIC:
+            raise CorrectionFileError("bad magic %r (not a TokenWing correction file, or another format version)" % pre[:8])
+        jl, ps, fs = struct.unpack("<QQQ", pre[8:32])
+        if fs != sz:
+            raise CorrectionFileError("file is %d bytes but the header says %d (truncated or extended)" % (sz, fs))
+        if jl > ps or ps > sz or ps % ALIGN:
+            raise CorrectionFileError("header sizes inconsistent (json %d, payload_start %d, file %d)" % (jl, ps, sz))
+        js = f.read(jl)
+    if hashlib.sha256(js).digest() != pre[32:64]:
+        raise CorrectionFileError("header hash mismatch (header bytes changed)")
+    try:
+        hdr = json.loads(js)
+    except Exception as e:
+        raise CorrectionFileError("header is not valid JSON: %s" % e)
+    if hdr.get("format") != FORMAT:
+        raise CorrectionFileError("format %r, this loader reads %d" % (hdr.get("format"), FORMAT))
+    mi = hdr["model"]
+    cur = model_info_light(gguf_path)
+    for k in ("arch", "n_layer", "n_expert", "n_embd"):
+        if mi.get(k) != cur[k]:
+            raise CorrectionFileError("another model: %s is %r in the file, %r in the model" % (k, mi.get(k), cur[k]))
+    real = model_info(gguf_path, mi["layers"])
+    if real["router_sha256"] != mi["router_sha256"]:
+        raise CorrectionFileError("another model or quant: the router tensors' sha256 differs (file %s.., model %s..)" % (mi["router_sha256"][:12], real["router_sha256"][:12]))
+    seen = []
+    nb = NE * ND * 4
+    for p in hdr["pairs"]:
+        X, d, off = p["target"], p["lead"], p["offset"]
+        if p["shape"] != [mi["n_expert"], mi["n_embd"]] or p["nbytes"] != nb or p["dtype"] != "f32":
+            raise CorrectionFileError("pair (%s, %s): shape %s / %s bytes do not fit the model" % (X, d, p["shape"], p["nbytes"]))
+        if off < ps or off % ALIGN or off + nb > sz:
+            raise CorrectionFileError("pair (%s, %s): offset %d outside the payload" % (X, d, off))
+        if p["source"] != X - d or X not in mi["layers"]:
+            raise CorrectionFileError("pair (%s, %s): source layer / target layer not valid" % (X, d))
+        seen.append((off, off + nb))
+    seen.sort()
+    for a, b in zip(seen, seen[1:]):
+        if a[1] > b[0]:
+            raise CorrectionFileError("two pairs overlap in the file")
+    if verify_payload:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            f.seek(ps)
+            while True:
+                b = f.read(1 << 24)
+                if not b:
+                    break
+                h.update(b)
+        if h.hexdigest() != hdr["payload_sha256"]:
+            raise CorrectionFileError("payload hash mismatch (matrix bytes changed)")
+    out = {}
+    for p in hdr["pairs"]:
+        out[(p["target"], p["lead"])] = np.memmap(path, dtype="<f4", mode="r", offset=p["offset"], shape=(NE, ND))
+    return hdr, out
+
+
+def model_info_light(gguf_path):
+    rd = _gguf(gguf_path)
+    arch = _field(rd, "general.architecture", "?")
+    t = next(t for t in rd.tensors if t.name.endswith("ffn_gate_inp.weight"))
+    sh = [int(x) for x in t.shape][::-1]
+    return {"arch": arch, "n_layer": _field(rd, "%s.block_count" % arch), "n_expert": sh[0], "n_embd": sh[1]}

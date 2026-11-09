@@ -1,0 +1,2 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Write a modern C++20 function that reads a directory recursively and returns a map from file extension to total size in bytes. Use <filesystem>, structured bindings and `std::ranges`. Skip files larger than 100 MiB and say why in a comment.<|role_end|><role>ASSISTANT</role>
+<think>

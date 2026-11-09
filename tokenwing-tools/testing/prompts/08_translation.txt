@@ -1,0 +1,4 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Translate the following English paragraph into German, then into Japanese. Keep the register formal and do not add commentary.
+
+The council voted on Tuesday to postpone the decision until the spring, citing a lack of funds and an incomplete environmental assessment. Several members said they would prefer to publish the full assessment before any vote is taken again.<|role_end|><role>ASSISTANT</role>
+<think>

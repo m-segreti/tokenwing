@@ -1,0 +1,2 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Write a Python function `dijkstra(graph, source)` where graph is a dict mapping nodes to lists of (neighbour, weight) tuples. Use a heap, handle negative weights by raising a ValueError, and add a type-annotated version using `heapq` and `collections`. Add a docstring with a doctest example.<|role_end|><role>ASSISTANT</role>
+<think>

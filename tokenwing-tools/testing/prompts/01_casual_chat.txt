@@ -1,0 +1,2 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Hey! I've had a genuinely weird afternoon. I went to the corner shop for milk and came home with a tub of ice cream, a bag of flour, and no milk. How does that even happen? Tell me your theory.<|role_end|><role>ASSISTANT</role>
+<think>

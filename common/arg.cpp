@@ -1,0 +1,6612 @@
+#include "arg.h"
+
+#include "build-info.h"
+#include "chat.h"
+#include "common.h"
+#include "download.h"
+#include "json-schema-to-grammar.h"
+#include "json.h"
+#include "llama.h"
+#include "log.h"
+#include "sampling.h"
+#include "speculative.h"
+#include "preset.h"
+
+// fix problem with std::min and std::max
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#   define NOMINMAX
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
+#include <algorithm>
+#include <cinttypes>
+#include <climits>
+#include <cmath>
+#include <cstdarg>
+#include <filesystem>
+#include <fstream>
+#include <list>
+#include <numeric>
+#include <regex>
+#include <set>
+#include <string>
+#include <system_error>
+#include <thread> // for hardware_concurrency
+#include <vector>
+
+#ifndef __EMSCRIPTEN__
+#ifdef __linux__
+#include <linux/limits.h>
+#elif defined(_WIN32)
+#   if !defined(PATH_MAX)
+#   define PATH_MAX MAX_PATH
+#   endif
+#elif defined(_AIX)
+#include <sys/limits.h>
+#else
+#include <sys/syslimits.h>
+#endif
+#endif
+
+#define LLAMA_MAX_URL_LENGTH 2084 // Maximum URL Length in Chrome: 2083
+
+using json = common_json;
+using namespace common_arg_utils;
+
+static std::initializer_list<enum llama_example> mmproj_examples = {
+    LLAMA_EXAMPLE_MTMD,
+    LLAMA_EXAMPLE_SERVER,
+    LLAMA_EXAMPLE_CLI,
+    LLAMA_EXAMPLE_TTS,
+};
+
+static std::string read_file(const std::string & fname) {
+    std::ifstream file(fname);
+    if (!file) {
+        throw std::runtime_error(string_format("error: failed to open file '%s'\n", fname.c_str()));
+    }
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+    return content;
+}
+
+static const std::vector<common_arg> & get_common_arg_defs() {
+    static const std::vector<common_arg> options = [] {
+        common_params params;
+        auto ctx = common_params_parser_init(params, LLAMA_EXAMPLE_SERVER, nullptr);
+        return ctx.options;
+    }();
+    return options;
+}
+
+common_arg & common_arg::set_examples(std::initializer_list<enum llama_example> examples) {
+    this->examples = examples;
+    return *this;
+}
+
+common_arg & common_arg::set_excludes(std::initializer_list<enum llama_example> excludes) {
+    this->excludes = excludes;
+    return *this;
+}
+
+common_arg & common_arg::set_env(const char * env) {
+    help = help + "\n(env: " + env + ")";
+    this->env = env;
+    return *this;
+}
+
+common_arg & common_arg::set_sampling() {
+    is_sampling = true;
+    return *this;
+}
+
+common_arg & common_arg::set_spec() {
+    is_spec = true;
+    return *this;
+}
+
+common_arg & common_arg::set_preset_only() {
+    is_preset_only = true;
+    return *this;
+}
+
+bool common_arg::in_example(enum llama_example ex) {
+    return examples.find(ex) != examples.end();
+}
+
+bool common_arg::is_exclude(enum llama_example ex) {
+    return excludes.find(ex) != excludes.end();
+}
+
+bool common_arg::get_value_from_env(std::string & output) const {
+    if (env == nullptr) return false;
+    if (!args_neg.empty()) {
+        // for compatibility, we need to check LLAMA_ARG_NO_ env as well
+        std::string neg_env = env;
+        string_replace_all(neg_env, "LLAMA_ARG_", "LLAMA_ARG_NO_");
+        char * neg_value = std::getenv(neg_env.c_str());
+        if (neg_value) {
+            output = "0"; // falsey
+            return true;
+        }
+    }
+    char * value = std::getenv(env);
+    if (value) {
+        output = value;
+        return true;
+    }
+    return false;
+}
+
+bool common_arg::has_value_from_env() const {
+    if (env != nullptr && !args_neg.empty()) {
+        // for compatibility, we need to check LLAMA_ARG_NO_ env as well
+        std::string neg_env = env;
+        string_replace_all(neg_env, "LLAMA_ARG_", "LLAMA_ARG_NO_");
+        if (std::getenv(neg_env.c_str())) {
+            return true;
+        }
+    }
+    return env != nullptr && std::getenv(env);
+}
+
+static std::vector<std::string> break_str_into_lines(std::string input, size_t max_char_per_line) {
+    std::vector<std::string> result;
+    std::istringstream iss(input);
+    std::string line;
+    auto add_line = [&](const std::string& l) {
+        if (l.length() <= max_char_per_line) {
+            result.push_back(l);
+        } else {
+            std::istringstream line_stream(l);
+            std::string word, current_line;
+            while (line_stream >> word) {
+                if (current_line.length() + !current_line.empty() + word.length() > max_char_per_line) {
+                    if (!current_line.empty()) result.push_back(current_line);
+                    current_line = word;
+                } else {
+                    current_line += (!current_line.empty() ? " " : "") + word;
+                }
+            }
+            if (!current_line.empty()) result.push_back(current_line);
+        }
+    };
+    while (std::getline(iss, line)) {
+        add_line(line);
+    }
+    return result;
+}
+
+std::string common_arg::to_string() const {
+    // params for printing to console
+    const static int n_leading_spaces = 40;
+    const static int n_char_per_line_help = 70; // TODO: detect this based on current console
+    std::string leading_spaces(n_leading_spaces, ' ');
+
+    std::ostringstream ss;
+    auto all_args = get_args(); // also contains args_neg
+    for (const auto & arg : all_args) {
+        if (arg == all_args.front()) {
+            if (all_args.size() == 1) {
+                ss << arg;
+            } else {
+                // first arg is usually abbreviation, we need padding to make it more beautiful
+                auto tmp = std::string(arg) + ", ";
+                auto spaces = std::string(std::max(0, 7 - (int)tmp.size()), ' ');
+                ss << tmp << spaces;
+            }
+        } else {
+            ss << arg << (arg != all_args.back() ? ", " : "");
+        }
+    }
+    if (value_hint) ss << " " << value_hint;
+    if (value_hint_2) ss << " " << value_hint_2;
+    if (ss.tellp() > n_leading_spaces - 3) {
+        // current line is too long, add new line
+        ss << "\n" << leading_spaces;
+    } else {
+        // padding between arg and help, same line
+        ss << std::string(leading_spaces.size() - ss.tellp(), ' ');
+    }
+    const auto help_lines = break_str_into_lines(help, n_char_per_line_help);
+    for (const auto & line : help_lines) {
+        ss << (&line == &help_lines.front() ? "" : leading_spaces) << line << "\n";
+    }
+    return ss.str();
+}
+
+std::vector<std::string> common_arg::get_args() const {
+    std::vector<std::string> result;
+    for (const auto & arg : args) {
+        result.push_back(std::string(arg));
+    }
+    for (const auto & arg : args_neg) {
+        result.push_back(std::string(arg));
+    }
+    return result;
+}
+
+std::vector<std::string> common_arg::get_env() const {
+    std::vector<std::string> result;
+    if (env) {
+        result.push_back(std::string(env));
+    }
+    if (!args_neg.empty() && env) {
+        // for compatibility, we need to add LLAMA_ARG_NO_ variant
+        std::string neg_env = env;
+        string_replace_all(neg_env, "LLAMA_ARG_", "LLAMA_ARG_NO_");
+        result.push_back(neg_env);
+    }
+    return result;
+}
+
+//
+// utils
+//
+
+// Helper function to parse tensor buffer override strings
+static void parse_tensor_buffer_overrides(const std::string & value, std::vector<llama_model_tensor_buft_override> & overrides) {
+    ggml_backend_load_all();
+
+    std::map<std::string, ggml_backend_buffer_type_t> buft_list;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        auto * buft = ggml_backend_dev_buffer_type(dev);
+        if (buft) {
+            buft_list[ggml_backend_buft_name(buft)] = buft;
+        }
+    }
+
+    for (const auto & override : string_split<std::string>(value, ',')) {
+        std::string::size_type pos = override.find('=');
+        if (pos == std::string::npos) {
+            throw std::invalid_argument("invalid value");
+        }
+        std::string tensor_name = override.substr(0, pos);
+        std::string buffer_type = override.substr(pos + 1);
+
+        if (buft_list.find(buffer_type) == buft_list.end()) {
+            printf("Available buffer types:\n");
+            for (const auto & it : buft_list) {
+                printf("  %s\n", ggml_backend_buft_name(it.second));
+            }
+            throw std::invalid_argument("unknown buffer type");
+        }
+        // keep strings alive and avoid leaking memory by storing them in a static vector
+        static std::list<std::string> buft_overrides;
+        buft_overrides.push_back(tensor_name);
+        overrides.push_back({buft_overrides.back().c_str(), buft_list.at(buffer_type)});
+    }
+}
+
+static std::string clean_file_name(const std::string & fname) {
+    std::string clean_fname = fname;
+    string_replace_all(clean_fname, "\\", "_");
+    string_replace_all(clean_fname, "/", "_");
+    return clean_fname;
+}
+
+struct handle_model_result {
+    bool found_mmproj = false;
+    common_params_model mmproj;
+
+    bool found_mtp = false;
+    common_params_model mtp;
+
+    bool found_preset = false;
+    std::string preset_path;
+};
+
+const std::vector<ggml_type> kv_cache_types = {
+    GGML_TYPE_F32,
+    GGML_TYPE_F16,
+    GGML_TYPE_BF16,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_IQ4_NL,
+    GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1,
+};
+
+static ggml_type kv_cache_type_from_str(const std::string & s) {
+    for (const auto & type : kv_cache_types) {
+        if (ggml_type_name(type) == s) {
+            return type;
+        }
+    }
+    throw std::runtime_error("Unsupported cache type: " + s);
+}
+
+static std::string get_all_kv_cache_types() {
+    std::ostringstream msg;
+    for (const auto & type : kv_cache_types) {
+        msg << ggml_type_name(type) << (&type == &kv_cache_types.back() ? "" : ", ");
+    }
+    return msg.str();
+}
+
+static bool parse_bool_value(const std::string & value) {
+    if (is_truthy(value)) {
+        return true;
+    } else if (is_falsey(value)) {
+        return false;
+    } else {
+        throw std::invalid_argument("invalid boolean value");
+    }
+}
+
+[[noreturn]] static void arg_removed(const std::string & msg) {
+    throw std::invalid_argument("the argument has been removed. " + msg);
+}
+
+//
+// common_models_handler
+//
+
+static std::string get_default_local_path(const std::string & url) {
+    auto f = string_split<std::string>(url, '#').front();
+    f = string_split<std::string>(f, '?').front();
+    return fs_path_to_utf8(fs_get_cache_file(string_split<std::string>(f, '/').back()));
+}
+
+static bool spec_types_is_default(const common_params & params) {
+    return params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE};
+}
+
+common_models_handler common_models_handler_init(const common_params & params, llama_example curr_ex) {
+    common_download_hf_plan plan;
+    common_download_hf_plan plan_spec;
+    common_download_opts opts;
+
+    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
+                                        params.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
+                                           params.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
+
+    const bool spec_type_draft_eagle3 = std::find(params.speculative.types.begin(),
+                                           params.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params.speculative.types.end();
+
+    const bool spec_type_draft_dspark = std::find(params.speculative.types.begin(),
+                                           params.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.speculative.types.end();
+
+    // only download mmproj if the current example is using it
+    bool use_mmproj = false;
+    for (const auto & ex : mmproj_examples) {
+        if (curr_ex == ex) {
+            use_mmproj = true;
+            break;
+        }
+    }
+    if (curr_ex == LLAMA_EXAMPLE_DOWNLOAD) {
+        use_mmproj = true;
+    }
+
+    opts.bearer_token    = params.hf_token;
+    opts.offline         = params.offline;
+    opts.download_mtp    = spec_type_draft_mtp;
+    opts.download_eagle3 = spec_type_draft_eagle3;
+    opts.download_dflash = spec_type_draft_dflash;
+    opts.download_dspark = spec_type_draft_dspark;
+    opts.download_mmproj = use_mmproj && !params.no_mmproj
+                        && params.mmproj.path.empty() && params.mmproj.url.empty();
+
+    if (!params.model.hf_repo.empty()) {
+        plan = common_download_get_hf_plan(params.model, opts);
+    }
+
+    if (!params.speculative.draft.mparams.hf_repo.empty()) {
+        // without a requested type, discover every sidecar the draft repo ships to infer the type later
+        auto opts_spec = opts;
+        if (spec_types_is_default(params)) {
+            opts_spec.download_mtp    = true;
+            opts_spec.download_dflash = true;
+            opts_spec.download_eagle3 = true;
+            opts_spec.download_dspark = true;
+        }
+        plan_spec = common_download_get_hf_plan(params.speculative.draft.mparams, opts_spec);
+    }
+
+    return common_models_handler{plan, plan_spec, opts};
+}
+
+bool common_models_handler_is_preset_repo(const common_models_handler & handler) {
+    return !handler.plan.preset.url.empty();
+}
+
+static std::vector<common_download_task> build_url_tasks(const common_params_model & model, common_download_opts opts) {
+    auto parts = common_download_get_all_parts(model.url);
+    std::vector<common_download_task> tasks;
+
+    // single-part: download straight to model.path if the user gave one (-m), else the cache default
+    if (parts.size() == 1) {
+        common_download_task task;
+        task.url        = parts[0];
+        task.local_path = model.path.empty() ? get_default_local_path(parts[0]) : model.path;
+        task.opts       = opts;
+        tasks.push_back(std::move(task));
+        return tasks;
+    }
+
+    // multi-part: place each part under the user's -m directory (if given), else the cache default
+    std::string base_dir;
+    if (!model.path.empty()) {
+        auto pos = model.path.rfind('/');
+        base_dir = pos == std::string::npos ? std::string(".") : model.path.substr(0, pos);
+    }
+
+    for (const auto & part : parts) {
+        common_download_task task;
+        task.url  = part;
+        task.opts = opts;
+
+        std::string local = get_default_local_path(part);
+        if (!base_dir.empty()) {
+            auto pos = local.rfind('/');
+            std::string name = pos == std::string::npos ? local : local.substr(pos + 1);
+            local = base_dir + "/" + name;
+        }
+        task.local_path = local;
+        tasks.push_back(std::move(task));
+    }
+    return tasks;
+}
+
+void common_models_handler_apply(common_models_handler & handler, common_params & params, common_download_callback * callback) {
+    std::vector<common_download_task> tasks;
+
+    auto & plan      = handler.plan;
+    auto & plan_spec = handler.plan_spec;
+
+    auto opts = handler.opts; // copy
+    opts.callback = callback;
+
+    // handle plain "url" if needed
+    auto handle_url = [&](common_params_model & model) {
+        if (!model.url.empty()) {
+            if (model.path.empty()) {
+                model.path = get_default_local_path(model.url);
+            }
+        }
+    };
+    handle_url(params.model);
+    handle_url(params.mmproj);
+    handle_url(params.speculative.draft.mparams);
+
+    // optionally, if docker repo is set, resolve it
+    if (!params.model.docker_repo.empty()) {
+        params.model.url  = common_docker_resolve_model(params.model.docker_repo);
+        params.model.path = get_default_local_path(params.model.url);
+    }
+
+    // handle plain "url" tasks (non-hf)
+    if (!params.model.url.empty()) {
+        auto url_tasks = build_url_tasks(params.model, opts);
+        // the first part is what gets loaded, so point params.model.path at it
+        if (!url_tasks.empty()) {
+            std::string first_path = url_tasks.front().local_path;
+            url_tasks.front().on_done = [&, first_path]() { params.model.path = first_path; };
+        }
+        for (auto & task : url_tasks) {
+            tasks.push_back(std::move(task));
+        }
+    }
+    if (!params.mmproj.url.empty()) {
+        common_download_task task;
+        task.url        = params.mmproj.url;
+        task.local_path = params.mmproj.path;
+        task.opts       = opts;
+        tasks.push_back(task);
+    }
+    bool had_spec_url = false;
+    if (!params.speculative.draft.mparams.url.empty()) {
+        common_download_task task;
+        task.url        = params.speculative.draft.mparams.url;
+        task.local_path = params.speculative.draft.mparams.path;
+        task.opts       = opts;
+        tasks.push_back(task);
+        had_spec_url = true;
+    }
+
+    // handle hf_plan tasks
+    auto add_tasks = [&opts, &tasks](const hf_cache::hf_files  & model_files,
+                                    const hf_cache::hf_file    & primary,
+                                    common_params_model        & model) {
+        for (size_t i = 0; i < model_files.size(); ++i) {
+            auto & model_file = model_files[i];
+            bool is_primary = (model_file.path == primary.path);
+            tasks.emplace_back(model_file, opts, [&, is_primary]() {
+                if (is_primary) {
+                    // the primary file is the first split (00001-of), use it as model path
+                    model.path = hf_cache::finalize_file(model_file);
+                } else {
+                    hf_cache::finalize_file(model_file);
+                }
+            });
+        }
+    };
+
+    // an explicit draft file selection (e.g. -md with -hfd) disables the sidecar resolution of the draft repo
+    if (!params.speculative.draft.mparams.hf_file.empty()) {
+        plan_spec.mtp    = {};
+        plan_spec.dflash = {};
+        plan_spec.eagle3 = {};
+        plan_spec.dspark = {};
+    }
+
+    // infer the speculative type from the sidecar shipped by the draft repo when none is requested
+    if (spec_types_is_default(params)) {
+        if (!plan_spec.mtp.local_path.empty()) {
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            plan_spec.dspark = {};
+            plan_spec.dflash = {};
+            plan_spec.eagle3 = {};
+        } else if (!plan_spec.dspark.local_path.empty()) {
+            // dspark outranks dflash, its sidecar carries the extra Markov head
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+            plan_spec.dflash = {};
+            plan_spec.eagle3 = {};
+        } else if (!plan_spec.dflash.local_path.empty()) {
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+            plan_spec.eagle3 = {};
+        } else if (!plan_spec.eagle3.local_path.empty()) {
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 };
+        }
+    }
+
+    // infer the speculative type from the draft GGUF metadata when none is requested
+    // note: reads only the first split - sharded drafts need an explicit --spec-type
+    if (spec_types_is_default(params) && !params.speculative.draft.mparams.path.empty()) {
+        const auto types_gguf = common_speculative_types_from_gguf(params.speculative.draft.mparams.path);
+        if (!types_gguf.empty()) {
+            params.speculative.types = types_gguf;
+        }
+    }
+
+    // when a sidecar type is requested, the draft repo resolves to its sidecar instead of a full model
+    const bool spec_sidecar_found = !plan_spec.mtp.local_path.empty() ||
+                                    !plan_spec.dflash.local_path.empty() ||
+                                    !plan_spec.eagle3.local_path.empty() ||
+                                    !plan_spec.dspark.local_path.empty();
+    if (!plan_spec.mtp.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan_spec.mtp, opts, [&]() {
+            // only use the discovered MTP head when no draft path is set yet
+            if (params.speculative.draft.mparams.path.empty()) {
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.mtp);
+            } else {
+                hf_cache::finalize_file(plan_spec.mtp);
+            }
+        });
+    }
+    if (!plan_spec.dflash.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan_spec.dflash, opts, [&]() {
+            // only use the discovered DFlash sidecar when no draft path is set yet
+            if (params.speculative.draft.mparams.path.empty()) {
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.dflash);
+            } else {
+                hf_cache::finalize_file(plan_spec.dflash);
+            }
+        });
+    }
+    if (!plan_spec.eagle3.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan_spec.eagle3, opts, [&]() {
+            // only use the discovered Eagle3 sidecar when no draft path is set yet
+            if (params.speculative.draft.mparams.path.empty()) {
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.eagle3);
+            } else {
+                hf_cache::finalize_file(plan_spec.eagle3);
+            }
+        });
+    }
+    if (!plan_spec.dspark.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan_spec.dspark, opts, [&]() {
+            // only use the discovered DSpark sidecar when no draft path is set yet
+            if (params.speculative.draft.mparams.path.empty()) {
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan_spec.dspark);
+            } else {
+                hf_cache::finalize_file(plan_spec.dspark);
+            }
+        });
+    }
+
+    // a wired draft sidecar counts as an explicit draft for the main plan fallback below
+    if (spec_sidecar_found) {
+        had_spec_url = true;
+    }
+
+    // handle plan_spec (e.g. --spec-draft-hf)
+    if (!plan_spec.model_files.empty() && !had_spec_url && !spec_sidecar_found) {
+        add_tasks(plan_spec.model_files, plan_spec.primary, params.speculative.draft.mparams);
+        had_spec_url = true;
+    }
+
+    if (!plan.model_files.empty()) {
+        add_tasks(plan.model_files, plan.primary, params.model);
+    }
+    if (!plan.mmproj.local_path.empty()) {
+        tasks.emplace_back(plan.mmproj, opts, [&]() {
+            params.mmproj.path = hf_cache::finalize_file(plan.mmproj);
+        });
+    }
+    if (!plan.mtp.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan.mtp, opts, [&]() {
+            // only fall back to the discovered MTP head when no draft was explicitly provided
+            if (params.speculative.draft.mparams.empty()) {
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.mtp);
+            } else {
+                hf_cache::finalize_file(plan.mtp);
+            }
+        });
+    }
+    if (!plan.dflash.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan.dflash, opts, [&]() {
+            // only fall back to the discovered DFlash sidecar when no draft was explicitly provided
+            if (params.speculative.draft.mparams.empty()) {
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.dflash);
+            } else {
+                hf_cache::finalize_file(plan.dflash);
+            }
+        });
+    }
+    if (!plan.eagle3.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan.eagle3, opts, [&]() {
+            // only fall back to the discovered Eagle3 sidecar when no draft was explicitly provided
+            if (params.speculative.draft.mparams.empty()) {
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.eagle3);
+            } else {
+                hf_cache::finalize_file(plan.eagle3);
+            }
+        });
+    }
+    if (!plan.dspark.local_path.empty() && !had_spec_url) {
+        tasks.emplace_back(plan.dspark, opts, [&]() {
+            // only fall back to the discovered DSpark sidecar when no draft was explicitly provided
+            if (params.speculative.draft.mparams.empty()) {
+                params.speculative.draft.mparams.path = hf_cache::finalize_file(plan.dspark);
+            } else {
+                hf_cache::finalize_file(plan.dspark);
+            }
+        });
+    }
+    if (!plan.preset.local_path.empty()) {
+        tasks.emplace_back(plan.preset, opts, [&]() {
+            // if HF repo is a preset repo, we simply run server in router mode with the preset.ini file
+            params.models_preset_hf = params.model.hf_repo; // only for showing a warning
+            params.models_preset    = hf_cache::finalize_file(plan.preset);
+            // clear the model so the server starts in router mode
+            params.model.path.clear();
+            params.model.hf_repo.clear();
+            params.model.docker_repo.clear();
+        });
+    }
+
+    // run all tasks in parallel
+    if (!params.offline) {
+        // if duplicated files are found, only download once (but still call on_done for each task)
+        std::unordered_map<std::string, common_download_task *> unique_tasks;
+        for (auto & task : tasks) {
+            auto it = unique_tasks.find(task.local_path);
+            if (it == unique_tasks.end()) {
+                unique_tasks[task.local_path] = &task;
+            }
+        }
+        std::vector<common_download_task> unique_tasks_vec;
+        for (auto & pair : unique_tasks) {
+            LOG_DBG("download task: %s -> %s\n", pair.second->url.c_str(), pair.second->local_path.c_str());
+            unique_tasks_vec.push_back(*pair.second);
+        }
+        common_download_run_tasks(unique_tasks_vec);
+    }
+
+    // download successful, update params with the downloaded paths
+    for (const auto & task : tasks) {
+        if (task.on_done) {
+            task.on_done();
+        }
+    }
+}
+
+//
+// CLI argument parsing functions
+//
+
+// apply config files (if present), a later file overrides an earlier one:
+// 1. system-wide: /etc/llama.cpp/config.ini (%PROGRAMDATA%\llama.cpp\config.ini on windows)
+// 2. user-level: ${XDG_CONFIG_HOME:-~/.config}/llama.cpp/config.ini (%APPDATA%\llama.cpp\config.ini on windows)
+static void common_params_apply_system_config(common_params & params, llama_example ex) {
+    std::vector<std::filesystem::path> paths;
+
+#if defined(_WIN32)
+    const std::filesystem::path program_data = common_get_path_from_env("PROGRAMDATA");
+    if (!program_data.empty()) {
+        paths.push_back(program_data / "llama.cpp" / "config.ini");
+    }
+#else
+    paths.push_back("/etc/llama.cpp/config.ini");
+#endif
+
+    try {
+        paths.push_back(fs_get_config_directory() / "config.ini");
+    } catch (const std::exception & e) {
+        LOG_DBG("cannot read user-level config file, skipping: %s\n", e.what());
+    }
+
+    std::vector<std::filesystem::path> found;
+    for (const auto & path : paths) {
+        std::error_code ec;
+        if (std::filesystem::exists(path, ec)) {
+            found.push_back(path);
+        }
+    }
+    if (found.empty()) {
+        return;
+    }
+
+    common_preset_context ctx(ex);
+    ctx.ignore_unknown_keys = true; // the same config file is shared by all programs
+    for (const auto & path : found) {
+        LOG_INF("using config file: %s\n", fs_path_to_utf8(path).c_str());
+        common_preset global;
+        common_presets presets = ctx.load_from_ini(path, global);
+        global.apply_to_params(params);
+        auto it = presets.find(COMMON_PRESET_DEFAULT_NAME);
+        if (it != presets.end()) {
+            it->second.apply_to_params(params);
+        }
+    }
+}
+
+static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
+    common_params & params = ctx_arg.params;
+
+    // setup log directly from params.verbosity: see tools/cli/cli.cpp
+    common_log_set_verbosity_thold(params.verbosity);
+
+    // config file applies first, so env variables and CLI arguments override it
+    common_params_apply_system_config(params, ctx_arg.ex);
+
+    std::unordered_map<std::string, std::pair<common_arg *, bool>> arg_to_options;
+    for (auto & opt : ctx_arg.options) {
+        for (const auto & arg : opt.args) {
+            arg_to_options[arg] = {&opt, /* is_positive */ true};
+        }
+        for (const auto & arg : opt.args_neg) {
+            arg_to_options[arg] = {&opt, /* is_positive */ false};
+        }
+    }
+
+    // handle environment variables
+    for (auto & opt : ctx_arg.options) {
+        std::string value;
+        if (opt.get_value_from_env(value)) {
+            try {
+                if (opt.handler_void && is_truthy(value)) {
+                    opt.handler_void(params);
+                }
+                if (opt.handler_int) {
+                    opt.handler_int(params, std::stoi(value));
+                }
+                if (opt.handler_bool) {
+                    opt.handler_bool(params, parse_bool_value(value));
+                }
+                if (opt.handler_string) {
+                    opt.handler_string(params, value);
+                    continue;
+                }
+            } catch (std::exception & e) {
+                throw std::invalid_argument(string_format(
+                    "error while handling environment variable \"%s\": %s\n\n", opt.env, e.what()));
+            }
+        }
+    }
+
+    // handle command line arguments
+    auto check_arg = [&](int i) {
+        if (i+1 >= argc) {
+            throw std::invalid_argument("expected value for argument");
+        }
+    };
+
+    auto parse_cli_args = [&]() {
+        std::set<std::string> seen_args;
+
+        for (int i = 1; i < argc; i++) {
+            const std::string arg_prefix = "--";
+
+            std::string arg = argv[i];
+            if (arg.compare(0, arg_prefix.size(), arg_prefix) == 0) {
+                std::replace(arg.begin(), arg.end(), '_', '-');
+            }
+            if (arg_to_options.find(arg) == arg_to_options.end()) {
+                throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
+            }
+            if (!seen_args.insert(arg).second) {
+                const bool skip = (arg == "--spec-type");
+
+                if (!skip) {
+                    LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
+                }
+            }
+            auto & tmp = arg_to_options[arg];
+            auto opt = *tmp.first;
+            bool is_positive = tmp.second;
+            if (opt.has_value_from_env()) {
+                fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
+            }
+            try {
+                if (opt.handler_void) {
+                    opt.handler_void(params);
+                    continue;
+                }
+                if (opt.handler_bool) {
+                    opt.handler_bool(params, is_positive);
+                    continue;
+                }
+
+                // arg with single value
+                check_arg(i);
+                std::string val = argv[++i];
+                if (opt.handler_int) {
+                    opt.handler_int(params, std::stoi(val));
+                    continue;
+                }
+                if (opt.handler_string) {
+                    opt.handler_string(params, val);
+                    continue;
+                }
+
+                // arg with 2 values
+                check_arg(i);
+                std::string val2 = argv[++i];
+                if (opt.handler_str_str) {
+                    opt.handler_str_str(params, val, val2);
+                    continue;
+                }
+            } catch (std::exception & e) {
+                throw std::invalid_argument(string_format(
+                    "error while handling argument \"%s\": %s\n\n"
+                    "usage:\n%s\n\nto show complete usage, run with -h",
+                    arg.c_str(), e.what(), opt.to_string().c_str()));
+            }
+        }
+    };
+
+    // parse all CLI args now, so that -hf is available below for remote preset resolution
+    parse_cli_args();
+
+    postprocess_cpu_params(params.cpuparams,       nullptr);
+    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+
+    postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
+    postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+
+    // default the mmproj device to the global device selection if not set explicitly with -mmdev
+    if (params.mmproj_use_gpu && params.mmproj_device == nullptr && !params.devices.empty()) {
+        params.mmproj_device = params.devices.front();
+        params.mmproj_use_gpu = params.mmproj_device != nullptr;
+    }
+
+    if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
+        throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
+    }
+
+    // A streaming setting that needs another one is switched off with one line and the model runs
+    // without it (was: refused before anything loads). In dependency order, so a setting switched off here also switches off what
+    // needs it further down. (What each one needs, and why, is in the lines below)
+    const auto off = [](const char * x, const char * why) {
+        LOG_WRN("%s is off: it needs %s\n", x, why);
+    };
+    if (params.moe_stream_plan == 1) {
+        // the waiting list replaces these guess paths: the list stays, the older setting goes (MOE_STREAM_TEST_ORACLE_LIST=1,
+        // test only, lets the oracle feed the list)
+        const bool oracle_list_test = getenv("MOE_STREAM_TEST_ORACLE_LIST") && atoi(getenv("MOE_STREAM_TEST_ORACLE_LIST")) != 0;
+        const char * plan_why = "--moe-stream-plan 0 (the waiting list of --moe-stream-plan 1 replaces that guess path)";
+        if (params.moe_stream_prefetch_lead > 1)      { off("--moe-stream-prefetch-lead > 1", plan_why); params.moe_stream_prefetch_lead = 1; }
+        if (params.moe_stream_prefetch_inflight > 0)  { off("--moe-stream-prefetch-inflight", plan_why); params.moe_stream_prefetch_inflight = 0; }
+        if (params.moe_stream_early_order != 0)       { off("--moe-stream-early-order", plan_why); params.moe_stream_early_order = 0; }
+        if (!params.moe_stream_chance_model.empty())  { off("--moe-stream-chance-model", plan_why); params.moe_stream_chance_model.clear(); }
+        if (params.moe_stream_read_threshold != 0.0f) { off("--moe-stream-read-threshold", plan_why); params.moe_stream_read_threshold = 0.0f; }
+        if (params.moe_stream_demand_last != 0)       { off("--moe-stream-demand-last", plan_why); params.moe_stream_demand_last = 0; }
+        if (!params.moe_stream_oracle.empty() && !oracle_list_test) { off("--moe-stream-oracle", plan_why); params.moe_stream_oracle.clear(); }
+    }
+    const bool plan = params.moe_stream_plan == 1;
+    if (params.moe_stream_drop_stale == 1 && !plan)       { off("--moe-stream-drop-stale 1", "--moe-stream-plan 1"); params.moe_stream_drop_stale = 0; }
+    if (params.moe_stream_plan_bind_early == 1 && !plan)  { off("--moe-stream-plan-bind-early 1", "--moe-stream-plan 1"); params.moe_stream_plan_bind_early = 0; }
+    if (params.moe_stream_needed_early == 1 && !plan)     { off("--moe-stream-needed-early 1", "--moe-stream-plan 1"); params.moe_stream_needed_early = 0; }
+    // The behind rule's two numbers work as a pair, and all three settings act on the waiting list's readers
+    if ((params.moe_stream_behind_backlog > 0) != (params.moe_stream_behind_rank > 0)) {
+        off(params.moe_stream_behind_backlog > 0 ? "--moe-stream-behind-backlog" : "--moe-stream-behind-rank",
+            params.moe_stream_behind_backlog > 0 ? "--moe-stream-behind-rank (they work as a pair)" : "--moe-stream-behind-backlog (they work as a pair)");
+        params.moe_stream_behind_backlog = 0;
+        params.moe_stream_behind_rank    = 0;
+    }
+    if ((params.moe_stream_behind_backlog > 0 || params.moe_stream_behind_rank > 0) && !plan) {
+        off("--moe-stream-behind-backlog / -rank", "--moe-stream-plan 1");
+        params.moe_stream_behind_backlog = 0;
+        params.moe_stream_behind_rank    = 0;
+    }
+    if (params.moe_stream_guess_inflight > 0 && !plan) { off("--moe-stream-guess-inflight", "--moe-stream-plan 1"); params.moe_stream_guess_inflight = 0; }
+    // A bind at the pick and a late guess start their read as a guess read; only promote moves its pieces to the
+    // needed-read queue, so without it G could hold back a read the target layer is waiting for
+    if (params.moe_stream_guess_inflight > 0 && params.moe_stream_promote != 1) {
+        off("--moe-stream-guess-inflight", "--moe-stream-promote 1 (without it a read the target waits for stays a guess read and G could hold it back)");
+        params.moe_stream_guess_inflight = 0;
+    }
+    // The wider decode guess fills the waiting list; K below the model's k is raised by the engine (only it knows k)
+    if (params.moe_stream_guess_top > 0 && !plan) { off("--moe-stream-guess-top", "--moe-stream-plan 1"); params.moe_stream_guess_top = 0; }
+    {
+        // K below --moe-stream-prefetch-m would make the decode guess narrower than the plain guess - raised to M (unset, the
+        // width is the model's top-k, not known here: the engine checks it at load)
+        const int32_t m = params.moe_stream_prefetch_m;
+        if (m > 0 && params.moe_stream_guess_top > 0 && params.moe_stream_guess_top < m) {
+            LOG_WRN("--moe-stream-guess-top %d is below --moe-stream-prefetch-m %d (it would narrow the decode guess): %d\n",
+                    params.moe_stream_guess_top, m, m);
+            params.moe_stream_guess_top = m;
+        }
+    }
+    // The far guesses fill the waiting list, and a target's entries must go at its start (drop stale)
+    if (params.moe_stream_lookahead > 1 && (!plan || params.moe_stream_drop_stale != 1)) {
+        if (params.moe_stream_lookahead_set) {
+            off(string_format("--moe-stream-lookahead %d", params.moe_stream_lookahead).c_str(),
+                "--moe-stream-plan 1 and --moe-stream-drop-stale 1 (a target's entries go at its start); lookahead 1");
+        }
+        params.moe_stream_lookahead = 1;
+    }
+    // Protect named keeps the experts the guesses (the waiting list's) named
+    if (params.moe_stream_protect_named == 1 && !plan) { off("--moe-stream-protect-named 1", "--moe-stream-plan 1"); params.moe_stream_protect_named = 0; }
+    // The word-start guesses go on the waiting list, through the streamed layers' add code (drop stale)
+    if (params.moe_stream_wordstart > 0 && (!plan || params.moe_stream_drop_stale != 1)) {
+        off(string_format("--moe-stream-wordstart %d", params.moe_stream_wordstart).c_str(), "--moe-stream-plan 1 and --moe-stream-drop-stale 1");
+        params.moe_stream_wordstart = 0;
+    }
+    // The combined step builds the N distances' guesses; with N = 1 there is nothing to combine
+    if (params.moe_stream_guess_combined == 1 && params.moe_stream_lookahead <= 1) {
+        off("--moe-stream-guess-combined 1", "--moe-stream-lookahead 2 or more (it builds the N distances' guesses in one step)");
+        params.moe_stream_guess_combined = 0;
+    }
+    if (params.moe_stream_plan_old_order == 1 && params.moe_stream_plan_extra_near == 1) {
+        off("--moe-stream-plan-extra-near 1", "--moe-stream-plan-old-order 0 (they are two different orders; the old order stays)");
+        params.moe_stream_plan_extra_near = 0;
+    }
+    if (params.moe_stream_plan_old_order == 1 && params.moe_stream_lookahead <= 1) {
+        off("--moe-stream-plan-old-order 1", "--moe-stream-lookahead 2 or more (the list is sorted only then)");
+        params.moe_stream_plan_old_order = 0;
+    }
+    if (params.moe_stream_plan_extra_near == 1 && params.moe_stream_lookahead <= 1) {
+        off("--moe-stream-plan-extra-near 1", "--moe-stream-lookahead 2 or more (the list is sorted only then)");
+        params.moe_stream_plan_extra_near = 0;
+    }
+    // The per-projection flags are waited on by the overlap's wait in mul_mat_id
+    if (params.moe_stream_proj_ready == 1 && params.moe_stream_overlap != 1) {
+        off("--moe-stream-proj-ready 1", "--moe-stream-overlap 1 (its per-projection flags are waited on by the overlap's wait)");
+        params.moe_stream_proj_ready = 0;
+    }
+    if (!params.moe_stream_correction.empty() && params.moe_stream.empty()) {
+        off("--moe-stream-correction", "--moe-stream (the guess it corrects is the streaming engine's)");
+        params.moe_stream_correction.clear();
+    }
+    // VRAM follow moves the VRAM expert pool; the device pass in the launch needs the pool and the GPU form of needed-early's "router
+    // done"; the copy-back is part of VRAM follow
+    const bool pool = params.moe_stream_vram_experts > 0 || params.moe_stream_vram_free > 0;
+    if (params.moe_stream_vram_follow == 1 && !pool) {
+        off("--moe-stream-vram-follow 1", "--moe-stream-vram-experts N or --moe-stream-vram-free SIZE (the GPU expert pool it moves)");
+        params.moe_stream_vram_follow = 0;
+    }
+    if (params.moe_stream_vram_parallel == 1 && (!pool || params.moe_stream_needed_early != 1)) {
+        off("--moe-stream-vram-parallel 1", !pool ? "--moe-stream-vram-experts N or --moe-stream-vram-free SIZE (the GPU expert pool whose pass it moves)"
+                                                  : "--moe-stream-needed-early 1 (its \"router done\" lets the CPU experts start during the GPU pass)");
+        params.moe_stream_vram_parallel = 0;
+    }
+    if (params.moe_stream_vram_copyback == 1 && params.moe_stream_vram_follow != 1) {
+        off("--moe-stream-vram-copyback 1", "--moe-stream-vram-follow 1 (it copies back the experts that leave VRAM follow's moving set)");
+        params.moe_stream_vram_copyback = 0;
+    }
+
+    const bool skip_model_download =
+        // server will call common_params_handle_models() later, so we skip it here
+        ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
+        // download calls common_params_handle_models() itself and prints the paths
+        ctx_arg.ex == LLAMA_EXAMPLE_DOWNLOAD ||
+        // export_graph_ops loads only metadata
+        ctx_arg.ex == LLAMA_EXAMPLE_EXPORT_GRAPH_OPS;
+
+    if (!skip_model_download) {
+        // handle model and download
+        common_models_handler handler = common_models_handler_init(params, ctx_arg.ex);
+        common_models_handler_apply(handler, params);
+
+        // model is required (except for server)
+        // TODO @ngxson : maybe show a list of available models in CLI in this case
+        bool can_skip_model = params.usage || params.completion || !params.server_base.empty();
+        if (!can_skip_model && params.model.path.empty()) {
+            throw std::invalid_argument("error: --model or -hf is required\n");
+        }
+    }
+
+    if (params.escape) {
+        string_process_escapes(params.prompt);
+        string_process_escapes(params.input_prefix);
+        string_process_escapes(params.input_suffix);
+        for (auto & antiprompt : params.antiprompt) {
+            string_process_escapes(antiprompt);
+        }
+        for (auto & seq_breaker : params.sampling.dry_sequence_breakers) {
+            string_process_escapes(seq_breaker);
+        }
+    }
+
+    if (!params.kv_overrides.empty()) {
+        params.kv_overrides.emplace_back();
+        params.kv_overrides.back().key[0] = 0;
+    }
+
+    const bool mcp_enabled = !params.mcp_servers_config.empty() || !params.mcp_servers_json.empty();
+    if ((!params.server_tools.empty() || mcp_enabled) && !params.cors_origins_explicit) {
+        LOG_WRN("server tools or MCP servers are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
+        params.cors_origins = "localhost";
+    }
+
+    // pad tensor_buft_overrides for llama_params_fit:
+    const size_t ntbo = llama_max_tensor_buft_overrides();
+    while (params.tensor_buft_overrides.size() < ntbo) {
+        params.tensor_buft_overrides.push_back({nullptr, nullptr});
+    }
+
+    if (!params.speculative.draft.tensor_buft_overrides.empty()) {
+        params.speculative.draft.tensor_buft_overrides.push_back({nullptr, nullptr});
+    }
+
+    if (!params.chat_template.empty() && !common_chat_verify_template(params.chat_template, params.use_jinja)) {
+        throw std::runtime_error(string_format(
+            "error: the supplied chat template is not supported: %s%s\n",
+            params.chat_template.c_str(),
+            params.use_jinja ? "" : "\nnote: llama.cpp was started without --jinja, we only support commonly used templates"
+        ));
+    }
+
+    // if the preserve_reasoning kwarg was not specified explicitly, enable it by default
+    if (!params.default_template_kwargs.count("preserve_reasoning")) {
+        params.default_template_kwargs["preserve_reasoning"] = "true";
+    }
+
+    return true;
+}
+
+static void common_params_print_usage(common_params_context & ctx_arg) {
+    auto print_options = [](std::vector<common_arg *> & options) {
+        for (common_arg * opt : options) {
+            printf("%s", opt->to_string().c_str());
+        }
+    };
+
+    std::vector<common_arg *> common_options;
+    std::vector<common_arg *> sampling_options;
+    std::vector<common_arg *> spec_options;
+    std::vector<common_arg *> specific_options;
+    for (auto & opt : ctx_arg.options) {
+        // in case multiple LLAMA_EXAMPLE_* are set, we prioritize the LLAMA_EXAMPLE_* matching current example
+        if (opt.is_sampling) {
+            sampling_options.push_back(&opt);
+        } else if (opt.is_spec) {
+            spec_options.push_back(&opt);
+        } else if (opt.in_example(ctx_arg.ex)) {
+            specific_options.push_back(&opt);
+        } else {
+            common_options.push_back(&opt);
+        }
+    }
+    bool first = true;
+    auto print_section = [&](const char * header, std::vector<common_arg *> & options) {
+        if (options.empty()) {
+            return;
+        }
+        printf("%s----- %s -----\n\n", first ? "" : "\n\n", header);
+        first = false;
+        print_options(options);
+    };
+    print_section("common params",           common_options);
+    print_section("sampling params",         sampling_options);
+    print_section("speculative params",      spec_options);
+    print_section("example-specific params", specific_options);
+}
+
+static void common_params_print_completion(common_params_context & ctx_arg) {
+    std::vector<common_arg *> common_options;
+    std::vector<common_arg *> sampling_options;
+    std::vector<common_arg *> spec_options;
+    std::vector<common_arg *> specific_options;
+
+    for (auto & opt : ctx_arg.options) {
+        if (opt.is_sampling) {
+            sampling_options.push_back(&opt);
+        } else if (opt.is_spec) {
+            spec_options.push_back(&opt);
+        } else if (opt.in_example(ctx_arg.ex)) {
+            specific_options.push_back(&opt);
+        } else {
+            common_options.push_back(&opt);
+        }
+    }
+
+    printf("_llama_completions() {\n");
+    printf("    local cur prev opts\n");
+    printf("    COMPREPLY=()\n");
+    printf("    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n");
+    printf("    prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n\n");
+
+    printf("    opts=\"");
+    auto print_options = [](const std::vector<common_arg *> & options) {
+        for (const common_arg * opt : options) {
+            for (const char * arg : opt->args) {
+                printf("%s ", arg);
+            }
+        }
+    };
+
+    print_options(common_options);
+    print_options(sampling_options);
+    print_options(spec_options);
+    print_options(specific_options);
+    printf("\"\n\n");
+
+    printf("    case \"$prev\" in\n");
+    printf("        --model|-m)\n");
+    printf("            COMPREPLY=( $(compgen -f -X '!*.gguf' -- \"$cur\") $(compgen -d -- \"$cur\") )\n");
+    printf("            return 0\n");
+    printf("            ;;\n");
+    printf("        --grammar-file)\n");
+    printf("            COMPREPLY=( $(compgen -f -X '!*.gbnf' -- \"$cur\") $(compgen -d -- \"$cur\") )\n");
+    printf("            return 0\n");
+    printf("            ;;\n");
+    printf("        --chat-template-file)\n");
+    printf("            COMPREPLY=( $(compgen -f -X '!*.jinja' -- \"$cur\") $(compgen -d -- \"$cur\") )\n");
+    printf("            return 0\n");
+    printf("            ;;\n");
+    printf("        *)\n");
+    printf("            COMPREPLY=( $(compgen -W \"${opts}\" -- \"$cur\") )\n");
+    printf("            return 0\n");
+    printf("            ;;\n");
+    printf("    esac\n");
+    printf("}\n\n");
+
+    std::set<std::string> executables = {
+        "llama-batched",
+        "llama-batched-bench",
+        "llama-bench",
+        "llama-cli",
+        "llama-completion",
+        "llama-convert-llama2c-to-ggml",
+        "llama-cvector-generator",
+        "llama-debug",
+        "llama-diffusion-cli",
+        "llama-embedding",
+        "llama-eval-callback",
+        "llama-export-lora",
+        "llama-finetune",
+        "llama-fit-params",
+        "llama-gemma3-cli",
+        "llama-gen-docs",
+        "llama-gguf",
+        "llama-gguf-hash",
+        "llama-gguf-split",
+        "llama-idle",
+        "llama-imatrix",
+        "llama-llava-cli",
+        "llama-lookahead",
+        "llama-lookup",
+        "llama-lookup-create",
+        "llama-lookup-merge",
+        "llama-lookup-stats",
+        "llama-minicpmv-cli",
+        "llama-mtmd-cli",
+        "llama-parallel",
+        "llama-passkey",
+        "llama-perplexity",
+        "llama-q8dot",
+        "llama-quantize",
+        "llama-qwen2vl-cli",
+        "llama-retrieval",
+        "llama-save-load-state",
+        "llama-server",
+        "llama-simple",
+        "llama-simple-chat",
+        "llama-speculative",
+        "llama-speculative-simple",
+        "llama-tokenize",
+        "llama-tts",
+        "llama-vdot"
+    };
+
+    for (const auto& exe : executables) {
+        printf("complete -F _llama_completions %s\n", exe.c_str());
+    }
+}
+
+static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value) {
+    std::vector<ggml_backend_dev_t> devices;
+    auto dev_names = string_split<std::string>(value, ',');
+    if (dev_names.empty()) {
+        throw std::invalid_argument("no devices specified");
+    }
+    if (dev_names.size() == 1 && dev_names[0] == "none") {
+        devices.push_back(nullptr);
+    } else {
+        ggml_backend_load_all();
+        for (const auto & device : dev_names) {
+            auto * dev = ggml_backend_dev_by_name(device.c_str());
+            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
+            }
+            devices.push_back(dev);
+        }
+        devices.push_back(nullptr);
+    }
+    return devices;
+}
+
+void common_print_available_devices() {
+    constexpr size_t MiB = 1024 * 1024;
+    std::vector<ggml_backend_dev_t> devices;
+
+    ggml_backend_load_all();
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        auto * dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    printf("Available devices:\n");
+
+    if (devices.empty()) {
+        printf("  (none)\n");
+        return;
+    }
+    for (auto * dev : devices) {
+        size_t free, total;
+        ggml_backend_dev_memory(dev, &free, &total);
+        printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / MiB, free / MiB);
+    }
+}
+
+static void add_rpc_devices(const std::string & servers) {
+    auto rpc_servers = string_split<std::string>(servers, ',');
+    if (rpc_servers.empty()) {
+        throw std::invalid_argument("no RPC servers specified");
+    }
+    ggml_backend_load_all();
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (!rpc_reg) {
+        throw std::invalid_argument("failed to find RPC backend");
+    }
+    typedef ggml_backend_reg_t (*ggml_backend_rpc_add_server_t)(const char * endpoint);
+    ggml_backend_rpc_add_server_t ggml_backend_rpc_add_server_fn = (ggml_backend_rpc_add_server_t) ggml_backend_reg_get_proc_address(rpc_reg, "ggml_backend_rpc_add_server");
+    if (!ggml_backend_rpc_add_server_fn) {
+        throw std::invalid_argument("failed to find RPC add server function");
+    }
+    for (const auto & server : rpc_servers) {
+        auto reg = ggml_backend_rpc_add_server_fn(server.c_str());
+        ggml_backend_register(reg);
+    }
+}
+
+bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<common_arg, std::string> & out_map) {
+    common_params dummy_params;
+    common_params_context ctx_arg = common_params_parser_init(dummy_params, ex, nullptr);
+
+    std::unordered_map<std::string, common_arg *> arg_to_options;
+    for (auto & opt : ctx_arg.options) {
+        for (const auto & arg : opt.args) {
+            arg_to_options[arg] = &opt;
+        }
+        for (const auto & arg : opt.args_neg) {
+            arg_to_options[arg] = &opt;
+        }
+    }
+
+    // TODO @ngxson : find a way to deduplicate this code
+
+    // handle command line arguments
+    auto check_arg = [&](int i) {
+        if (i+1 >= argc) {
+            throw std::invalid_argument("expected value for argument");
+        }
+    };
+
+    std::set<std::string> seen_args;
+
+    for (int i = 1; i < argc; i++) {
+        const std::string arg_prefix = "--";
+
+        std::string arg = argv[i];
+        if (arg.compare(0, arg_prefix.size(), arg_prefix) == 0) {
+            std::replace(arg.begin(), arg.end(), '_', '-');
+        }
+        if (arg_to_options.find(arg) == arg_to_options.end()) {
+            throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
+        }
+        if (!seen_args.insert(arg).second) {
+            const bool skip = (arg == "--spec-type");
+
+            if (!skip) {
+                LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
+            }
+        }
+        auto opt = *arg_to_options[arg];
+        std::string val;
+        if (opt.value_hint == nullptr && opt.value_hint_2 == nullptr) {
+            // bool arg (need to reverse the meaning for negative args)
+            bool is_neg = std::find(opt.args_neg.begin(), opt.args_neg.end(), arg) != opt.args_neg.end();
+            val = is_neg ? "0" : "1";
+        }
+        if (opt.value_hint != nullptr) {
+            // arg with single value
+            check_arg(i);
+            val = argv[++i];
+        }
+        if (opt.value_hint_2 != nullptr) {
+            // TODO: support arg with 2 values
+            throw std::invalid_argument("error: argument with 2 values is not yet supported\n");
+        }
+        out_map[opt] = val;
+    }
+
+    return true;
+}
+
+#ifdef _WIN32
+struct utf8_argv {
+    std::vector<std::string> buf;
+    std::vector<char*> ptrs;
+};
+
+static utf8_argv make_utf8_argv() {
+    utf8_argv out;
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) return out;
+
+    out.buf.reserve(wargc);
+    for (int i = 0; i < wargc; ++i) {
+        int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        if (n <= 0) { out.buf.emplace_back(); continue; }
+        auto& s = out.buf.emplace_back();
+        s.resize(static_cast<size_t>(n - 1));
+        (void)WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), n, nullptr, nullptr);
+    }
+    LocalFree(wargv);
+
+    out.ptrs.reserve(out.buf.size() + 1);
+    for (auto& s : out.buf) out.ptrs.push_back(s.data());
+    out.ptrs.push_back(nullptr);
+    return out;
+}
+#endif
+
+bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+#ifdef _WIN32
+    auto utf8 = make_utf8_argv();
+    // repair argv only when it matches the process command line
+    if (static_cast<int>(utf8.buf.size()) == argc) {
+        argv = utf8.ptrs.data();
+    }
+#endif
+
+    auto ctx_arg = common_params_parser_init(params, ex, print_usage);
+    const common_params params_org = ctx_arg.params; // the example can modify the default params
+
+    try {
+        if (!common_params_parse_ex(argc, argv, ctx_arg)) {
+            ctx_arg.params = params_org;
+            return false;
+        }
+        // The record's key - the --moe-stream flags that shape the graph (not the sidecar, the slot / RAM numbers, the recorder, the plan switch)
+        for (int i = 1; i < argc; i++) {
+            const std::string a = argv[i];
+            if (a.rfind("--moe-stream-", 0) != 0 || a == "--moe-stream-plan-only" || a == "--moe-stream-slots" || a.rfind("--moe-stream-ram", 0) == 0 ||
+                    a.rfind("--moe-stream-record", 0) == 0 || a.rfind("--moe-stream-nonpool", 0) == 0) {
+                continue;
+            }
+            ctx_arg.params.moe_stream_nonpool_args += a + " ";
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                ctx_arg.params.moe_stream_nonpool_args += std::string(argv[++i]) + " ";
+            }
+        }
+        if (ctx_arg.params.usage) {
+            common_params_print_usage(ctx_arg);
+            if (ctx_arg.print_usage) {
+                ctx_arg.print_usage(argc, argv);
+            }
+            common_log_flush(common_log_main());
+            exit(0);
+        }
+        if (ctx_arg.params.completion) {
+            common_params_print_completion(ctx_arg);
+            exit(0);
+        }
+        params.lr.init();
+    } catch (const std::invalid_argument & ex) {
+        fprintf(stderr, "%s\n", ex.what());
+        ctx_arg.params = params_org;
+        return false;
+    } catch (std::exception & ex) {
+        fprintf(stderr, "%s\n", ex.what());
+        exit(1); // for other exceptions, we exit with status code 1
+    }
+
+    return true;
+}
+
+static std::string list_builtin_chat_templates() {
+    std::vector<const char *> supported_tmpl;
+    int32_t res = llama_chat_builtin_templates(nullptr, 0);
+    supported_tmpl.resize(res);
+    res = llama_chat_builtin_templates(supported_tmpl.data(), supported_tmpl.size());
+    std::ostringstream msg;
+    for (auto & tmpl : supported_tmpl) {
+        msg << tmpl << (&tmpl == &supported_tmpl.back() ? "" : ", ");
+    }
+    return msg.str();
+}
+
+bool common_arg_utils::is_truthy(const std::string & value) {
+    return value == "on" || value == "enabled" || value == "true" || value == "1";
+}
+
+bool common_arg_utils::is_falsey(const std::string & value) {
+    return value == "off" || value == "disabled" || value == "false" || value == "0";
+}
+
+bool common_arg_utils::is_autoy(const std::string & value) {
+    return value == "auto" || value == "-1";
+}
+
+// Simple CSV parser that handles quoted fields and escaped quotes
+// example:
+//    input:  value1,"value, with, commas","value with ""escaped"" quotes",value4
+//    output: [value1] [value, with, commas] [value with "escaped" quotes] [value4]
+static std::vector<std::string> parse_csv_row(const std::string& input) {
+    std::vector<std::string> fields;
+    std::string field;
+    bool in_quotes = false;
+
+    for (size_t i = 0; i < input.length(); ++i) {
+        char ch = input[i];
+
+        if (ch == '"') {
+            if (!in_quotes) {
+                // start of quoted field (only valid if at beginning of field)
+                if (!field.empty()) {
+                    // quote appeared in middle of unquoted field, treat as literal
+                    field += '"';
+                } else {
+                    in_quotes = true; // start
+                }
+            } else {
+                if (i + 1 < input.length() && input[i + 1] == '"') {
+                    // escaped quote: ""
+                    field += '"';
+                    ++i; // skip the next quote
+                } else {
+                    in_quotes = false; // end
+                }
+            }
+        } else if (ch == ',') {
+            if (in_quotes) {
+                field += ',';
+            } else {
+                fields.push_back(std::move(field));
+                field.clear();
+            }
+        } else {
+            field += ch;
+        }
+    }
+
+    // Add the last field
+    fields.push_back(std::move(field));
+
+    return fields;
+}
+
+// a byte count with an optional suffix: 20GiB, 20g, 512MiB, 1048576
+static int64_t moe_stream_parse_size(const std::string & str) {
+    if (str.empty()) {
+        throw std::invalid_argument("expected a size like 20GiB");
+    }
+
+    size_t n = 0;
+    while (n < str.size() && (isdigit((unsigned char) str[n]) || str[n] == '.')) {
+        n++;
+    }
+
+    const double value = n > 0 ? std::stod(str.substr(0, n)) : 0.0;
+    std::string suffix = str.substr(n);
+
+    for (char & c : suffix) {
+        c = (char) tolower((unsigned char) c);
+    }
+
+    int64_t mul = 1;
+    if      (suffix == "b")                                      { mul = 1; }
+    else if (suffix == "k" || suffix == "kb" || suffix == "kib")   { mul = 1024; }
+    else if (suffix == "m" || suffix == "mb" || suffix == "mib")   { mul = 1024*1024; }
+    else if (suffix == "g" || suffix == "gb" || suffix == "gib")   { mul = 1024*1024*1024; }
+    else if (suffix == "t" || suffix == "tb" || suffix == "tib")   { mul = (int64_t) 1024*1024*1024*1024; }
+    else if (!suffix.empty()) {
+        throw std::invalid_argument("unknown size suffix '" + suffix + "'");
+    }
+
+    return (int64_t) (value*mul);
+}
+
+common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    // per-example default params
+    // we define here to make sure it's included in llama-gen-docs
+    if (ex == LLAMA_EXAMPLE_COMPLETION) {
+        params.use_jinja = false;   // disable jinja by default
+    } else if (ex == LLAMA_EXAMPLE_MTMD) {
+        params.use_jinja = false;   // disable jinja by default
+        params.sampling.temp = 0.2; // lower temp by default for better quality
+    } else if (ex == LLAMA_EXAMPLE_SERVER) {
+        params.n_parallel = -1;     // auto by default
+    } else if (ex == LLAMA_EXAMPLE_TOKENIZE) {
+        params.parse_special = true; // parse special tokens by default, like the old tokenize tool
+    } else if (ex == LLAMA_EXAMPLE_TTS) {
+        params.out_file = "output.wav";
+        params.sampling.penalty_repeat = 1.05f;
+        params.sampling.penalty_last_n = -1;
+    }
+
+    params.use_color = tty_can_use_colors();
+
+    common_params_context ctx_arg(params);
+    ctx_arg.print_usage = print_usage;
+    ctx_arg.ex          = ex;
+
+    std::string sampler_type_chars;
+    std::string sampler_type_names;
+    for (const auto & sampler : params.sampling.samplers) {
+        sampler_type_chars += common_sampler_type_to_chr(sampler);
+        sampler_type_names += common_sampler_type_to_str(sampler) + ";";
+    }
+    if (!sampler_type_names.empty()) {
+        sampler_type_names.pop_back(); // remove last semicolon
+    }
+
+    /**
+     * filter options by example
+     * rules:
+     * - all examples inherit options from LLAMA_EXAMPLE_COMMON
+     * - if LLAMA_EXAMPLE_* is set (other than COMMON), we only show the option in the corresponding example
+     * - if both {LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_*,} are set, we will prioritize the LLAMA_EXAMPLE_* matching current example
+     */
+    auto add_opt = [&](common_arg arg) {
+        // download only exposes the handful of args explicitly tagged for it
+        const bool inherit_common = ex != LLAMA_EXAMPLE_DOWNLOAD;
+        if ((arg.in_example(ex) || (inherit_common && arg.in_example(LLAMA_EXAMPLE_COMMON))) && !arg.is_exclude(ex)) {
+            ctx_arg.options.push_back(std::move(arg));
+        }
+    };
+
+    add_opt(common_arg(
+        {"-h", "--help", "--usage"},
+        "print usage and exit",
+        [](common_params & params) {
+            params.usage = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD}));
+    add_opt(common_arg(
+        {"--version"},
+        "show version and build info",
+        [](common_params &) {
+            llama_print_build_info(llama_version());
+            exit(0);
+        }
+    ));
+    add_opt(common_arg(
+        {"-cl", "--cache-list"},
+        "show list of models in cache",
+        [](common_params &) {
+            auto models = common_list_cached_models();
+            printf("number of models in cache: %zu\n", models.size());
+            for (size_t i = 0; i < models.size(); i++) {
+                printf("%4zu. %s\n", i + 1, models[i].to_string().c_str());
+            }
+            exit(0);
+        }
+    ));
+    add_opt(common_arg(
+        {"--completion-bash"},
+        "print source-able bash completion script for llama.cpp",
+        [](common_params & params) {
+            params.completion = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--server-base"}, "URL",
+        string_format("connect to this server instead of starting a new one, example: 'http://localhost:8080' (default: none)"),
+        [](common_params & params, const std::string & value) {
+            params.server_base = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--verbose-prompt"},
+        string_format("print a verbose prompt before generation (default: %s)", params.verbose_prompt ? "true" : "false"),
+        [](common_params & params) {
+            params.verbose_prompt = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL}));
+    add_opt(common_arg(
+        {"--display-prompt"},
+        {"--no-display-prompt"},
+        string_format("whether to print prompt at generation (default: %s)", params.display_prompt ? "true" : "false"),
+        [](common_params & params, bool value) {
+            params.display_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-co", "--color"}, "[on|off|auto]",
+        "Colorize output to distinguish prompt and user input from generations ('on', 'off', or 'auto', default: 'auto')\n"
+        "'auto' enables colors when output is to a terminal",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.use_color = true;
+            } else if (is_falsey(value)) {
+                params.use_color = false;
+            } else if (is_autoy(value)) {
+                params.use_color = tty_can_use_colors();
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --color: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP}));
+    add_opt(common_arg(
+        {"-t", "--threads"}, "N",
+        string_format("number of CPU threads to use during generation (default: %d)", params.cpuparams.n_threads),
+        [](common_params & params, int value) {
+            params.cpuparams.n_threads = value;
+            if (params.cpuparams.n_threads <= 0) {
+                params.cpuparams.n_threads = std::thread::hardware_concurrency();
+            }
+        }
+    ).set_env("LLAMA_ARG_THREADS"));
+    add_opt(common_arg(
+        {"-tb", "--threads-batch"}, "N",
+        "number of threads to use during batch and prompt processing (default: same as --threads)",
+        [](common_params & params, int value) {
+            params.cpuparams_batch.n_threads = value;
+            if (params.cpuparams_batch.n_threads <= 0) {
+                params.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"-C", "--cpu-mask"}, "M",
+        "CPU affinity mask: arbitrarily long hex. Complements cpu-range (default: \"\")",
+        [](common_params & params, const std::string & mask) {
+            params.cpuparams.mask_valid = true;
+            if (!parse_cpu_mask(mask, params.cpuparams.cpumask)) {
+                throw std::invalid_argument("invalid cpumask");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"-Cr", "--cpu-range"}, "lo-hi",
+        "range of CPUs for affinity. Complements --cpu-mask",
+        [](common_params & params, const std::string & range) {
+            params.cpuparams.mask_valid = true;
+            if (!parse_cpu_range(range, params.cpuparams.cpumask)) {
+                throw std::invalid_argument("invalid range");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--cpu-strict"}, "<0|1>",
+        string_format("use strict CPU placement (default: %u)\n", (unsigned) params.cpuparams.strict_cpu),
+        [](common_params & params, const std::string & value) {
+            params.cpuparams.strict_cpu = std::stoul(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--prio"}, "N",
+        string_format("set process/thread priority : low(-1), normal(0), medium(1), high(2), realtime(3) (default: %d)\n", params.cpuparams.priority),
+        [](common_params & params, int prio) {
+            if (prio < GGML_SCHED_PRIO_LOW || prio > GGML_SCHED_PRIO_REALTIME) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.cpuparams.priority = (enum ggml_sched_priority) prio;
+        }
+    ));
+    add_opt(common_arg(
+        {"--poll"}, "<0...100>",
+        string_format("use polling level to wait for work (0 - no polling, default: %u)\n", (unsigned) params.cpuparams.poll),
+        [](common_params & params, const std::string & value) {
+            params.cpuparams.poll = std::stoul(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"-Cb", "--cpu-mask-batch"}, "M",
+        "CPU affinity mask: arbitrarily long hex. Complements cpu-range-batch (default: same as --cpu-mask)",
+        [](common_params & params, const std::string & mask) {
+            params.cpuparams_batch.mask_valid = true;
+            if (!parse_cpu_mask(mask, params.cpuparams_batch.cpumask)) {
+                throw std::invalid_argument("invalid cpumask");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"-Crb", "--cpu-range-batch"}, "lo-hi",
+        "ranges of CPUs for affinity. Complements --cpu-mask-batch",
+        [](common_params & params, const std::string & range) {
+            params.cpuparams_batch.mask_valid = true;
+            if (!parse_cpu_range(range, params.cpuparams_batch.cpumask)) {
+                throw std::invalid_argument("invalid range");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--cpu-strict-batch"}, "<0|1>",
+        "use strict CPU placement (default: same as --cpu-strict)",
+        [](common_params & params, int value) {
+            params.cpuparams_batch.strict_cpu = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--prio-batch"}, "N",
+        string_format("set process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime (default: %d)\n", params.cpuparams_batch.priority),
+        [](common_params & params, int prio) {
+            if (prio < 0 || prio > 3) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.cpuparams_batch.priority = (enum ggml_sched_priority) prio;
+        }
+    ));
+    add_opt(common_arg(
+        {"--poll-batch"}, "<0|1>",
+        "use polling to wait for work (default: same as --poll)",
+        [](common_params & params, int value) {
+            params.cpuparams_batch.poll = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"-lcs", "--lookup-cache-static"}, "FNAME",
+        "path to static lookup cache to use for lookup decoding (not updated by generation)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_cache.lookup_cache_static = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-lcd", "--lookup-cache-dynamic"}, "FNAME",
+        "path to dynamic lookup cache to use for lookup decoding (updated by generation)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.ngram_cache.lookup_cache_dynamic = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-c", "--ctx-size"}, "N",
+        string_format("size of the prompt context (default: %d, 0 = loaded from model)", params.n_ctx),
+        [](common_params & params, int value) {
+            params.n_ctx = value;
+            if (value == 0) {
+                // disable context reduction in llama_params_fit if the user explicitly requests the full context size:
+                params.fit_params_min_ctx = UINT32_MAX;
+            }
+        }
+    ).set_env("LLAMA_ARG_CTX_SIZE"));
+    add_opt(common_arg(
+        { "--kv-unified-per-slot" }, "N",
+        "context limit per parallel slot (default: unset, behavior unchanged).\n"
+        "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
+        [](common_params & params, int value) {
+            params.kv_unified_per_slot = value;
+        }
+    ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"-n", "--predict", "--n-predict"}, "N",
+        string_format(
+            ex == LLAMA_EXAMPLE_COMPLETION
+                ? "number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)"
+                : "number of tokens to predict (default: %d, -1 = infinity)",
+            params.n_predict),
+        [](common_params & params, int value) {
+            params.n_predict = value;
+        }
+    ).set_env("LLAMA_ARG_N_PREDICT"));
+    add_opt(common_arg(
+        {"-b", "--batch-size"}, "N",
+        string_format("logical maximum batch size (default: %d)", params.n_batch),
+        [](common_params & params, int value) {
+            params.n_batch = value;
+        }
+    ).set_env("LLAMA_ARG_BATCH"));
+    add_opt(common_arg(
+        {"-ub", "--ubatch-size"}, "N",
+        string_format("physical maximum batch size (default: %d)", params.n_ubatch),
+        [](common_params & params, int value) {
+            params.n_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH"));
+    add_opt(common_arg(
+        {"--keep"}, "N",
+        string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
+        [](common_params & params, int value) {
+            params.n_keep = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--swa-full"},
+        string_format("use full-size SWA cache (default: %s)\n"
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)", params.swa_full ? "true" : "false"),
+        [](common_params & params) {
+            params.swa_full = true;
+        }
+    ).set_env("LLAMA_ARG_SWA_FULL"));
+    add_opt(common_arg(
+        {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
+        string_format("max number of context checkpoints to create per slot (default: %d)"
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),
+        [](common_params & params, int value) {
+            params.n_ctx_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-cms", "--checkpoint-min-step"}, "N",
+        string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("checkpoint-min-step must be non-negative");
+            }
+            params.checkpoint_min_step = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-cram", "--cache-ram"}, "N",
+        string_format("set the maximum cache size in MiB (default: %d, 0 for decision models, -1 - no limit, 0 - disable)"
+            "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
+        [](common_params & params, int value) {
+            params.cache_ram_mib = value;
+            params.cache_ram_explicit = true;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-disk"}, "DIR",
+        "keep the chat states on disk in DIR (one file per saved state, written after each reply, before the "
+        "next request is taken): a request with an X-Conversation-Id header restores its chat's state, a request without one "
+        "the saved state sharing the longest beginning (the RAM prompt cache's rule). A state saved under another model file "
+        "or other settings, or damaged (checksum), is refused. Files are owner-only. POST /cache-disk/erase (the chat in "
+        "X-Conversation-Id) and POST /cache-disk/clear delete saved states. A directory that cannot be written stops the "
+        "server. Works with --cache-ram 0 (default: none = off)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_dir = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-gb"}, "N",
+        string_format("size limit of the --cache-disk directory in GB (fractions allowed); the entry written "
+            "longest ago is deleted first, a state larger than the limit is not written (default: %.0f)", (double) params.cache_disk_gb),
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (!std::isfinite(v) || !(v > 0.0f) || v > 1e6f) {
+                throw std::invalid_argument("--cache-disk-gb must be a number > 0 and <= 1000000");
+            }
+            params.cache_disk_gb = v;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_GB").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-checkpoints"}, "N",
+        string_format("with --cache-disk, keep each chat's (X-Conversation-Id) \"start of message\" context snapshots "
+            "as files of that directory, at most N per chat (the oldest first): after each reply the snapshot made at the last user "
+            "message's start is written (the SSD is idle then), and a request that goes back further than the snapshots in RAM "
+            "(e.g. an edited older message) restarts from the newest one instead of re-reading the chat. Counted in --cache-disk-gb; "
+            "deleted with the chat (erase, clear, the size limit). 0 = off (default: %d)", params.cache_disk_checkpoints),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--cache-disk-checkpoints must be >= 0");
+            }
+            params.cache_disk_checkpoints = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-kvu", "--kv-unified"},
+        {"-no-kvu", "--no-kv-unified"},
+        "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
+        [](common_params & params, bool value) {
+            params.kv_unified = value;
+        }
+    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--cache-idle-slots"},
+        {"--no-cache-idle-slots"},
+        "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
+        [](common_params & params, bool value) {
+            params.cache_idle_slots = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--context-shift"},
+        {"--no-context-shift"},
+        string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.ctx_shift = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_CONTEXT_SHIFT"));
+    add_opt(common_arg(
+        {"--chunks"}, "N",
+        string_format("max number of chunks to process (default: %d, -1 = all)", params.n_chunks),
+        [](common_params & params, int value) {
+            params.n_chunks = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_RETRIEVAL}));
+    add_opt(common_arg({ "-fa", "--flash-attn" }, "[on|off|auto]",
+                       string_format("set Flash Attention use ('on', 'off', or 'auto', default: '%s')",
+                                     llama_flash_attn_type_name(params.flash_attn_type)),
+                       [](common_params & params, const std::string & value) {
+                           if (is_truthy(value)) {
+                               params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+                           } else if (is_falsey(value)) {
+                               params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+                           } else if (is_autoy(value)) {
+                               params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+                           } else {
+                               throw std::runtime_error(
+                                   string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
+                           }
+                       }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg(
+        {"-p", "--prompt"}, "PROMPT",
+        "prompt to start generation with; for system message, use -sys",
+        [](common_params & params, const std::string & value) {
+            params.prompt = value;
+        }
+    ).set_excludes({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-sys", "--system-prompt"}, "PROMPT",
+        "system prompt to use with model (if applicable, depending on chat template)",
+        [](common_params & params, const std::string & value) {
+            params.system_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DIFFUSION, LLAMA_EXAMPLE_MTMD}));
+    add_opt(common_arg(
+        {"--perf"},
+        {"--no-perf"},
+        string_format("whether to enable internal libllama performance timings (default: %s)", params.no_perf ? "true" : "false"),
+        [](common_params & params, bool value) {
+            params.no_perf = !value;
+            params.sampling.no_perf = !value;
+        }
+    ).set_env("LLAMA_ARG_PERF"));
+    add_opt(common_arg(
+        {"--show-timings"},
+        {"--no-show-timings"},
+        string_format("whether to show timing information after each response (default: %s)", params.show_timings ? "true" : "false"),
+        [](common_params & params, bool value) {
+            params.show_timings = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SHOW_TIMINGS"));
+    add_opt(common_arg(
+        {"-f", "--file"}, "FNAME",
+        "a file containing the prompt (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.prompt = read_file(value);
+            // store the external file name in params
+            params.prompt_file = value;
+            if (!params.prompt.empty() && params.prompt.back() == '\n') {
+                params.prompt.pop_back();
+            }
+        }
+    ).set_excludes({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-sysf", "--system-prompt-file"}, "FNAME",
+        "a file containing the system prompt (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.system_prompt = read_file(value);
+            if (!params.system_prompt.empty() && params.system_prompt.back() == '\n') {
+                params.system_prompt.pop_back();
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DIFFUSION}));
+    add_opt(common_arg(
+        {"--in-file"}, "FNAME",
+        "an input file (use comma-separated values to specify multiple files)",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                std::ifstream file(item);
+                if (!file) {
+                    throw std::runtime_error(string_format("error: failed to open file '%s'\n", item.c_str()));
+                }
+                params.in_files.push_back(item);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"-bf", "--binary-file"}, "FNAME",
+        "binary file containing the prompt (default: none)",
+        [](common_params & params, const std::string & value) {
+            std::ifstream file(value, std::ios::binary);
+            if (!file) {
+                throw std::runtime_error(string_format("error: failed to open file '%s'\n", value.c_str()));
+            }
+            // store the external file name in params
+            params.prompt_file = value;
+            std::ostringstream ss;
+            ss << file.rdbuf();
+            params.prompt = ss.str();
+            fprintf(stderr, "Read %zu bytes from binary file %s\n", params.prompt.size(), value.c_str());
+        }
+    ).set_excludes({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-e", "--escape"},
+        {"--no-escape"},
+        string_format("whether to process escapes sequences (\\n, \\r, \\t, \\', \\\", \\\\) (default: %s)", params.escape ? "true" : "false"),
+        [](common_params & params, bool value) {
+            params.escape = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"-ptc", "--print-token-count"}, "N",
+        string_format("print token count every N tokens (default: %d)", params.n_print),
+        [](common_params & params, int value) {
+            params.n_print = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--prompt-cache"}, "FNAME",
+        "file to cache prompt state for faster startup (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.path_prompt_cache = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--prompt-cache-all"},
+        "if specified, saves user input and generations to cache as well\n",
+        [](common_params & params) {
+            params.prompt_cache_all = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--prompt-cache-ro"},
+        "if specified, uses the prompt cache but does not update it",
+        [](common_params & params) {
+            params.prompt_cache_ro = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"-r", "--reverse-prompt"}, "PROMPT",
+        "halt generation at PROMPT, return control in interactive mode\n",
+        [](common_params & params, const std::string & value) {
+            params.antiprompt.emplace_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-sp", "--special"},
+        string_format("special tokens output enabled (default: %s)", params.special ? "true" : "false"),
+        [](common_params & params) {
+            params.special = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-cnv", "--conversation"},
+        {"-no-cnv", "--no-conversation"},
+        "whether to run in conversation mode:\n"
+        "- does not print special tokens and suffix/prefix\n"
+        "- interactive mode is also enabled\n"
+        "(default: auto enabled if chat template is available)",
+        [](common_params & params, bool value) {
+            params.conversation_mode = value ? COMMON_CONVERSATION_MODE_ENABLED : COMMON_CONVERSATION_MODE_DISABLED;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"-st", "--single-turn"},
+        "run conversation for a single turn only, then exit when done\n"
+        "will not be interactive if first turn is predefined with --prompt\n"
+        "(default: false)",
+        [](common_params & params) {
+            params.single_turn = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-i", "--interactive"},
+        string_format("run in interactive mode (default: %s)", params.interactive ? "true" : "false"),
+        [](common_params & params) {
+            params.interactive = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"-if", "--interactive-first"},
+        string_format("run in interactive mode and wait for input right away (default: %s)", params.interactive_first ? "true" : "false"),
+        [](common_params & params) {
+            params.interactive_first = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"-mli", "--multiline-input"},
+        "allows you to write or paste multiple lines without ending each in '\\'",
+        [](common_params & params) {
+            params.multiline_input = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--in-prefix-bos"},
+        "prefix BOS to user inputs, preceding the `--in-prefix` string",
+        [](common_params & params) {
+            params.input_prefix_bos = true;
+            params.enable_chat_template = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--in-prefix"}, "STRING",
+        "string to prefix user inputs with (default: empty)",
+        [](common_params & params, const std::string & value) {
+            params.input_prefix = value;
+            params.enable_chat_template = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--in-suffix"}, "STRING",
+        "string to suffix after user inputs with (default: empty)",
+        [](common_params & params, const std::string & value) {
+            params.input_suffix = value;
+            params.enable_chat_template = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--warmup"},
+        {"--no-warmup"},
+        string_format("whether to perform warmup with an empty run (default: %s)", params.warmup ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.warmup = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_DEBUG, LLAMA_EXAMPLE_MOE_TRACE}));
+    add_opt(common_arg(
+        {"--spm-infill"},
+        string_format(
+            "use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this. (default: %s)",
+            params.spm_infill ? "enabled" : "disabled"
+        ),
+        [](common_params & params) {
+            params.spm_infill = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--samplers"}, "SAMPLERS",
+        string_format("samplers that will be used for generation in the order, separated by \';\'\n(default: %s)", sampler_type_names.c_str()),
+        [](common_params & params, const std::string & value) {
+            const auto sampler_names = string_split<std::string>(value, ';');
+            params.sampling.samplers = common_sampler_types_from_names(sampler_names);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"-s", "--seed"}, "SEED",
+        string_format("RNG seed (default: %d, use random seed for %d)", params.sampling.seed, LLAMA_DEFAULT_SEED),
+        [](common_params & params, const std::string & value) {
+            params.sampling.seed = std::stoul(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--sampler-seq", "--sampling-seq"}, "SEQUENCE",
+        string_format("simplified sequence for samplers that will be used (default: %s)", sampler_type_chars.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.sampling.samplers = common_sampler_types_from_chars(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--ignore-eos"},
+        "ignore end of stream token and continue generating (implies --logit-bias EOS-inf)",
+        [](common_params & params) {
+            params.sampling.ignore_eos = true;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--temp", "--temperature"}, "N",
+        string_format("temperature (default: %.2f)", (double)params.sampling.temp),
+        [](common_params & params, const std::string & value) {
+            params.sampling.temp = std::stof(value);
+            params.sampling.temp = std::max(params.sampling.temp, 0.0f);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TEMP;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_TEMPERATURE"));
+    add_opt(common_arg(
+        {"--top-k"}, "N",
+        string_format("top-k sampling (default: %d, 0 = disabled)", params.sampling.top_k),
+        [](common_params & params, int value) {
+            params.sampling.top_k = value;
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_K;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_TOP_K"));
+    add_opt(common_arg(
+        {"--top-p"}, "N",
+        string_format("top-p sampling (default: %.2f, 1.0 = disabled)", (double)params.sampling.top_p),
+        [](common_params & params, const std::string & value) {
+            params.sampling.top_p = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_TOP_P;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_TOP_P"));
+    add_opt(common_arg(
+        {"--min-p"}, "N",
+        string_format("min-p sampling (default: %.2f, 0.0 = disabled)", (double)params.sampling.min_p),
+        [](common_params & params, const std::string & value) {
+            params.sampling.min_p = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIN_P;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_MIN_P"));
+    add_opt(common_arg(
+        {"--top-nsigma", "--top-n-sigma"}, "N",
+        string_format("top-n-sigma sampling (default: %.2f, -1.0 = disabled)", params.sampling.top_n_sigma),
+        [](common_params & params, const std::string & value) {
+            params.sampling.top_n_sigma = std::stof(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--xtc-probability"}, "N",
+        string_format("xtc probability (default: %.2f, 0.0 = disabled)", (double)params.sampling.xtc_probability),
+        [](common_params & params, const std::string & value) {
+            params.sampling.xtc_probability = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_PROBABILITY;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--xtc-threshold"}, "N",
+        string_format("xtc threshold (default: %.2f, 1.0 = disabled)", (double)params.sampling.xtc_threshold),
+        [](common_params & params, const std::string & value) {
+            params.sampling.xtc_threshold = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_XTC_THRESHOLD;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--typical", "--typical-p"}, "N",
+        string_format("locally typical sampling, parameter p (default: %.2f, 1.0 = disabled)", (double)params.sampling.typ_p),
+        [](common_params & params, const std::string & value) {
+            params.sampling.typ_p = std::stof(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--repeat-last-n"}, "N",
+        string_format("last n tokens to consider for penalize (default: %d, 0 = disabled)", params.sampling.penalty_last_n),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::runtime_error(string_format("error: invalid repeat-last-n = %d\n", value));
+            }
+            params.sampling.penalty_last_n = value;
+            params.sampling.n_prev = std::max(params.sampling.n_prev, params.sampling.penalty_last_n);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_LAST_N;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--repeat-penalty"}, "N",
+        string_format("penalize repeat sequence of tokens (default: %.2f, 1.0 = disabled)", (double)params.sampling.penalty_repeat),
+        [](common_params & params, const std::string & value) {
+            const float penalty_repeat = std::stof(value);
+            if (!std::isfinite(penalty_repeat) ||
+                penalty_repeat <= 0.0f ||
+                !std::isfinite(1.0f/penalty_repeat)) {
+                throw std::runtime_error("error: repeat-penalty must be finite and greater than 0\n");
+            }
+            params.sampling.penalty_repeat = penalty_repeat;
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_PENALTY_REPEAT;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_REPEAT_PENALTY"));
+    add_opt(common_arg(
+        {"--presence-penalty"}, "N",
+        string_format("repeat alpha presence penalty (default: %.2f, 0.0 = disabled)", (double)params.sampling.penalty_present),
+        [](common_params & params, const std::string & value) {
+            const float penalty_present = std::stof(value);
+            if (!std::isfinite(penalty_present)) {
+                throw std::runtime_error("error: presence-penalty must be finite\n");
+            }
+            params.sampling.penalty_present = penalty_present;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_PRESENCE_PENALTY"));
+    add_opt(common_arg(
+        {"--frequency-penalty"}, "N",
+        string_format("repeat alpha frequency penalty (default: %.2f, 0.0 = disabled)", (double)params.sampling.penalty_freq),
+        [](common_params & params, const std::string & value) {
+            const float penalty_freq = std::stof(value);
+            if (!std::isfinite(penalty_freq)) {
+                throw std::runtime_error("error: frequency-penalty must be finite\n");
+            }
+            params.sampling.penalty_freq = penalty_freq;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_FREQUENCY_PENALTY"));
+    add_opt(common_arg(
+        {"--dry-multiplier"}, "N",
+        string_format("set DRY sampling multiplier (default: %.2f, 0.0 = disabled)", (double)params.sampling.dry_multiplier),
+        [](common_params & params, const std::string & value) {
+            params.sampling.dry_multiplier = std::stof(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--dry-base"}, "N",
+        string_format("set DRY sampling base value (default: %.2f)", (double)params.sampling.dry_base),
+        [](common_params & params, const std::string & value) {
+            float potential_base = std::stof(value);
+            if (potential_base >= 1.0f)
+            {
+                params.sampling.dry_base = potential_base;
+            }
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--dry-allowed-length"}, "N",
+        string_format("set allowed length for DRY sampling (default: %d)", params.sampling.dry_allowed_length),
+        [](common_params & params, int value) {
+            params.sampling.dry_allowed_length = value;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--dry-penalty-last-n"}, "N",
+        string_format("set DRY penalty for the last n tokens (default: %d, 0 = disable)", params.sampling.dry_penalty_last_n),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::runtime_error(string_format("error: invalid dry-penalty-last-n = %d\n", value));
+            }
+            params.sampling.dry_penalty_last_n = value;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--dry-sequence-breaker"}, "STRING",
+        string_format("add sequence breaker for DRY sampling, clearing out default breakers (%s) in the process; use \"none\" to not use any sequence breakers\n",
+            params.sampling.dry_sequence_breakers.empty() ? "none" :
+            std::accumulate(std::next(params.sampling.dry_sequence_breakers.begin()),
+                params.sampling.dry_sequence_breakers.end(),
+                std::string("'") + (params.sampling.dry_sequence_breakers[0] == "\n" ? "\\n" : params.sampling.dry_sequence_breakers[0]) + "'",
+                [](const std::string& a, const std::string& b) {
+                    std::string formatted_b = (b == "\n") ? "\\n" : b;
+                    return a + ", '" + formatted_b + "'";
+                }).c_str()),
+        [](common_params & params, const std::string & value) {
+            static bool defaults_cleared = false;
+
+            if (!defaults_cleared) {
+                params.sampling.dry_sequence_breakers.clear();
+                defaults_cleared = true;
+            }
+
+            if (value == "none") {
+                params.sampling.dry_sequence_breakers.clear();
+            } else {
+                params.sampling.dry_sequence_breakers.emplace_back(value);
+            }
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--adaptive-target"}, "N",
+        string_format("adaptive-p: select tokens near this probability (valid range 0.0 "
+                      "to 1.0; negative = disabled) (default: %.2f)\n"
+                      "[(more info)](https://github.com/ggml-org/llama.cpp/pull/17927)",
+                      (double)params.sampling.adaptive_target),
+        [](common_params & params, const std::string & value) {
+            params.sampling.adaptive_target = std::stof(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--adaptive-decay"}, "N",
+        string_format("adaptive-p: decay rate for target adaptation over time. lower values "
+                      "are more reactive, higher values are more stable.\n"
+                      "(valid range 0.0 to 0.99) (default: %.2f)",
+                      (double)params.sampling.adaptive_decay),
+        [](common_params & params, const std::string & value) {
+            params.sampling.adaptive_decay = std::stof(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--dynatemp-range"}, "N",
+        string_format("dynamic temperature range (default: %.2f, 0.0 = disabled)", (double)params.sampling.dynatemp_range),
+        [](common_params & params, const std::string & value) {
+            params.sampling.dynatemp_range = std::stof(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--dynatemp-exp"}, "N",
+        string_format("dynamic temperature exponent (default: %.2f)", (double)params.sampling.dynatemp_exponent),
+        [](common_params & params, const std::string & value) {
+            params.sampling.dynatemp_exponent = std::stof(value);
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--mirostat"}, "N",
+        string_format("use Mirostat sampling.\nTop K, Nucleus and Locally Typical samplers are ignored if used.\n"
+        "(default: %d, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0)", params.sampling.mirostat),
+        [](common_params & params, int value) {
+            params.sampling.mirostat = value;
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--mirostat-lr"}, "N",
+        string_format("Mirostat learning rate, parameter eta (default: %.2f)", (double)params.sampling.mirostat_eta),
+        [](common_params & params, const std::string & value) {
+            params.sampling.mirostat_eta = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--mirostat-ent"}, "N",
+        string_format("Mirostat target entropy, parameter tau (default: %.2f)", (double)params.sampling.mirostat_tau),
+        [](common_params & params, const std::string & value) {
+            params.sampling.mirostat_tau = std::stof(value);
+            params.sampling.user_sampling_config |= common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_TAU;
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"-l", "--logit-bias"}, "TOKEN_ID(+/-)BIAS",
+        "modifies the likelihood of token appearing in the completion,\n"
+        "i.e. `--logit-bias 15043+1` to increase likelihood of token ' Hello',\n"
+        "or `--logit-bias 15043-1` to decrease likelihood of token ' Hello'",
+        [](common_params & params, const std::string & value) {
+            std::stringstream ss(value);
+            llama_token key;
+            char sign;
+            std::string value_str;
+            try {
+                if (ss >> key && ss >> sign && std::getline(ss, value_str) && (sign == '+' || sign == '-')) {
+                    const float bias = std::stof(value_str) * ((sign == '-') ? -1.0f : 1.0f);
+                    params.sampling.logit_bias.push_back({key, bias});
+                } else {
+                    throw std::invalid_argument("invalid input format");
+                }
+            } catch (const std::exception&) {
+                throw std::invalid_argument("invalid input format");
+            }
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--grammar"}, "GRAMMAR",
+        "BNF-like grammar to constrain generations (see samples in grammars/ dir)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, value};
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"--grammar-file"}, "FNAME",
+        "file to read grammar from",
+        [](common_params & params, const std::string & value) {
+            params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, read_file(value)};
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"-j", "--json-schema"}, "SCHEMA",
+        "JSON schema to constrain generations (https://json-schema.org/), e.g. `{\"type\": \"object\"}` for any JSON object",
+        [](common_params & params, const std::string & value) {
+            params.sampling.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(json::parse(value))};
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"-jf", "--json-schema-file"}, "FILE",
+        "File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{\"type\": \"object\"}` for any JSON object",
+        [](common_params & params, const std::string & value) {
+            std::ifstream file(value);
+            if (!file) {
+                throw std::runtime_error(string_format("error: failed to open file '%s'\n", value.c_str()));
+            }
+            std::string schema;
+            std::copy(
+                std::istreambuf_iterator<char>(file),
+                std::istreambuf_iterator<char>(),
+                std::back_inserter(schema)
+            );
+            params.sampling.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, json_schema_to_grammar(json::parse(schema))};
+        }
+    ).set_sampling());
+    add_opt(common_arg(
+        {"-bs", "--backend-sampling"},
+        "enable backend sampling (experimental) (default: disabled)",
+        [](common_params & params) {
+            params.sampling.backend_sampling = true;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--pooling"}, "{none,mean,cls,last,rank}",
+        "pooling type for embeddings, use model default if unspecified",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "none") { params.pooling_type = LLAMA_POOLING_TYPE_NONE; }
+            else if (value == "mean") { params.pooling_type = LLAMA_POOLING_TYPE_MEAN; }
+            else if (value == "cls")  { params.pooling_type = LLAMA_POOLING_TYPE_CLS;  }
+            else if (value == "last") { params.pooling_type = LLAMA_POOLING_TYPE_LAST; }
+            else if (value == "rank") { params.pooling_type = LLAMA_POOLING_TYPE_RANK; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}).set_env("LLAMA_ARG_POOLING"));
+    add_opt(common_arg(
+        {"--attention"}, "{causal,non-causal}",
+        "attention type for embeddings, use model default if unspecified",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "causal") { params.attention_type = LLAMA_ATTENTION_TYPE_CAUSAL; }
+            else if (value == "non-causal") { params.attention_type = LLAMA_ATTENTION_TYPE_NON_CAUSAL; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
+    add_opt(common_arg(
+        {"--rope-scaling"}, "{none,linear,yarn}",
+        "RoPE frequency scaling method, defaults to linear unless specified by the model",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "none") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_NONE; }
+            else if (value == "linear") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_LINEAR; }
+            else if (value == "yarn") { params.rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_YARN; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_ROPE_SCALING_TYPE"));
+    add_opt(common_arg(
+        {"--rope-scale"}, "N",
+        "RoPE context scaling factor, expands context by a factor of N",
+        [](common_params & params, const std::string & value) {
+            params.rope_freq_scale = 1.0f / std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_ROPE_SCALE"));
+    add_opt(common_arg(
+        {"--rope-freq-base"}, "N",
+        "RoPE base frequency, used by NTK-aware scaling (default: loaded from model)",
+        [](common_params & params, const std::string & value) {
+            params.rope_freq_base = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_ROPE_FREQ_BASE"));
+    add_opt(common_arg(
+        {"--rope-freq-scale"}, "N",
+        "RoPE frequency scaling factor, expands context by a factor of 1/N",
+        [](common_params & params, const std::string & value) {
+            params.rope_freq_scale = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_ROPE_FREQ_SCALE"));
+    add_opt(common_arg(
+        {"--yarn-orig-ctx"}, "N",
+        string_format("YaRN: original context size of model (default: %d = model training context size)", params.yarn_orig_ctx),
+        [](common_params & params, int value) {
+            params.yarn_orig_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_YARN_ORIG_CTX"));
+    add_opt(common_arg(
+        {"--yarn-ext-factor"}, "N",
+        string_format("YaRN: extrapolation mix factor (default: %.2f, 0.0 = full interpolation)", (double)params.yarn_ext_factor),
+        [](common_params & params, const std::string & value) {
+            params.yarn_ext_factor = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_YARN_EXT_FACTOR"));
+    add_opt(common_arg(
+        {"--yarn-attn-factor"}, "N",
+        string_format("YaRN: scale sqrt(t) or attention magnitude (default: %.2f)", (double)params.yarn_attn_factor),
+        [](common_params & params, const std::string & value) {
+            params.yarn_attn_factor = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_YARN_ATTN_FACTOR"));
+    add_opt(common_arg(
+        {"--yarn-beta-slow"}, "N",
+        string_format("YaRN: high correction dim or alpha (default: %.2f)", (double)params.yarn_beta_slow),
+        [](common_params & params, const std::string & value) {
+            params.yarn_beta_slow = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_YARN_BETA_SLOW"));
+    add_opt(common_arg(
+        {"--yarn-beta-fast"}, "N",
+        string_format("YaRN: low correction dim or beta (default: %.2f)", (double)params.yarn_beta_fast),
+        [](common_params & params, const std::string & value) {
+            params.yarn_beta_fast = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_YARN_BETA_FAST"));
+    add_opt(common_arg(
+        {"-gan", "--grp-attn-n"}, "N",
+        string_format("group-attention factor (default: %d)", params.grp_attn_n),
+        [](common_params & params, int value) {
+            params.grp_attn_n = value;
+        }
+    ).set_env("LLAMA_ARG_GRP_ATTN_N").set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_PASSKEY}));
+    add_opt(common_arg(
+        {"-gaw", "--grp-attn-w"}, "N",
+        string_format("group-attention width (default: %d)", params.grp_attn_w),
+        [](common_params & params, int value) {
+            params.grp_attn_w = value;
+        }
+    ).set_env("LLAMA_ARG_GRP_ATTN_W").set_examples({LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"-kvo", "--kv-offload"},
+        {"-nkvo", "--no-kv-offload"},
+        string_format("whether to enable KV cache offloading (default: %s)", params.no_kv_offload ? "disabled" : "enabled"),
+        [](common_params & params, bool value) {
+            params.no_kv_offload = !value;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD"));
+    add_opt(common_arg(
+        {"--repack"},
+        {"-nr", "--no-repack"},
+        string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),
+        [](common_params & params, bool value) {
+            params.no_extra_bufts = !value;
+        }
+    ).set_env("LLAMA_ARG_REPACK"));
+    add_opt(common_arg(
+        {"--no-host"},
+        "bypass host buffer allowing extra buffers to be used",
+        [](common_params & params) {
+            params.no_host = true;
+        }
+    ).set_env("LLAMA_ARG_NO_HOST"));
+    add_opt(common_arg(
+        {"-ctk", "--cache-type-k"}, "TYPE",
+        string_format(
+            "KV cache data type for K\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.cache_type_k)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_k = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
+    add_opt(common_arg(
+        {"-ctv", "--cache-type-v"}, "TYPE",
+        string_format(
+            "KV cache data type for V\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.cache_type_v)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.cache_type_v = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--hellaswag"},
+        "compute HellaSwag score over random tasks from datafile supplied with -f",
+        [](common_params & params) {
+            params.hellaswag = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--hellaswag-tasks"}, "N",
+        string_format("number of tasks to use when computing the HellaSwag score (default: %zu)", params.hellaswag_tasks),
+        [](common_params & params, int value) {
+            params.hellaswag_tasks = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--winogrande"},
+        "compute Winogrande score over random tasks from datafile supplied with -f",
+        [](common_params & params) {
+            params.winogrande = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--winogrande-tasks"}, "N",
+        string_format("number of tasks to use when computing the Winogrande score (default: %zu)", params.winogrande_tasks),
+        [](common_params & params, int value) {
+            params.winogrande_tasks = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--multiple-choice"},
+        "compute multiple choice score over random tasks from datafile supplied with -f",
+        [](common_params & params) {
+            params.multiple_choice = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--multiple-choice-tasks"}, "N",
+        string_format("number of tasks to use when computing the multiple choice score (default: %zu)", params.multiple_choice_tasks),
+        [](common_params & params, int value) {
+            params.multiple_choice_tasks = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--kl-divergence"},
+        "computes KL-divergence to logits provided via --kl-divergence-base",
+        [](common_params & params) {
+            params.kl_divergence = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--save-all-logits", "--kl-divergence-base"}, "FNAME",
+        "set logits file",
+        [](common_params & params, const std::string & value) {
+            params.logits_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--ppl-stride"}, "N",
+        string_format("stride for perplexity calculation (default: %d)", params.ppl_stride),
+        [](common_params & params, int value) {
+            params.ppl_stride = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"--ppl-output-type"}, "<0|1>",
+        string_format("output type for perplexity calculation (default: %d)", params.ppl_output_type),
+        [](common_params & params, int value) {
+            params.ppl_output_type = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}));
+    add_opt(common_arg(
+        {"-dt", "--defrag-thold"}, "N",
+        string_format("KV cache defragmentation threshold (DEPRECATED)"),
+        [](common_params & params, const std::string & value) {
+            GGML_UNUSED(params);
+            GGML_UNUSED(value);
+            LOG_WRN("DEPRECATED: --defrag-thold is deprecated and no longer necessary to specify\n");
+        }
+    ).set_env("LLAMA_ARG_DEFRAG_THOLD"));
+    if (ex == LLAMA_EXAMPLE_SERVER) {
+        // this is to make sure this option appears in the server-specific section of the help message
+        add_opt(common_arg(
+            {"-np", "--parallel"}, "N",
+            string_format("number of server slots (default: %d, -1 = auto)", params.n_parallel),
+            [](common_params & params, int value) {
+                if (value == 0) {
+                    throw std::invalid_argument("error: invalid value for n_parallel\n");
+                }
+                params.n_parallel = value;
+            }
+        ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    } else {
+        add_opt(common_arg(
+            {"-np", "--parallel"}, "N",
+            string_format("number of parallel sequences to decode (default: %d)", params.n_parallel),
+            [](common_params & params, int value) {
+                params.n_parallel = value;
+            }
+        ).set_env("LLAMA_ARG_N_PARALLEL"));
+    }
+    add_opt(common_arg(
+        {"-ns", "--sequences"}, "N",
+        string_format("number of sequences to decode (default: %d)", params.n_sequences),
+        [](common_params & params, int value) {
+            params.n_sequences = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PARALLEL}));
+    add_opt(common_arg(
+        {"-cb", "--cont-batching"},
+        {"-nocb", "--no-cont-batching"},
+        string_format("whether to enable continuous batching (a.k.a dynamic batching) (default: %s)", params.cont_batching ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cont_batching = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
+    add_opt(common_arg(
+        {"-mm", "--mmproj"}, "FILE",
+        "path to a multimodal projector file. see tools/mtmd/README.md\n"
+        "note: if -hf is used, this argument can be omitted",
+        [](common_params & params, const std::string & value) {
+            params.mmproj.path = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ"));
+    add_opt(common_arg(
+        {"-mmu", "--mmproj-url"}, "URL",
+        "URL to a multimodal projector file. see tools/mtmd/README.md",
+        [](common_params & params, const std::string & value) {
+            params.mmproj.url = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_URL"));
+    add_opt(common_arg(
+        {"--mmproj-auto"},
+        {"--no-mmproj", "--no-mmproj-auto"},
+        string_format("whether to use multimodal projector file (if available), useful when using -hf (default: %s)", params.no_mmproj ? "disabled" : "enabled"),
+        [](common_params & params, bool value) {
+            params.no_mmproj = !value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_DOWNLOAD}).set_env("LLAMA_ARG_MMPROJ_AUTO"));
+    add_opt(common_arg(
+        {"--mmproj-offload"},
+        {"--no-mmproj-offload"},
+        string_format("whether to enable GPU offloading for multimodal projector (default: %s)", params.mmproj_use_gpu ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.mmproj_use_gpu = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
+    add_opt(common_arg(
+        // note: "-mmdev" must sort after "--rpc" in the preset map, else RPC devices are not registered yet
+        {"-mmdev", "--mmproj-device"}, "DEVICE",
+        "device to use for multimodal projector (none = don't offload, default: follows --device)\n"
+        "use --list-devices to see a list of available devices",
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.mmproj_use_gpu = false;
+                params.mmproj_device  = nullptr;
+                return;
+            }
+            auto devices = parse_device_list(value);
+            // parse_device_list pushes nullptr at back so devices is length 2 for single device.
+            if (devices.size() > 2) {
+                throw std::invalid_argument("only one device may be specified for mmproj");
+            }
+            params.mmproj_use_gpu = true;
+            params.mmproj_device  = devices.front();
+        }
+    ).set_examples(mmproj_examples).set_env("MTMD_BACKEND_DEVICE")); // no LLAMA_ARG_ prefix for backward compatibility reason
+    add_opt(common_arg(
+        {"--image", "--audio", "--video"}, "FILE",
+        "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                params.image.emplace_back(item);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_MTMD, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--image-min-tokens"}, "N",
+        "minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)",
+        [](common_params & params, int value) {
+            params.image_min_tokens = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--image-max-tokens"}, "N",
+        "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)",
+        [](common_params & params, int value) {
+            params.image_max_tokens = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--mtmd-batch-max-tokens"}, "N",
+        string_format("maximum number of image tokens per batch when encoding images (default: %d)", params.mtmd_batch_max_tokens),
+        [](common_params & params, int value) {
+            params.mtmd_batch_max_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--video-fps"}, "N",
+        string_format("target video frame rate (default: %.1f)", params.video_fps),
+        [](common_params & params, const std::string & value) {
+            params.video_fps = std::stof(value);
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FPS"));
+    add_opt(common_arg(
+        {"--video-timestamp-interval"}, "N",
+        string_format("interval in milliseconds between text timestamps (default: %" PRId64 ")", params.video_timestamp_interval_ms),
+        [](common_params & params, int value) {
+            params.video_timestamp_interval_ms = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_TIMESTAMP_INTERVAL"));
+    add_opt(common_arg(
+        {"--video-ffmpeg-dir"}, "DIR",
+        "path to the directory containing ffmpeg and ffprobe (default: search in PATH)",
+        [](common_params & params, const std::string & value) {
+            params.video_ffmpeg_bin_dir = value;
+        }
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_VIDEO_FFMPEG_DIR"));
+    add_opt(common_arg(
+        {"--rpc"}, "SERVERS",
+        "comma-separated list of RPC servers (host:port)",
+        [](common_params & params, const std::string & value) {
+            if (!llama_supports_rpc()) {
+                throw std::invalid_argument("RPC not supported in this build");
+            }
+            add_rpc_devices(value);
+            GGML_UNUSED(params);
+        }
+    ).set_env("LLAMA_ARG_RPC"));
+    add_opt(common_arg(
+        {"-lm", "--load-mode"}, "MODE",
+        "model loading mode (default: auto)\n"
+        "- auto: mmap, unless a device does not support it\n"
+        "- none: no special loading mode\n"
+        "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
+        "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
+        "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
+        "- dio: use DirectIO if available\n",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
+            else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
+            else if (value == "mmap")       { params.load_mode = LLAMA_LOAD_MODE_MMAP;       }
+            else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
+            else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
+            else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_LOAD_MODE"));
+    add_opt(common_arg(
+        {"-lzm", "--lazy-mode"}, "MODE",
+        "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
+        "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
+        "- auto: on, but only for tensors larger than 4 GiB\n"
+        "- off: always keep them resident",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
+            else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
+            else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_LAZY_MODE"));
+    add_opt(common_arg(
+        {"--numa"}, "TYPE",
+        "attempt optimizations that help on some NUMA systems\n"
+        "- distribute: spread execution evenly over all nodes\n"
+        "- isolate: only spawn threads on CPUs on the node that execution started on\n"
+        "- numactl: use the CPU map provided by numactl\n"
+        "if run without this previously, it is recommended to drop the system page cache before using this\n"
+        "see https://github.com/ggml-org/llama.cpp/issues/1437",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
+            else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
+            else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_env("LLAMA_ARG_NUMA"));
+    add_opt(common_arg(
+        {"-dev", "--device"}, "<dev1,dev2,..>",
+        "comma-separated list of devices to use for offloading (none = don't offload)\n"
+        "use --list-devices to see a list of available devices",
+        [](common_params & params, const std::string & value) {
+            params.devices = parse_device_list(value);
+        }
+    ).set_env("LLAMA_ARG_DEVICE"));
+    add_opt(common_arg(
+        {"--list-devices"},
+        "print list of available devices and exit",
+        [](common_params &) {
+            common_print_available_devices();
+            exit(0);
+        }
+    ));
+    add_opt(common_arg(
+        {"-ot", "--override-tensor"}, "<tensor name pattern>=<buffer type>,...",
+        "override tensor buffer type", [](common_params & params, const std::string & value) {
+            parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
+        }
+    ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"-cmoe", "--cpu-moe"},
+        "keep all Mixture of Experts (MoE) weights in the CPU",
+        [](common_params & params) {
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_env("LLAMA_ARG_CPU_MOE"));
+    add_opt(common_arg(
+        {"-ncmoe", "--n-cpu-moe"}, "N",
+        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
+        }
+    ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"-ncffn", "--n-cpu-ffn"}, "N",
+        "keep the dense FFN weights of the first N layers in the CPU\n"
+        "(dense models; for MoE expert weights use --n-cpu-moe)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
+        }
+    ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
+    add_opt(common_arg(
+        {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
+        string_format("max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)", params.n_gpu_layers == -1 ? "auto" : "all"),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.n_gpu_layers = -1;
+            } else if (value == "all") {
+                params.n_gpu_layers = -2;
+            } else {
+                params.n_gpu_layers = std::stoi(value);
+            }
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
+                fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
+                fprintf(stderr, "warning: consult docs/building.md for compilation instructions\n");
+            }
+        }
+    ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
+    add_opt(common_arg(
+        {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
+        "how to split the model across multiple GPUs, one of:\n"
+        "- none: use one GPU only\n"
+        "- layer (default): split layers and KV across GPUs (pipelined)\n"
+        "- row: split weight across GPUs by rows (parallelized)\n"
+        "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.split_mode = LLAMA_SPLIT_MODE_NONE;
+            } else if (value == "layer") {
+                params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+            } else if (value == "row") {
+                params.split_mode = LLAMA_SPLIT_MODE_ROW;
+            } else if (value == "tensor") {
+                params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting the split mode has no effect.\n");
+            }
+        }
+    ).set_env("LLAMA_ARG_SPLIT_MODE"));
+    add_opt(common_arg(
+        {"-ts", "--tensor-split"}, "N0,N1,N2,...",
+        "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+
+            // split string by , and /
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
+                if (i < split_arg.size()) {
+                    params.tensor_split[i] = std::stof(split_arg[i]);
+                } else {
+                    params.tensor_split[i] = 0.0f;
+                }
+            }
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting a tensor split has no effect.\n");
+            }
+        }
+    ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
+    add_opt(common_arg(
+        {"-mg", "--main-gpu"}, "INDEX",
+        string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),
+        [](common_params & params, int value) {
+            params.main_gpu = value;
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting the main GPU has no effect.\n");
+            }
+        }
+    ).set_env("LLAMA_ARG_MAIN_GPU"));
+    add_opt(common_arg(
+        { "-fit", "--fit" }, "[on|off]",
+        string_format("whether to adjust unset arguments to fit in device memory ('on' or 'off', default: '%s')", params.fit_params ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.fit_params = true;
+            } else if (is_falsey(value)) {
+                params.fit_params = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT"));
+    add_opt(common_arg(
+        { "-fitp", "--fit-print" }, "[on|off]",
+        string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.fit_params_print = true;
+            } else if (is_falsey(value)) {
+                params.fit_params_print = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-print: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_ESTIMATE"));
+    add_opt(common_arg(
+        { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
+        string_format("target margin per device for --fit, comma-separated list of values, "
+            "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+
+            // split string by , and /
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            if (split_arg.size() == 1) {
+                std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), std::stoull(split_arg[0]) * 1024*1024);
+                return;
+            }
+            for (size_t i = 0; i < split_arg.size(); i++) {
+                params.fit_params_target[i] = std::stoull(split_arg[i]) * 1024*1024;
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT_TARGET"));
+    add_opt(common_arg(
+        { "-fitc", "--fit-ctx" }, "N",
+        string_format("minimum ctx size that can be set by --fit option, default: %" PRIu32, params.fit_params_min_ctx),
+        [](common_params & params, int value) {
+            params.fit_params_min_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_FIT_CTX"));
+    add_opt(common_arg(
+        {"--check-tensors"},
+        string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),
+        [](common_params & params) {
+            params.check_tensors = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--override-kv"}, "KEY=TYPE:VALUE,...",
+        "advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.\n"
+        "types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false,tokenizer.ggml.add_eos_token=bool:false",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                if (!string_parse_kv_override(item.c_str(), params.kv_overrides)) {
+                    throw std::runtime_error(string_format("error: Invalid type for KV override: %s\n", item.c_str()));
+                }
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--op-offload"},
+        {"--no-op-offload"},
+        string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
+        [](common_params & params, bool value) {
+            params.no_op_offload = !value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--lora"}, "FNAME",
+        "path to LoRA adapter (use comma-separated values to load multiple adapters)",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                params.lora_adapters.push_back({ item, 1.0, "", "", nullptr });
+            }
+        }
+        // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
+    add_opt(common_arg(
+        {"--lora-scaled"}, "FNAME:SCALE,...",
+        "path to LoRA adapter with user defined scaling (format: FNAME:SCALE,...)\n"
+        "note: use comma-separated values",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                auto parts = string_split<std::string>(item, ':');
+                if (parts.size() != 2) {
+                    throw std::invalid_argument("lora-scaled format: FNAME:SCALE");
+                }
+                params.lora_adapters.push_back({ parts[0], std::stof(parts[1]), "", "", nullptr });
+            }
+        }
+        // we define this arg on both COMMON and EXPORT_LORA, so when showing help message of export-lora, it will be categorized as "example-specific" arg
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}));
+    add_opt(common_arg(
+        {"--control-vector"}, "FNAME",
+        "add a control vector\nnote: use comma-separated values to add multiple control vectors",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                params.control_vectors.push_back({ 1.0f, item, });
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--control-vector-scaled"}, "FNAME:SCALE,...",
+        "add a control vector with user defined scaling SCALE\n"
+        "note: use comma-separated values (format: FNAME:SCALE,...)",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                auto parts = string_split<std::string>(item, ':');
+                if (parts.size() != 2) {
+                    throw std::invalid_argument("control-vector-scaled format: FNAME:SCALE");
+                }
+                params.control_vectors.push_back({ std::stof(parts[1]), parts[0] });
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--control-vector-layer-range"}, "START", "END",
+        "layer range to apply the control vector(s) to, start and end inclusive",
+        [](common_params & params, const std::string & start, const std::string & end) {
+            params.control_vector_layer_start = std::stoi(start);
+            params.control_vector_layer_end = std::stoi(end);
+        }
+    ));
+    add_opt(common_arg(
+        {"-a", "--alias"}, "STRING",
+        "set model name aliases, comma-separated (to be used by API)",
+        [](common_params & params, const std::string & value) {
+            for (auto & alias : string_split<std::string>(value, ',')) {
+                alias = string_strip(alias);
+                if (!alias.empty()) {
+                    params.model_alias.insert(alias);
+                }
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ALIAS"));
+    add_opt(common_arg(
+        {"--tags"}, "STRING",
+        "set model tags, comma-separated (informational, not used for routing)",
+        [](common_params & params, const std::string & value) {
+            for (auto & tag : string_split<std::string>(value, ',')) {
+                tag = string_strip(tag);
+                if (!tag.empty()) {
+                    params.model_tags.insert(tag);
+                }
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TAGS"));
+    add_opt(common_arg(
+        {"-m", "--model"}, "FNAME",
+        ex == LLAMA_EXAMPLE_EXPORT_LORA
+            ? "model path from which to load base model"
+            : "model path to load",
+        [](common_params & params, const std::string & value) {
+            params.model.path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_MODEL"));
+    add_opt(common_arg(
+        {"-mu", "--model-url"}, "MODEL_URL",
+        "model download url (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.model.url = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_MODEL_URL"));
+    add_opt(common_arg(
+        { "-dr", "--docker-repo" }, "[<repo>/]<model>[:quant]",
+        "Docker Hub model repository. repo is optional, default to ai/. quant is optional, default to :latest.\n"
+        "example: gemma3\n"
+        "(default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.model.docker_repo = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_DOCKER_REPO"));
+    add_opt(common_arg(
+        {"-hf", "-hfr", "--hf-repo"}, "<user>/<model>[:quant]",
+        "Hugging Face model repository; quant is optional, case-insensitive, default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.\n"
+        "mmproj is also downloaded automatically if available. to disable, add --no-mmproj\n"
+        "example: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M\n"
+        "(default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.model.hf_repo = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_HF_REPO"));
+    add_opt(common_arg(
+        {"-hff", "--hf-file"}, "FILE",
+        "Hugging Face model file. If specified, it will override the quant in --hf-repo (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.model.hf_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_HF_FILE"));
+    add_opt(common_arg(
+        {"-hft", "--hf-token"}, "TOKEN",
+        "Hugging Face access token (default: value from HF_TOKEN environment variable)",
+        [](common_params & params, const std::string & value) {
+            params.hf_token = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("HF_TOKEN"));
+    add_opt(common_arg(
+        {"--mtp"},
+        "also download the multi-token prediction (MTP) head, if available (default: unused)",
+        [](common_params & params) {
+            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+        }
+    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
+    add_opt(common_arg(
+        {"--dflash"},
+        "also download the DFlash sidecar, if available (default: unused)",
+        [](common_params & params) {
+            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH);
+        }
+    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
+    add_opt(common_arg(
+        {"--eagle3"},
+        "also download the Eagle3 sidecar, if available (default: unused)",
+        [](common_params & params) {
+            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3);
+        }
+    ).set_examples({LLAMA_EXAMPLE_DOWNLOAD}));
+    add_opt(common_arg(
+        {"--context-file"}, "FNAME",
+        "file to load context from (use comma-separated values to specify multiple files)",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                std::ifstream file(item, std::ios::binary);
+                if (!file) {
+                    throw std::runtime_error(string_format("error: failed to open file '%s'\n", item.c_str()));
+                }
+                params.context_files.push_back(item);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_RETRIEVAL}));
+    add_opt(common_arg(
+        {"--chunk-size"}, "N",
+        string_format("minimum length of embedded text chunks (default: %d)", params.chunk_size),
+        [](common_params & params, int value) {
+            params.chunk_size = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_RETRIEVAL}));
+    add_opt(common_arg(
+        {"--chunk-separator"}, "STRING",
+        string_format("separator between chunks (default: '%s')", params.chunk_separator.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.chunk_separator = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_RETRIEVAL}));
+    add_opt(common_arg(
+        {"--junk"}, "N",
+        string_format("number of times to repeat the junk text (default: %d)", params.n_junk),
+        [](common_params & params, int value) {
+            params.n_junk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PASSKEY, LLAMA_EXAMPLE_PARALLEL}));
+    add_opt(common_arg(
+        {"--pos"}, "N",
+        string_format("position of the passkey in the junk text (default: %d)", params.i_pos),
+        [](common_params & params, int value) {
+            params.i_pos = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_PASSKEY}));
+    add_opt(common_arg(
+        {"-o", "--output", "--output-file"}, "FNAME",
+        string_format("output file (default: '%s')", params.out_file.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.out_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_CVECTOR_GENERATOR, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_TTS, LLAMA_EXAMPLE_FINETUNE,
+                    LLAMA_EXAMPLE_RESULTS, LLAMA_EXAMPLE_EXPORT_GRAPH_OPS, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MOE_TRACE}));
+    add_opt(common_arg(
+        {"--moe-stream"}, "PATH",
+        "stream the routed MoE experts from the repacked sidecar described by PATH (the "
+        "\"<sidecar>.json\" of tokenwing-tools/experts/expert_repack.py) into per-layer slot pools in RAM instead of "
+        "reading them from the model file",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-slots"}, "N",
+        "expert slots per MoE layer for --moe-stream, must be >= 3*moe_expert_used and <= the number of "
+        "experts a layer has (default: as many as the RAM budget pays for, see --moe-stream-ram)",
+        [](common_params & params, int value) {
+            params.moe_stream_slots = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-log"}, "PATH",
+        "write a per-token miss log of --moe-stream to PATH",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_log = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-io-threads"}, "N",
+        "number of threads that read the expert sidecar for --moe-stream (default: 8)",
+        [](common_params & params, int value) {
+            params.moe_stream_io_threads = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-waves"}, "N",
+        "run the expert matmuls of a ubatch that needs expert waves on the GPU when it has at least N "
+        "tokens (default: 512, below it the matmuls of a wave graph stay on the host). A wave matmul's "
+        "result is [n_ff, k, tokens], so a ubatch of 32 tokens is already above the offload threshold of "
+        "the CUDA backend and GGML_OP_OFFLOAD_MIN_BATCH does not have to be set",
+        [](common_params & params, int value) {
+            params.moe_stream_gpu_waves = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-layers"}, "N",
+        "keep the routed experts of N whole MoE layers on the GPU instead of streaming them: they are "
+        "loaded from the model file and that layer's MoE runs entirely on the GPU, at the cost of one "
+        "layer's worth of experts (1.494 GiB per layer on Ling-3.0-flash). A negative value fits as many "
+        "layers as the free VRAM takes (default: -1, which is 4 layers on a 12 GB card at -c 4096; 0 "
+        "streams every layer)",
+        [](common_params & params, int value) {
+            params.moe_stream_gpu_layers = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-layers-list"}, "LIST",
+        "comma-separated MoE layer indices to keep on the GPU instead of streaming them, e.g. \"5,17,38\" "
+        "(takes precedence over --moe-stream-gpu-layers)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_gpu_layers_list = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-other-rest"}, "SIZE",
+        "llama-server with --moe-stream: the memory the rest of the process uses next to the pools, the weights in RAM and the "
+        "server's snapshots (the KV cache, the compute buffers, the CUDA host allocations), as measured on one machine and model; "
+        "what the 1.51GiB non-pool reserve has left above it holds the server's snapshots and its --cache-disk restore buffer, and "
+        "only what does not fit costs slots (default: 0 = 1093MiB, measured with Ling-3.0-flash at -c 16384 -np 1)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_other_rest = (int64_t) moe_stream_parse_size(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--moe-stream-vram-reserve"}, "SIZE",
+        "VRAM to keep free for the KV cache, the compute buffers and the driver when --moe-stream-gpu-layers "
+        "is negative, so the auto-fit leaves room for them (default: 3.15GiB - the 2GiB measured at 4k ctx plus "
+        "1.15GiB that the fit used to over-count, so the placement stays the measured one; raise it for a large -c or -ub)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_vram_reserve = (int64_t) moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-layers-mode"}, "MODE",
+        "which layers --moe-stream-gpu-layers (negative) keeps on the GPU: 'hot' takes the ones a census "
+        "measured as reading the most, 'last' takes the deepest ones. 'hot' is the default: it is worth "
+        "9 % more decode than 'last', and its KLD against no whole layer at all is 0.073, inside the 0.1528 "
+        "that stock itself pays for putting the routed experts on the host instead of the GPU (tiny, "
+        "measured) - both orders are rounding of the same weights, not a change of the model. "
+        "'hot' uses Ling-3.0-flash's layer ranking (43 blocks); for another model it falls back to "
+        "shallowest-first and says so on stderr",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_gpu_layers_mode = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-hugepages"}, "0|1",
+        "allocate the expert pools 2 MiB-aligned and madvise(MADV_HUGEPAGE) them, so that a 3.13 MB expert "
+        "slice spans 2 page-table entries instead of about 765 4 KiB ones (default: 0 = off, since no "
+        "MoE measurement of THP exists)",
+        [](common_params & params, int value) {
+            params.moe_stream_hugepages = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-pin"}, "0|1",
+        "register the expert pools with the CUDA driver (cudaHostRegister) so that RAM->VRAM copies run at "
+        "full speed and the pool cannot be swapped (default: 0 = off; needs a CUDA context, and the "
+        "registration of a 20 GiB pool takes seconds)",
+        [](common_params & params, int value) {
+            params.moe_stream_pin = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-policy"}, "NAME",
+        "how a layer's pool evicts: 'lru' (default), 'lfu' (the expert used most often, with every "
+        "frequency halved every 64 accesses so the score tracks recent use) or 'slru' (a hit promotes a "
+        "slot out of the probation segment, and victims come from probation first) or 'decay' (the lowest "
+        "decayed use count, see --moe-stream-evict-halflife; a landed guess nobody used is worth 0, a guess for a layer "
+        "that has not run yet in this word is kept; decode only, prompts keep lru)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_policy = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-pred-shared"}, "0|1",
+        "predict the next layer's experts from the residual plus the *shared* expert's output of this "
+        "layer, i.e. run the next router on what the residual will be minus the routed part (Colibri's idea; "
+        "default 0 = off because it makes the prediction wait for the "
+        "shared expert, which is device work the layer already issued)",
+        [](common_params & params, int value) {
+            params.moe_stream_pred_shared = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-pred-recall"}, "0|1",
+        "count recall@8 of the layer-ahead expert guess: the guessed top-8 of layer L+1 is scored against "
+        "L+1's real top-8 when L+1's remap op runs, per layer and per phase, printed by print_stats. It "
+        "only counts, so it does not change the run. Default off",
+        [](common_params & params, int value) {
+            params.moe_stream_pred_recall = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-pred-scores"}, "PREFIX",
+        "write the layer-ahead guess's router scores for ALL experts of every generated word and MoE "
+        "layer to PREFIX.f32 ([n_words, n_layer, n_expert] float32, sigmoid(W.h_hat) + bias, the group "
+        "mask NOT applied) plus PREFIX.json and PREFIX.rows.i32. Default off; it only copies scores the "
+        "graph already computes, so it does not change the run",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_pred_scores = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-pred-input"}, "PREFIX",
+        "record the vector the next layer's router is run on - with --moe-stream-pred-shared 1 the normed "
+        "residual plus this layer's shared expert output, which is what the engine's guess actually sees - "
+        "for 1 generated word in --moe-stream-pred-input-every, every streamed layer, plus that layer's guess "
+        "and the predicted layer's real experts, as PREFIX.{vec.f32,guess.i32,real.i32,rows.i64,json}. It "
+        "only copies vectors the graph already computes, so it does not change the run. Default off",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_pred_input = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-pred-input-every"}, "N",
+        "with --moe-stream-pred-input: record 1 generated word in N (default 8). N = 1 records every "
+        "generated word, which is what a run that compares against --moe-stream-pred-recall wants",
+        [](common_params & params, int value) {
+            params.moe_stream_pred_input_every = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-record"}, "DIR",
+        "write the side-by-side recording of every decode word and streamed layer into DIR: "
+        "the experts the router chose with their weights and whether each was in RAM, "
+        "the raw router logits of the guesses 1-4 layers ahead (all 512 experts), which experts of the next "
+        "four layers were in RAM, and timestamps. It only copies and counts - nothing extra is read, moved "
+        "or evicted, and the text is unchanged. Default off",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_record = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-record-words"}, "N",
+        "with --moe-stream-record: keep at most N decode words (default 1024, ~0.33 MiB of RAM per word on "
+        "Flash); later words are counted as dropped in meta.json",
+        [](common_params & params, int value) {
+            params.moe_stream_record_words = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-overlap"}, "0|1",
+        "compute a layer's experts whose bytes have already landed while the missing ones are still "
+        "being read: remap() returns after issuing the reads and ggml's mul_mat_id waits per slot, in a "
+        "second pass over the experts, so the resident work hides under the read. Lossless - the "
+        "same columns are computed by the same matmuls - but it moves a wait into the CPU backend, so "
+        "it is off by default until it is measured",
+        [](common_params & params, int value) {
+            params.moe_stream_overlap = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-chunk"}, "KiB",
+        "split every demand read of an expert into chunks of this many bytes, so that the I/O "
+        "threads serve one read in parallel (default: 0 = one read per expert)",
+        [](common_params & params, int value) {
+            // 1024*value in int32 overflows above 2 MiB and a negative chunk became "off", so
+            // the product is computed in 64 bits and a chunk is at most one expert block (2 GiB)
+            const int64_t bytes = std::max<int64_t>(0, (int64_t) value) * 1024;
+            params.moe_stream_chunk = (int32_t) std::min<int64_t>(bytes, (int64_t) 2*1024*1024*1024 - 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-chunk-prefetch"}, "KiB",
+        "the same for a prefetch read, which is not on the critical path (default: 0 = one read "
+        "per expert)",
+        [](common_params & params, int value) {
+            const int64_t bytes = std::max<int64_t>(0, (int64_t) value) * 1024;
+            params.moe_stream_chunk_prefetch = (int32_t) std::min<int64_t>(bytes, (int64_t) 2*1024*1024*1024 - 1);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prefetch"}, "0|1",
+        "prefetch the experts that the next layer's router predicts (default: 1)",
+        [](common_params & params, int value) {
+            params.moe_stream_prefetch = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prefetch-m"}, "M",
+        "experts predicted per token for the next MoE layer (default: 0 = the model's experts per token, e.g. 8 on Ling, 6 on Flint)",
+        [](common_params & params, int value) {
+            params.moe_stream_prefetch_m = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prefetch-lead"}, "N",
+        "MoE layers of lead for the expert prefetcher: 1 predicts the next layer only (default), "
+        "2 also guesses the layer after it now and corrects that guess at the next layer",
+        [](common_params & params, int value) {
+            params.moe_stream_prefetch_lead = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prefetch-m2"}, "M",
+        "experts the correction of a two-layer-lead guess covers (default: 0, the same as "
+        "--moe-stream-prefetch-m; measured 0.855 recall at 16/12 against 0.760 at 8/8)",
+        [](common_params & params, int value) {
+            params.moe_stream_prefetch_m2 = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-demand-last"}, "BOOL",
+        "let a queued prefetched read overtake a demand read (default: false, i.e. a demand read, "
+        "which the compute is waiting for, always overtakes a prefetch)",
+        [](common_params & params, int value) {
+            params.moe_stream_demand_last = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prefetch-inflight"}, "N",
+        "cap the guessed reads in flight at once (default: 0, no cap). Measured on one drive that "
+        "a needed read takes 0.76 ms on an idle drive and ~4.7 ms with eight reads queued, so a wide "
+        "early guess can make the stall worse than no guess; a needed read never waits for this cap",
+        [](common_params & params, int value) {
+            params.moe_stream_prefetch_inflight = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-early-order"}, "BOOL",
+        "make this layer's expert ids depend on the early-guess op, so the guess is issued before the "
+        "layer's own expert work instead of whenever the scheduler finds it ready (default: false; "
+        "the dependency is exact - a zero added to the ids - so the output does not change)",
+        [](common_params & params, int value) {
+            params.moe_stream_early_order = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-io-wake"}, "read|chunk",
+        "how many I/O threads a queued read wakes: one per read (default) or one per chunk, so the chunks of a guess run in parallel",
+        [](common_params & params, const std::string & value) {
+            if (value != "read" && value != "chunk") {   // ignored with a warning, the default stays
+                LOG_WRN("--moe-stream-io-wake must be read or chunk - ignored, the default stays\n");
+                return;
+            }
+            params.moe_stream_io_wake = value == "chunk" ? 1 : 0;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-plan"}, "0|1",
+        "1 = a decode word's 1-ahead guess puts its experts on a waiting list, and an I/O thread takes a RAM slot "
+        "for one (and queues its read) only when it has nothing else to read (late binding); the list is empty at every "
+        "word's end (default: 0 = the plain path, the guess's reads are queued at once). Not with --moe-stream-prefetch-lead > 1, "
+        "-prefetch-inflight, -early-order, -demand-last, -oracle or -chance-model / -read-threshold",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-plan must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_plan = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-plan-bind-early"}, "0|1",
+        "TEST ONLY: with --moe-stream-plan 1, every list entry takes its slot and queues its read the moment it is "
+        "added - the plain path's timing through the waiting-list code, for the identity check (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-plan-bind-early must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_plan_bind_early = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-drop-stale"}, "0|1",
+        "with --moe-stream-plan 1, when a layer starts, its waiting-list entries it did not pick are removed (never "
+        "read, never take a slot), and its started guess reads it did not pick lose their pieces not yet read (the slot is "
+        "freed); pieces already being read finish (default: 0 = they are read anyway). Needs --moe-stream-plan 1",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-drop-stale must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_drop_stale = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-needed-early"}, "0|1",
+        "with --moe-stream-plan 1, a decode word's 1-ahead guess is handed to a helper thread that makes "
+        "its waiting-list entries (skipped when the guessed layer has already started); the first part of putting the needed reads first "
+        "and the shared expert and the guess on the GPU during the CPU experts (default: 0). Needs --moe-stream-plan 1",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-needed-early must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_needed_early = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-behind-backlog"}, "B",
+        "with --moe-stream-plan 1 and --moe-stream-behind-rank, the drive counts as behind while B or more reads (needed "
+        "reads and started guess reads, whole reads, waiting or in service) are not finished; while behind, a reader binds only "
+        "waiting-list entries ranked R or better (the others wait on the list) (default: 0 = off). Needs --moe-stream-plan 1",
+        [](common_params & params, int value) {
+            if (value < 0) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 0);
+                LOG_WRN("--moe-stream-behind-backlog must be >= 0: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_behind_backlog = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-behind-rank"}, "R",
+        "with --moe-stream-behind-backlog: while the drive is behind, waiting-list entries whose rank in their guess "
+        "(1 = best) is above R wait (default: 0 = off). Needs --moe-stream-plan 1",
+        [](common_params & params, int value) {
+            if (value < 0) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 0);
+                LOG_WRN("--moe-stream-behind-rank must be >= 0: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_behind_rank = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-top"}, "K",
+        "with --moe-stream-plan 1, a decode word's 1-ahead guess puts its first K ranks on the waiting list: ranks 1..k "
+        "(the model's pick count) first, then k+1..K, read in the drive's spare time like every list entry; K must be >= k and "
+        "<= 32; prompt ubatches keep --moe-stream-prefetch-m (default: 0 = off, the guess width is --moe-stream-prefetch-m). "
+        "Needs --moe-stream-plan 1",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 32) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 32);
+                LOG_WRN("--moe-stream-guess-top must be 0 (off) or 1..32: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_guess_top = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-lookahead"}, "N",
+        "each streamed layer also guesses the streamed layers 2..N ahead (the recorder's lead-d guess: the target's router "
+        "on this layer's guess input); the waiting list keeps votes and the latest rank per entry and is re-sorted once per layer "
+        "(live before dropped, top k before extra ranks, nearest target, more votes, better rank) (default: 2, recommended; 1 = the 1-ahead guess only, max 8). "
+        "N > 1 needs --moe-stream-plan 1 and --moe-stream-drop-stale 1: without them the default falls back to 1 by itself and a value you give is switched off with one line; "
+        "only decode calls of one token use it (other call shapes keep the 1-ahead guess); refused at load on an architecture whose graph does not build the far guesses",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 8) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 1), 8);
+                LOG_WRN("--moe-stream-lookahead must be 1..8: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_lookahead = value;
+            params.moe_stream_lookahead_set = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-pace"}, "B",
+        "with --moe-stream-lookahead N > 1, a far guess (2 or more layers ahead) adds at most B new waiting-list entries "
+        "for its target; its other names still vote (default: 1; unused at N = 1)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 1), 64);
+                LOG_WRN("--moe-stream-guess-pace must be 1..64: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_guess_pace = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-plan-old-order"}, "0|1",
+        "TEST ONLY: with --moe-stream-lookahead N > 1, the waiting list's old order (one class, no live / "
+        "dropped; a started read always finishes first) (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-plan-old-order must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_plan_old_order = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-plan-extra-near"}, "0|1",
+        "TEST ONLY: with --moe-stream-lookahead N > 1, order A - a target's extra ranks (k+1..K) right after its top k, "
+        "before farther targets' entries (default: 0 = order B, every target's top k before any extra rank)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-plan-extra-near must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_plan_extra_near = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-combined"}, "0|1",
+        "with --moe-stream-lookahead N > 1, a layer's N guesses in one step - one norm, one multiply by the N targets' "
+        "gains, the N router products in one op (each row by the same matmul code as a separate guess), one gating, one top-k "
+        "with a bias per row - bit-identical to the separate ops (default: 0 = the separate ops)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-guess-combined must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_guess_combined = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-protect-named"}, "0|1",
+        "with --moe-stream-plan 1, while a streamed layer has not started in this decode word, a READY expert that a guess "
+        "made this word for it named (any distance, any rank) is not a guess read's victim (a bind, at the list or at the pick); a "
+        "needed read ignores the rule (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-protect-named must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_protect_named = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-wordstart"}, "D",
+        "in a decode word of one token, the last D layers before the first streamed layer (VRAM MoE layers, or dense "
+        "layers) each guess the streamed layers 1..N ahead of them (N = --moe-stream-lookahead), as a streamed layer guesses; one CPU "
+        "op after the last of them adds the guesses to the waiting list in the order the layers ran. D above the number of layers "
+        "before the first streamed one is clamped. Needs --moe-stream-plan 1 and --moe-stream-drop-stale 1 (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 8) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 8);
+                LOG_WRN("--moe-stream-wordstart must be 0..8: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_wordstart = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-proj-ready"}, "0|1",
+        "each RAM slot has a ready flag per projection (gate, up, down), and a needed read is issued as two requests, "
+        "gate+up first, then down: the expert matmul starts an expert's gate and up as soon as they land, while its down is "
+        "still being read. Same bytes, same text. Needs --moe-stream-overlap 1 (default: 0 = one flag per slot)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-proj-ready must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_proj_ready = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-inflight"}, "G",
+        "with --moe-stream-plan 1, while no needed read is in service, a reader starts a guess piece or binds a list "
+        "entry only while fewer than G guess pieces are in service (default: 0 = no limit). Needs --moe-stream-plan 1",
+        [](common_params & params, int value) {
+            if (value < 0) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 0);
+                LOG_WRN("--moe-stream-guess-inflight must be >= 0: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_guess_inflight = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-promote"}, "BOOL",
+        "a needed expert whose guess read has chunks still queued moves them to the needed-read queue (default: false)",
+        [](common_params & params, int value) {
+            params.moe_stream_promote = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-cap"}, "N",
+        "while a needed read is queued or running, at most N guess chunks are read at the same time (default: -1 = no cap)",
+        [](common_params & params, int value) {
+            params.moe_stream_guess_cap = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-cap-refill"}, "BOOL",
+        "with --moe-stream-guess-cap: a finished guess chunk wakes a sleeping I/O thread for the freed place while needed reads "
+        "are in flight (default: false; untested)",
+        [](common_params & params, int value) {
+            params.moe_stream_guess_cap_refill = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-evict-halflife"}, "W",
+        "with --moe-stream-policy decay: decode words after which a use counts half (default: 64)",
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (!(v > 0.0f)) {   // ignored with a warning, the default stays
+                LOG_WRN("--moe-stream-evict-halflife must be > 0 - ignored, the default stays\n");
+                return;
+            }
+            params.moe_stream_evict_halflife = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-evict-credit"}, "C",
+        "with --moe-stream-policy decay: value added to an expert the 1-ahead guess ranked in its top 16 but the layer did not choose (default: 0)",
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (!(v >= 0.0f)) {   // ignored with a warning, the default stays
+                LOG_WRN("--moe-stream-evict-credit must be >= 0 - ignored, the default stays\n");
+                return;
+            }
+            params.moe_stream_evict_credit = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prompt-end"}, "first-use|recency",
+        "wave order of a prompt's last ubatch: first-use (default) or recency (the experts the end of the prompt used most go last, so they stay in RAM for the reply)",
+        [](common_params & params, const std::string & value) {
+            if (value != "first-use" && value != "recency") {   // ignored with a warning, the default stays
+                LOG_WRN("--moe-stream-prompt-end must be first-use or recency - ignored, the default stays\n");
+                return;
+            }
+            params.moe_stream_prompt_end = value == "recency" ? 1 : 0;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prompt-end-halflife"}, "T",
+        "with --moe-stream-prompt-end recency: tokens before the end of the prompt after which a use counts half (default: 128)",
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (!(v > 0.0f)) {   // ignored with a warning, the default stays
+                LOG_WRN("--moe-stream-prompt-end-halflife must be > 0 - ignored, the default stays\n");
+                return;
+            }
+            params.moe_stream_prompt_end_halflife = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prompt-values"}, "BOOL",
+        "with --moe-stream-policy decay: a prompt's expert uses count as decode words would (each use weighs 2^(-tokens to the "
+        "end / --moe-stream-evict-halflife)), so the reply starts with values from the end of the prompt (default: false)",
+        [](common_params & params, int value) {
+            params.moe_stream_prompt_values = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-chance-model"}, "FILE",
+        "probability table (JSON) for the 1-ahead guess: read every candidate not in RAM whose probability is at least --moe-stream-read-threshold, best first, instead of the top --moe-stream-prefetch-m (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_chance_model = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-read-threshold"}, "P",
+        "with --moe-stream-chance-model: the probability a 1-ahead candidate needs to be read (default: 0.3)",
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            if (!(v > 0.0f && v <= 1.0f)) {   // ignored with a warning, the default stays
+                LOG_WRN("--moe-stream-read-threshold must be in (0, 1] - ignored, the default stays\n");
+                return;
+            }
+            params.moe_stream_read_threshold = v;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-skip-zero"}, "0|1",
+        "a ubatch that runs in waves on the CPU gives every (token, expert) pair outside the wave one of the pool's "
+        "all-zero slices; with 1 the CPU expert matmul writes 0 for those pairs instead of computing them (exactly the "
+        "same output, less work). Not with --moe-stream-cpu-repack (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-skip-zero must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_skip_zero = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-slot-check"}, "0|1",
+        "1 = an expert of a MoE layer that has no RAM slot when its matmul runs stops the run with a message (layer, expert, "
+        "token) instead of silently adding 0; in a ubatch that runs in waves, every (token, expert) pair must get a slot "
+        "exactly once over the waves. 0 = off, for an emergency only (default: 1)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-slot-check must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_slot_check = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-wave-plan"}, "0|1",
+        "1 = a ubatch that runs in waves gets its waves from a plan built once at the first wave: the experts already in RAM "
+        "first (so none is evicted before its wave), then the misses; each expert in one wave, every pair in exactly one wave "
+        "(in a prompt's last ubatch: ascending recency, so the last wave keeps the most recent). 0 = the plain waves by "
+        "first-use rank (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-wave-plan must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_wave_plan = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-wave-victim"}, "0|1",
+        "1 = in a ubatch that runs in waves, a slot keeps its wave mark until the call's last wave, so a later wave takes the "
+        "experts an earlier wave of the call already used as victims first (by default the marks are cleared at every wave, so that "
+        "rule never fires). 0 = off (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-wave-victim must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_wave_victim = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-experts"}, "N",
+        "keep the first N experts of every streamed MoE layer's ranked list (--moe-stream-vram-experts-file) in VRAM: the "
+        "GPU computes their pairs, the CPU the rest, and the SSD code never reads them. One VRAM pool for all layers plus "
+        "n_expert_used all-zero slices, allocated after the KV cache and the compute buffers; the run stops if it does not "
+        "fit with --moe-stream-vram-experts-margin left. Changes the rounding of those experts (GPU math) (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 0);
+                LOG_WRN("--moe-stream-vram-experts must be >= 0: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_experts = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-experts-file"}, "FNAME",
+        "the ranked expert list per MoE layer for --moe-stream-vram-experts (JSON, format \"tokenwing vram-experts v1\", made by "
+        "tokenwing-tools/experts/make_vram_list.py) (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_vram_experts_file = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-experts-margin"}, "SIZE",
+        "VRAM that must still be free after the VRAM expert pool and the compute buffers, e.g. 512MiB; the run stops "
+        "otherwise and names the largest N that fits (default: 512MiB)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_vram_experts_margin = (int64_t) moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-free"}, "SIZE",
+        "size the VRAM experts pool from the free VRAM instead of a pinned N: N per streamed layer = the largest count that still "
+        "leaves this much VRAM free at the END state (after a full prompt), e.g. 200MiB. The fit takes the free VRAM after the KV "
+        "cache and the compute buffers, minus the pool, minus --moe-stream-vram-growth (what the CUDA runtime still adds lazily "
+        "after that check). With --moe-stream-vram-experts N as well, N is a cap. The experts come from the list "
+        "(--moe-stream-vram-experts-file, 64 per layer). The run prints the fit and, once, the real end state (default: unset = "
+        "off, the pinned N and --moe-stream-vram-experts-margin decide)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_vram_free = (int64_t) moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-scratch"}, "SIZE",
+        "with --moe-stream-vram-free: the size the CUDA backend's op scratch pool is mapped at before the load-time check, so the "
+        "check sees the biggest temporary buffer of a prompt batch (0 = not mapped, the pool then grows over the first long prompts "
+        "and the growth reserve covers it; default: ubatch x hidden size x 8 bytes, a calibration on Ling-3.0-flash, not a derivation - other "
+        "models set this value; printed at start-up)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_vram_scratch = (int64_t) moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-growth"}, "SIZE",
+        "with --moe-stream-vram-free: the VRAM the CUDA runtime still adds after the load-time check (op scratch buffers of the "
+        "biggest prompt batch, CUDA graph instances), kept free in addition to the end-state value. The cuBLAS handle and "
+        "workspace are created before the check, so they are not in it (default: derived from the ubatch size, printed at "
+        "start-up)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_vram_growth = (int64_t) moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-correction"}, "FNAME",
+        "the trained correction file of the router-trick guess (tokenwing-tools/correction/make_correction.py, built for Ling 3.0 Flash). "
+        "For each (layer, lead) pair in the file the guess is made with W' = W_X*g_X + Bt instead of W_X (same product, same cost); "
+        "the matrices are allocated on the routers' own devices at model load, so a later --moe-stream-vram-free sees them as used "
+        "VRAM. Needs --moe-stream-pred-shared 1. A damaged file, another model or quant, or a setting it does not fit = the plain guess "
+        "and one line saying why, never an abort (default: unset = the plain guess)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_correction = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-idle-load"}, "0|1",
+        "1 = idle-time loading: after the model is loaded, and after every request once no call has come for --moe-stream-idle-pause, "
+        "EMPTY RAM slots are filled with the most-used experts of the usage table (--moe-stream-usage-file), at the lowest read "
+        "priority; it never evicts an expert, and a request stops it at once. The table is counted live (picks per expert per layer) "
+        "and saved next to the sidecar by an atomic replace; the first start reads <table>-seed (counted from recordings) when the table "
+        "does not exist yet. Not with elastic RAM (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-idle-load must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_idle_load = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-usage-file"}, "FNAME",
+        "the usage table of --moe-stream-idle-load (\"tokenwing usage v1\"; default: next to the sidecar, <sidecar>.usage.json; "
+        "its seed is the same name with -seed before .json). Keep it on the internal drive the model streams from",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_usage_file = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-idle-pause"}, "MS",
+        "with --moe-stream-idle-load 1, no call for this many milliseconds = idle (default: 500)",
+        [](common_params & params, int value) {
+            if (value <= 0) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 1);
+                LOG_WRN("--moe-stream-idle-pause must be > 0: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_idle_pause_ms = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-read-ahead"}, "0|1",
+        "1 = read-ahead in big prompt calls (calls of at least --moe-stream-read-ahead-min tokens, which use most of every layer's "
+        "experts): while layer L's expert stage runs, the most-used experts of the next streamed layer (the usage table of "
+        "--moe-stream-usage-file, up to a wave's width) are read into that layer's own EMPTY slots at a guess's priority, below layer "
+        "L's needed reads; that layer then finds them in RAM. Needs --moe-stream-wave-plan 1; a --moe-stream-window call does this "
+        "itself (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-read-ahead must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_read_ahead = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-read-ahead-min"}, "N",
+        "--moe-stream-read-ahead only in calls of at least N tokens (default: 4096)",
+        [](common_params & params, int value) {
+            if (value <= 0) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 1);
+                LOG_WRN("--moe-stream-read-ahead-min must be > 0: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_read_ahead_min = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-window"}, "0|1",
+        "1 = in a layer-major prompt call of at least --moe-stream-read-ahead-min tokens whose layers need more than one wave, the RAM "
+        "pools are one window over the layers (the same total): while a layer computes, the next streamed layers' most-used experts "
+        "(the usage table) are read into room taken from finished layers, empty slots and - in a full RAM - the layers farthest ahead, "
+        "below the running layer's needed reads; a finished layer keeps its share's worth of the call's experts by the prompt-end "
+        "weight, set for the reply. Needs --moe-stream-layer-major 1 and --moe-stream-wave-plan 1; not with --moe-stream-elastic / "
+        "--moe-stream-shares / --moe-stream-hugepages / --moe-stream-pin (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-window must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_window = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-window-keep"}, "F",
+        "with --moe-stream-window 1, a finished layer keeps F x its share during the call (0 < F <= 1) and the rest is read "
+        "back after the prompt, below the reply's own reads (default: 1)",
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (!(f > 0.0f && f <= 1.0f)) {   // ignored with a warning, the default stays
+                LOG_WRN("--moe-stream-window-keep must be in (0, 1] - ignored, the default stays\n");
+                return;
+            }
+            params.moe_stream_window_keep = f;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prompt-defer"}, "0|1",
+        "1 = a prompt call whose expert matmuls run on the CPU (CPU-only, and on a GPU machine the CPU waves under "
+        "--moe-stream-gpu-waves) leaves the wait for its reads to mul_mat_id, which computes the experts already in RAM while the rest "
+        "land (as one-word calls do); never a matmul the GPU runs. Needs --moe-stream-overlap 1 (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-prompt-defer must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_prompt_defer = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prompt-split"}, "0|1",
+        "1 = in a prompt call whose expert matmuls run on the CPU (under --moe-stream-gpu-waves), the GPU "
+        "computes the VRAM-held experts' pairs beside the CPU split (the router's ids, input and guess handed to the CPU through a pinned "
+        "slot), not after it - the multi-token form of --moe-stream-vram-parallel. Needs --moe-stream-vram-parallel 1, "
+        "--moe-stream-needed-early 1 and --moe-stream-gpu-waves (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-prompt-split must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_prompt_split = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-prompt-split-places"}, "N",
+        "with --moe-stream-prompt-split 1, the VRAM tail places a prompt call borrows (the lowest-value experts' places; "
+        "two halves, the next layer's guessed experts copied into one while the other is computed), given back at the call's end "
+        "(default: 128)",
+        [](common_params & params, int value) {
+            if (value < 2) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 2);
+                LOG_WRN("--moe-stream-prompt-split-places must be at least 2: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_prompt_split_places = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-wave-skip-zero"}, "0|1",
+        "1 = a GPU prompt matmul over expert waves (the scheduler's per-wave copy) or the VRAM pool's prompt pass skips the "
+        "pairs that point at the all-zero slices and writes 0 in their output rows (what those slices give), on CUDA; the multi-token form "
+        "of --moe-stream-gpu-skip-zero (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-gpu-wave-skip-zero must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_gpu_wave_skip_zero = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow"}, "0|1",
+        "with --moe-stream-vram-experts N, the VRAM expert pool moves with the text: while a reply is "
+        "written, every --moe-stream-vram-follow-tick words up to --moe-stream-vram-follow-swaps of the most-picked experts not "
+        "held replace the least-picked held ones (AI-der's rule), copied from their RAM slot on a second GPU stream (default: 0 = "
+        "the VRAM experts stay put)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-vram-follow must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_follow = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow-tick"}, "N",
+        "a tick (the swaps) every N reply words (default: 8)",
+        [](common_params & params, int value) {
+            if (value < 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 1);
+                LOG_WRN("--moe-stream-vram-follow-tick must be 1 or more: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_follow_tick = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow-swaps"}, "N",
+        "at most N swaps per tick (default: 64)",
+        [](common_params & params, int value) {
+            if (value < 0) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 0);
+                LOG_WRN("--moe-stream-vram-follow-swaps must be 0 or more: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_follow_swaps = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow-recent"}, "N",
+        "the recent pick count (the rank) is halved every N reply words (default: 256)",
+        [](common_params & params, int value) {
+            if (value < 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 1);
+                LOG_WRN("--moe-stream-vram-follow-recent must be 1 or more: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_follow_recent = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow-longterm"}, "N",
+        "the long-term pick count (the tie-break) is halved every N reply words (default: 1024)",
+        [](common_params & params, int value) {
+            if (value < 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 1);
+                LOG_WRN("--moe-stream-vram-follow-longterm must be 1 or more: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_follow_longterm = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow-ratio"}, "R",
+        "a swap needs the incoming expert's recent count > floor(R x the leaving one's) + --moe-stream-vram-follow-margin "
+        "(default: 1.25 = AI-der's cold + cold/4)",
+        [](common_params & params, const std::string & value) {
+            const float r = std::stof(value);
+            if (!(r >= 1.0f)) {   // ignored with a warning, the default stays
+                LOG_WRN("--moe-stream-vram-follow-ratio must be 1.0 or more - ignored, the default stays\n");
+                return;
+            }
+            params.moe_stream_vram_follow_ratio = r;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow-margin"}, "N",
+        "the margin of the swap rule (default: 4)",
+        [](common_params & params, int value) {
+            if (value < 0) {   // clamped with a warning
+                const int v0 = value;
+                value = std::max(value, 0);
+                LOG_WRN("--moe-stream-vram-follow-margin must be 0 or more: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_follow_margin = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow-fixed"}, "0|1",
+        "test only: every decided swap is switched at the next call start, copying there (from the RAM slot, or the "
+        "sidecar), so the held set depends on the text only (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-vram-follow-fixed must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_follow_fixed = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-follow-pinned"}, "0|1",
+        "the uploader copies through a pinned bounce buffer; 0 = straight from the RAM slot (default: 1)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-vram-follow-pinned must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_follow_pinned = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-parallel"}, "0|1",
+        "with --moe-stream-vram-experts (with or without --moe-stream-vram-follow) and --moe-stream-needed-early 1, "
+        "the VRAM pool's device pass of a one-token decode call runs in each layer's GPU launch right after \"router done\" - "
+        "during the CPU experts - with its ids from a per-layer table in VRAM; prompts and other calls keep the plain order. Off "
+        "with one start-up line when needed-early's GPU form is not active (default: 0 = the device pass after the CPU experts)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-vram-parallel must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_parallel = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-copyback"}, "0|1",
+        "with --moe-stream-vram-follow 1, an expert that leaves VRAM follow's set is copied back GPU -> RAM into its "
+        "layer's pool (no SSD read) when the pool has an empty slot or the expert's keep value is above the pool's lowest one, "
+        "and the picks of held experts count in the pool's keep value (default: 0 = the leaving expert is dropped)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-vram-copyback must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_copyback = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-async-h2d"}, "0|1",
+        "with --moe-stream on one GPU (no pipeline parallelism), a CPU split's output that lies in the GPU's pinned "
+        "host buffer goes to the next GPU split as an async host -> device copy on the GPU's stream, without the host waiting for "
+        "the GPU (default: 0 = a synchronous copy, as before)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-async-h2d must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_async_h2d = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-skip-zero"}, "0|1",
+        "with --moe-stream-vram-experts: the GPU's one-token expert matmul writes 0 for the pairs that name one of the VRAM "
+        "pool's all-zero slices instead of reading them (exactly the same output, less GPU memory traffic) (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-gpu-skip-zero must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_gpu_skip_zero = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-x4"}, "0|1|2",
+        "the CPU expert matmul on plain MXFP4 pools: 0 = one row per call (ggml's kernel), 1 = a 4-row AVX-512 VNNI kernel "
+        "with 256-bit registers, 2 = the same with 512-bit registers; exactly the same output; x86 only (default: 0; "
+        "1 was the faster one on the CPU measured)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 2) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 2);
+                LOG_WRN("--moe-stream-cpu-x4 must be 0, 1 or 2: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_x4 = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-x4-prefetch"}, "next|none|N",
+        "software prefetch of the --moe-stream-cpu-x4 kernel: next = the same block of the next 4-row group, none, or N = "
+        "N blocks of 17 bytes ahead in the row (default: next; without it the 4-row kernel is slower than one row per call)",
+        [](common_params & params, const std::string & value) {
+            if (value == "next") {
+                params.moe_stream_cpu_x4_pf = -1;
+            } else if (value == "none") {
+                params.moe_stream_cpu_x4_pf = 0;
+            } else {
+                const int n = std::stoi(value);
+                if (n < 1) {   // ignored with a warning, the default stays
+                    LOG_WRN("--moe-stream-cpu-x4-prefetch must be next, none or a block count >= 1 - ignored, the default stays\n");
+                    return;
+                }
+                params.moe_stream_cpu_x4_pf = n;
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-fuse"}, "0|1",
+        "1 = for one token, the CPU runs the MoE gate matmul, up matmul and SwiGLU as one step (activation quantized once, "
+        "one chunk queue over all experts); exactly the same output (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-fuse must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_fuse = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-dispatch"}, "0|1",
+        "1 = for one token, the CPU's expert matmul (mul_mat_id) splits its work as ik_llama.cpp does: one chunk queue "
+        "over all its experts, one long row range per thread and expert, ready experts first; exactly the same output "
+        "(default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-dispatch must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_dispatch = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-pieces"}, "N",
+        "for one token, the CPU's expert steps (the fused gate/up step of --moe-stream-cpu-fuse 1 and the split of "
+        "--moe-stream-cpu-dispatch 1) cut each expert into N work pieces per thread instead of 1 (16-row boundaries); the "
+        "threads take pieces as they finish, so the step's last piece is shorter and fewer threads wait for the slowest; "
+        "exactly the same output (default: 1)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 1), 64);
+                LOG_WRN("--moe-stream-cpu-pieces must be 1..64: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_pieces = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-conv1"}, "0|1",
+        "1 = for one token, the CPU's expert steps (as --moe-stream-cpu-pieces) convert the token's activation row to the "
+        "kernel's format on one thread instead of a slice per thread (upstream #29308: no cache line written by two "
+        "cores); exactly the same output (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-conv1 must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_conv1 = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-weighted-sum"}, "0|1",
+        "1 = with --moe-stream: in a layer whose MoE tail runs on the CPU (-ngl 0, a CPU-only machine, the layers -ngl N "
+        "leaves on the CPU), the routing-weight multiply and the sum over the chosen experts are one CPU op instead of a mul "
+        "and n-1 adds (one barrier instead of n); exactly the same output. Not in: GPU layers, the last CPU layer before a "
+        "GPU layer (its sum runs on the GPU), a layer with the VRAM experts pass, a layer whose experts are not in host "
+        "memory (e.g. a whole VRAM layer), and a prompt batch a GPU backend would take by op offload. The start-up line "
+        "says how many layers fuse (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-weighted-sum must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_wsum = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-iqk"}, "N",
+        "N > 0 = with --moe-stream: the CPU's picked-expert matmul (MUL_MAT_ID) in calls of 32+ tokens uses ik_llama.cpp's kernels (x86, AVX2 or AVX-512) for each "
+        "expert that gets N or more rows (Q8_0 experts: max(8, N/4)), for Q4_K, Q5_K, IQ4_XS, IQ3_S and Q8_0 weights; every other expert, format or machine keeps "
+        "the plain path. Replies are not touched. Rounding-level differences (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                LOG_WRN("--moe-stream-cpu-iqk must be >= 0: %d -> 0\n", value);
+                value = 0;
+            }
+            params.moe_stream_cpu_iqk = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-mmid-merge"}, "0|1",
+        "1 = with --moe-stream: the CPU's tiled picked-expert matmul (MUL_MAT_ID, prompts) runs a thread's consecutive 64-row weight "
+        "groups of an expert as one window of up to 256 rows, so that expert's activation rows are unpacked once per thread instead of "
+        "once per group. The same bits (each value is summed in the same order); any CPU (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-mmid-merge must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_mmid_merge = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-skip-full"}, "0|1",
+        "1 = with --moe-stream: a reply word's combined guess skips the target layers that hold every expert in RAM (all READY; "
+        "checked at every call's start, so a layer that loses an expert - a prompt's give-back, an eviction - is guessed again from the "
+        "next word). The same text; the guess's own CPU work saved where layers are full. CPU-only machines; a GPU machine's guess is "
+        "unchanged (its skip is --moe-stream-guess-skip-full-gpu) (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-guess-skip-full must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_guess_skip_full = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-nonpool-measured"}, "0|1",
+        "1 = the memory held back outside the expert pools comes from this run's own needs: the KV cache, the host compute buffers and the "
+        "rest of the process are measured in the run and kept in a record next to the sidecar (<sidecar>.nonpool.txt, one line per set of "
+        "settings); the next start with the same settings sizes the pools from it. Without a record: the fixed reserve. "
+        "A start that needs more than planned gives back slots, one line (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-nonpool-measured must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_nonpool_measured = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-nonpool-growth"}, "SIZE",
+        "with --moe-stream-nonpool-measured 1: bytes held back on top of the record (default: 128MiB)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_nonpool_growth = moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-guess-skip-full-gpu"}, "0|1",
+        "1 = with --moe-stream-guess-skip-full 1 on a GPU machine: the GPU's combined guess (its router rows) and its top-k skip the "
+        "target layers that hold every expert in RAM; the engine copies the 'full' bytes to the GPU at each call's start, the kernels "
+        "read them there (a CUDA GPU; elsewhere nothing changes). The same text (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-guess-skip-full-gpu must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_guess_skip_full_gpu = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-fuse-small"}, "MASK",
+        "with --moe-stream: fewer small CPU steps, the same results. A sum of: 1 = a reply's router chain (sigmoid, top-k, get_rows, "
+        "sum_rows, clamp, div) on one thread with one wait instead of one per step; 2 = each guess's chain (sigmoid, top-k, cont) the same; "
+        "64 = consecutive one-row matmuls on the same input (Q / K / V, the shared expert's gate / up) with one input conversion and "
+        "two waits. Only steps that run on the CPU; GPU work is untouched (default: 0)",
+        [](common_params & params, int value) {
+            const int v0 = value;
+            value &= (1 | 2 | 64);
+            if (value != v0) {
+                LOG_WRN("--moe-stream-cpu-fuse-small takes the bits 1, 2 and 64: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_fuse_small = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-fa"}, "0|1|2",
+        "with --moe-stream: CPU flash attention with a q8_0 K and V cache. 0 = as before; 1 = prompts take the tiled path (each K / V "
+        "tile converted to f32 once) and a one-row call with 512+ cached tokens splits the cache over the threads, the q heads that share "
+        "a KV head reading each K / V row together, each row's range cut to its unmasked columns (rounding-level against 0); 2 = "
+        "ik_llama.cpp's kernel (not built: falls back to 0 with one line) (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 2) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 2);
+                LOG_WRN("--moe-stream-cpu-fa must be 0, 1 or 2: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_fa = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-q8-tiled"}, "N",
+        "with --moe-stream: q8_0 weights (attention, shared experts, dense layers, output head) take the CPU's tiled matmul "
+        "from N activation rows up (1 = from 12 rows, measured on one machine; 2 or more = from N rows, at least the tiled path's own 8) "
+        "- prompts - with Q8_K activations and a float scale per 32 values (rounding-level against the "
+        "Q8_0 path). One row (replies) keeps the default kernel. x86 with AVX2 or AVX-512 VNNI; q8_0 experts (MUL_MAT_ID) stay on "
+        "their own path (default: 0 = off)",
+        [](common_params & params, int value) {
+            params.moe_stream_cpu_q8_tiled = std::max(value, 0);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-topk"}, "0|1",
+        "1 = with --moe-stream on a machine with no GPU device: the router's and the guesses' top-k pick reads each row once and "
+        "keeps the k largest (largest first) instead of sorting all experts - the same ids in the same order; a row with a NaN "
+        "or with two equal values among its k+1 largest is sorted as before. A GPU machine's graphs are "
+        "unchanged (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-topk must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_topk = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-down-scale"}, "0|1",
+        "1 = with --moe-stream: skip the down projection's input scale step of mistral4 / mellum / flint (#30861: the input divided "
+        "by a power of two and the output multiplied back, a guard for GPU kernels' f16 sums) in the layers where it is exact: the "
+        "down matmul runs on the CPU (no GPU device, or a call under the GPU offload size, never a GPU wave) and its weights' CPU "
+        "kernel quantizes the input with a float block scale (Q8_K: the K-quant and IQ formats; a q8_0 down keeps the step). The "
+        "same output while every row's max |x| <= 2^22. Test only: MOE_STREAM_TEST_DOWN_SCALE_COUNT=1 counts the rows the step "
+        "would have scaled (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-down-scale must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_down_scale = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-state-inplace"}, "0|1",
+        "1 = with --moe-stream: in a linear-attention layer (Gated DeltaNet / KDA) on the CPU device (-ngl 0, a CPU-only "
+        "machine, the layers -ngl N leaves on the CPU), the delta step reads the recurrent state straight from its cache "
+        "slot and writes the new state straight back (no copy of the state before and after the step), for one sequence "
+        "per batch and no snapshot slots; and a GET_ROWS with fewer rows than threads is copied by all threads. Exactly "
+        "the same output. The start-up line lists the layers (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-state-inplace must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_state_inplace = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-small-ops"}, "0|1",
+        "1 = with --moe-stream: on the CPU, the grouped expert pick (--moe-stream-fused-route's op) takes the top k from the "
+        "kept groups only (when two of the best scores are equal it sorts everything, as before), and CONCAT with fewer "
+        "planes than threads is split over the threads. Exactly the same output (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-cpu-small-ops must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_cpu_small_ops = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-fused-route"}, "0|1",
+        "the expert selection of every router and every 1-ahead guess (selection bias, expert groups, top k) as one "
+        "op (one GPU kernel) instead of the argsort chain (~11 kernels); same experts in the same order, so the same "
+        "output (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-fused-route must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_fused_route = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-conv-silu"}, "0|1",
+        "Ling (bailingmoe3) KDA layers: apply the conv's SiLU before the reshape instead of after it, so the CUDA "
+        "backend runs conv + SiLU as one kernel (its existing fusion); the same function on the same values "
+        "(default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-conv-silu must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_conv_silu = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-share-q8"}, "0|1",
+        "CUDA: matvecs (one to eight rows) that read exactly the same input bytes in one graph compute share one "
+        "q8_1 copy of the input instead of quantizing it again each (e.g. 6 per Ling KDA layer -> 1); the same bits. "
+        "Process-wide (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-gpu-share-q8 must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_gpu_share_q8 = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-probation"}, "BOOL",
+        "make a prefetched slot that nobody used the first eviction victim (default: false, i.e. "
+        "uncovered prefetches are protected from eviction)",
+        [](common_params & params, int value) {
+            params.moe_stream_probation = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-max-waves"}, "N",
+        "cap the expert waves a ubatch and layer is split into (default: 0, the bound that is always enough). "
+        "Every wave beyond the one the experts need still runs its expert matmuls, on all-zero weights, so a "
+        "cap that is too small costs speed and one that is too large costs more speed. A ubatch that needs more "
+        "waves than the cap is an error.",
+        [](common_params & params, int value) {
+            params.moe_stream_max_waves = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-ram"}, "SIZE",
+        "RAM budget for the --moe-stream expert pools, e.g. 20GiB; the slots per MoE layer follow from it. "
+        "It is a cap: the pools never take more than what the machine can spare (see --moe-stream-ram-free), "
+        "and --moe-stream-slots wins over both",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_ram = moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-ram-free"}, "SIZE",
+        "RAM to keep free for everything else, so the expert pools are sized from what the machine can "
+        "spare: MemAvailable - this - the weights that stay in RAM. A negative value keeps no margin "
+        "(default: 2.5GiB)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_ram_free = (int64_t) moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-elastic"}, "0|1",
+        "1 = elastic RAM: the expert pools give RAM back the moment the kernel's memory-pressure signal (PSI) "
+        "says another program needs it (the least valuable experts are dropped, their pages returned), and take RAM back at a "
+        "reply's end or a new request when at least --moe-stream-elastic-opts growmin is free, down to --moe-stream-ram-margin; "
+        "never above the process's memory cgroup limit; tunables in --moe-stream-elastic-opts (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-elastic must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_elastic = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-ram-margin"}, "SIZE",
+        "with --moe-stream-elastic 1: RAM the engine leaves free when it takes RAM back (default: 500MiB)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_ram_margin = (int64_t) moe_stream_parse_size(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-elastic-opts"}, "K=V,...",
+        "elastic RAM tunables: step=SIZE given back per pressure event (512MiB), growmin=SIZE free RAM needed before "
+        "taking back (1GiB), cool=SECONDS after a give-back before taking back (60), stall=US of memory stall in 2 s that fires the "
+        "signal (100000), ceiling=N the most slots a layer's pool can ever hold (address space only; default: what all RAM holds)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_elastic_opts = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-shares"}, "0|1",
+        "1 = slot shares per layer that adapt: one slot at a time (1 % steps) moves from the layer that would "
+        "miss it least to the one where one more slot saves the most SSD reads (ghost lists of evicted experts), on long averages, "
+        "with floors, ceilings and cool-downs; decode words only; tunables in --moe-stream-share-opts (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-shares must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_shares = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-share-file"}, "FNAME",
+        "with --moe-stream-shares 1: the starting split, one line 'slots <model layer> <slots>' per layer (default: equal shares)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_share_file = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-share-opts"}, "K=V,...",
+        "slot-share tunables: step=PCT of the giving layer per move (1), every=N decode words between checks (64), "
+        "gap=X the gain over the loss a move needs (1.5), hits=N ghost hits needed (32), cool=N words before the same pair moves "
+        "again (512), half=N words half-life of the history (256), floor=PCT / ceil=PCT of the equal share (25 / 300), min=N slots "
+        "per layer below which the feature is off (24)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_share_opts = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-layer-major"}, "0|1",
+        "1 = a prompt call of 2 or more ubatches runs layer by layer: every ubatch through one layer, then every ubatch through the "
+        "next (the hidden state kept between them, the attention memory applied once and replayed), and each streamed layer's experts "
+        "run once for the whole call, so each expert is read about once per call. The engine raises -b to the context "
+        "size (see --moe-stream-layer-major-batch) so a whole prompt arrives in one call. Runs only where the model has a layer range "
+        "(Ling-3.0), without MTP snapshot slots and with one sequence per call; otherwise the plain path. Default 0 = off",
+        [](common_params & params, int value) {
+            params.moe_stream_layer_major = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-layer-major-batch"}, "N",
+        "with --moe-stream-layer-major 1 the engine raises -b to the context size; N > 0 caps that raise at N tokens per call (a "
+        "larger -b given by the user stays). A call's own tensors take (2 x n_embd + 2 x top-k) x 4 bytes per token (Ling-3.0-flash: "
+        "20.1 KiB, 321 MiB at 16k): in the VRAM pool's tail with --moe-stream-vram-free (places that hold experts between prompts), "
+        "else a buffer of their own while the prompt runs. Default 0 = no cap",
+        [](common_params & params, int value) {
+            params.moe_stream_layer_major_batch = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-end-fill"}, "N",
+        "with --moe-stream-vram-free's pool tail (a GPU-wave prompt empties it): 1 = refill the tail's free places at the end of the call "
+        "that ends a prompt, best first by that call's prompt-end weights (its last tokens' experts; only experts READY in RAM, never an "
+        "SSD read), instead of at the first reply word by VRAM follow's counts; 2 = also one VRAM follow tick over the per-layer VRAM places with the same "
+        "weights. Default 0 = off",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 2) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 2);
+                LOG_WRN("--moe-stream-vram-end-fill must be 0, 1 or 2: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_vram_end_fill = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-copy-ahead"}, "0|1|2|3",
+        "with --moe-stream-vram-free's pool tail, GPU prompts copy the next wave's / layer's experts into the tail while this wave "
+        "computes, and a prompt whose experts all fit one wave (every expert in RAM) takes the engine's own copy (tail waves) instead of the "
+        "scheduler's whole-pool copy. Two sets of copy places: each step (the next wave or the next layer) copies into the other set "
+        "while this one computes; one set: the next step's experts go into the places this wave's gate / up matmuls have finished "
+        "with (a GPU mark tells the copier; needs needed-early's GPU form). 1 = two sets when one set costs at most a quarter of the GPU "
+        "pool's room, else one; 2 = one set; 3 = two sets. It switches itself off, with one line, where it cannot run. Default 0 = off",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 3) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 3);
+                LOG_WRN("--moe-stream-copy-ahead must be 0, 1, 2 or 3: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_copy_ahead = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-lend-prompt"}, "0|1",
+        "with --moe-stream-vram-free's GPU expert pool and --moe-stream-vram-follow, a prompt call's GPU compute buffer (ggml's "
+        "own plan) lives in lent places of the pool; the real compute buffer holds the reply graphs and short prompt calls (see "
+        "--moe-stream-vram-lend-short), so the pool holds more experts (refilled after the prompt). A tensor bigger than every lendable "
+        "piece stays in the real buffer. Off by itself with a pinned --moe-stream-vram-experts N. Default 0 = off",
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1) {
+                throw std::invalid_argument("--moe-stream-vram-lend-prompt must be 0 or 1");
+            }
+            params.moe_stream_vram_lend_prompt = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-lend-short"}, "N",
+        "with --moe-stream-vram-lend-prompt 1: prompt calls of at most N tokens (a short follow-up message) run in the real "
+        "compute buffer, which is sized at start for such a call at the full context (measured); longer calls lend "
+        "their plan from the VRAM pool. Default 64",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("--moe-stream-vram-lend-short must be at least 1");
+            }
+            params.moe_stream_vram_lend_short = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-cpu-repack"}, "BOOL",
+        "keep the expert pools in llama.cpp's repacked CPU layout, which lets the expert MUL_MAT_ID "
+        "use the repacked kernels: measured 2.2x on the expert matmul (0.187 -> 0.084 ms for 8 experts "
+        "and one token) at the cost of converting every read on an I/O thread (0.11-0.26 ms per expert). "
+        "Off by default, and only for decode: with a repacked pool a ubatch that needs waves (n_tokens "
+        ">= 512 and more distinct experts than the pool has slots) names only ~20 distinct experts per "
+        "ubatch-layer instead of ~390 and the text after the prompt is garbage. The "
+        "3x prefill that made this look attractive was that broken path, so it is not a speedup yet",
+        [](common_params & params, int value) {
+            params.moe_stream_cpu_repack = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-verify"}, "BOOL",
+        "byte-compare one filled expert slot of every streamed layer, and one expert of a whole layer "
+        "kept in VRAM, against the model file at the first token; a mismatch ends the run "
+        "with the layer, the projection and the byte. 0 = off, 1 (the default) = every layer, N = the "
+        "first N layers. It costs one expert read and one memcmp per layer",
+        [](common_params & params, int value) {
+            params.moe_stream_verify = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-plan-only"},
+        "print the plan of --moe-stream (slots, pool RAM, streamed layers) and stop, loading nothing",
+        [](common_params & params) {
+            params.moe_stream_plan_only = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-oracle"}, "TRACE_PREFIX",
+        "replay the experts of a llama-moe-trace of the same prompt instead of predicting them (perfect "
+        "prefetch, for measuring the ceiling)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_oracle = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-oracle-lead"}, "N",
+        "how many MoE layers the oracle looks ahead, in MoE layers (default: 1); N = n_moe_layers is one "
+        "whole token ahead",
+        [](common_params & params, int value) {
+            params.moe_stream_oracle_lead = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--dump-router-input"},
+        "llama-moe-trace: also dump the input vector of every router",
+        [](common_params & params) {
+            params.moe_trace_dump_router_input = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MOE_TRACE}));
+    add_opt(common_arg(
+        {"--routing-topk"}, "N",
+        "llama-moe-trace: also dump the top N router scores and expert ids of every layer, in a\n"
+        "compact per-token form (~2.9 KB/token on Flash). N must be >= n_expert_used",
+        [](common_params & params, int value) {
+            params.moe_trace_routing_topk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_MOE_TRACE}));
+    add_opt(common_arg(
+        {"-ofreq", "--output-frequency"}, "N",
+        string_format("output the imatrix every N iterations (default: %d)", params.n_out_freq),
+        [](common_params & params, int value) {
+            params.n_out_freq = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--output-format"}, "{gguf,dat}",
+        string_format("output format for imatrix file (default: %s)", params.imat_dat > 0 ? "dat" : "gguf"),
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "gguf") { params.imat_dat = -1; }
+            else if (value == "dat")  { params.imat_dat = 1;  }
+            else { throw std::invalid_argument("invalid output format"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--save-frequency"}, "N",
+        string_format("save an imatrix copy every N iterations (default: %d)", params.n_save_freq),
+        [](common_params & params, int value) {
+            params.n_save_freq = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--process-output"},
+        string_format("collect data for the output tensor (default: %s)", params.process_output ? "true" : "false"),
+        [](common_params & params) {
+            params.process_output = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--ppl"},
+        {"--no-ppl"},
+        string_format("whether to compute perplexity (default: %s)", params.compute_ppl ? "true" : "false"),
+        [](common_params & params, bool value) {
+            params.compute_ppl = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--chunk", "--from-chunk"}, "N",
+        string_format("start processing the input from chunk N (default: %d)", params.i_chunk),
+        [](common_params & params, int value) {
+            params.i_chunk = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--show-statistics"},
+        string_format("show imatrix statistics and then exit (default: %s)", params.show_statistics ? "true" : "false"),
+        [](common_params & params) {
+            params.show_statistics = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--parse-special"},
+        string_format("parse special tokens (chat, tool, etc) (default: %s)", params.parse_special ? "true" : "false"),
+        [](common_params & params) {
+            params.parse_special = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    add_opt(common_arg(
+        {"--ids"},
+        string_format("only print the token IDs, in a Python-parseable list form like [1, 2, 3] (default: %s)", params.tokenize_ids ? "true" : "false"),
+        [](common_params & params) {
+            params.tokenize_ids = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TOKENIZE}));
+    add_opt(common_arg(
+        {"--stdin"},
+        string_format("read the prompt from stdin (takes precedence over -f/--file and -p/--prompt) (default: %s)", params.tokenize_stdin ? "true" : "false"),
+        [](common_params & params) {
+            params.tokenize_stdin = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TOKENIZE}));
+    add_opt(common_arg(
+        {"--no-bos"},
+        string_format("do not add a BOS token to the prompt, even if the model normally uses one (default: %s)", params.tokenize_no_bos ? "true" : "false"),
+        [](common_params & params) {
+            params.tokenize_no_bos = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TOKENIZE}));
+    add_opt(common_arg(
+        {"--no-parse-special"},
+        string_format("do not parse special tokens (chat, tool, etc) (default: %s)", !params.parse_special ? "true" : "false"),
+        [](common_params & params) {
+            params.parse_special = false;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TOKENIZE}));
+    add_opt(common_arg(
+        {"--show-count"},
+        string_format("print the total number of tokens (default: %s)", params.tokenize_show_count ? "true" : "false"),
+        [](common_params & params) {
+            params.tokenize_show_count = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TOKENIZE}));
+    add_opt(common_arg(
+        {"-pps"},
+        string_format("is the prompt shared across parallel sequences (default: %s)", params.is_pp_shared ? "true" : "false"),
+        [](common_params & params) {
+            params.is_pp_shared = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    add_opt(common_arg(
+        {"-tgs"},
+        string_format("is the text generation separated across the different sequences (default: %s)", params.is_tg_separate ? "true" : "false"),
+        [](common_params & params) {
+            params.is_tg_separate = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    add_opt(common_arg(
+        {"-npp"}, "n0,n1,...",
+        "number of prompt tokens",
+        [](common_params & params, const std::string & value) {
+            auto p = string_split<int>(value, ',');
+            params.n_pp.insert(params.n_pp.end(), p.begin(), p.end());
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"-ntg"}, "n0,n1,...",
+        "number of text generation tokens",
+        [](common_params & params, const std::string & value) {
+            auto p = string_split<int>(value, ',');
+            params.n_tg.insert(params.n_tg.end(), p.begin(), p.end());
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"-npl"}, "n0,n1,...",
+        "number of parallel prompts",
+        [](common_params & params, const std::string & value) {
+            auto p = string_split<int>(value, ',');
+            params.n_pl.insert(params.n_pl.end(), p.begin(), p.end());
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--embd-normalize"}, "N",
+        string_format("normalisation for embeddings (default: %d) (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)", params.embd_normalize),
+        [](common_params & params, int value) {
+            params.embd_normalize = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--embd-output-format"}, "FORMAT",
+        "empty = default, \"array\" = [[],[]...], \"json\" = openai style, \"json+\" = same \"json\" + cosine similarity matrix, \"raw\" = plain whitespace-delimited output (one embedding per line)",
+        [](common_params & params, const std::string & value) {
+            params.embd_out = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
+    add_opt(common_arg(
+        {"--embd-separator"}, "STRING",
+        "separator of embeddings (default \\n) for example \"<#sep#>\"",
+        [](common_params & params, const std::string & value) {
+            params.embd_sep = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
+    add_opt(common_arg(
+        {"--cls-separator"}, "STRING",
+        "separator of classification sequences (default \\t) for example \"<#seq#>\"",
+        [](common_params & params, const std::string & value) {
+            params.cls_sep = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING}));
+    add_opt(common_arg(
+        {"--host"}, "HOST",
+        string_format("IP addresses to listen on, comma-separated, or UNIX socket paths ending in .sock; with multiple TCP addresses, :: binds IPv6 only; overlapping addresses result in undefined behavior (default: %s)", params.hostnames[0].c_str()),
+        [](common_params & params, const std::string & value) {
+            params.hostnames.clear();
+            for (auto & host : parse_csv_row(value)) {
+                host = string_strip(host);
+                if (!host.empty()) {
+                    params.hostnames.push_back(host);
+                }
+            }
+            if (params.hostnames.empty()) {
+                throw std::invalid_argument("--host requires at least one address");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_HOST"));
+    add_opt(common_arg(
+        {"--port"}, "PORT",
+        string_format("port to listen (default: %d)", params.port),
+        [](common_params & params, int value) {
+            params.port = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PORT"));
+    add_opt(common_arg(
+        {"--reuse-port"},
+        string_format("allow multiple sockets to bind to the same port (default: %s)", params.reuse_port ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.reuse_port = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REUSE_PORT"));
+    add_opt(common_arg(
+        {"--path"}, "PATH",
+        string_format("path to serve static files from (default: %s)", params.public_path.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.public_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STATIC_PATH"));
+    add_opt(common_arg(
+        {"--cors-origins"}, "ORIGINS",
+        string_format(
+            "comma-separated list of allowed origins for CORS (default: %s)\n"
+            "if set to special value 'localhost', reflect the Origin header only if it is localhost",
+        params.cors_origins.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.cors_origins = value;
+            params.cors_origins_explicit = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CORS_ORIGINS"));
+    add_opt(common_arg(
+        {"--cors-methods"}, "METHODS",
+        string_format("comma-separated list of allowed methods for CORS (default: %s)", params.cors_methods.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.cors_methods = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CORS_METHODS"));
+    add_opt(common_arg(
+        {"--cors-headers"}, "HEADERS",
+        string_format("comma-separated list of allowed headers for CORS (default: %s)", params.cors_headers.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.cors_headers = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CORS_HEADERS"));
+    add_opt(common_arg(
+        {"--cors-credentials"},
+        {"--no-cors-credentials"},
+        string_format(
+            "whether to allow credentials for CORS (default: %s)\n"
+            "note: if this is enabled and --cors-origins is set to * (default), the Origin header will be echoed back, and credentials will always be allowed",
+        params.cors_credentials ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cors_credentials = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CORS_CREDENTIALS"));
+    add_opt(common_arg(
+        {"--api-prefix"}, "PREFIX",
+        string_format("prefix path the server serves from, without the trailing slash (default: %s)", params.api_prefix.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.api_prefix = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_PREFIX"));
+    add_opt(common_arg(
+        {"--ui-config", "--webui-config"}, "JSON",
+        "JSON that provides default UI settings (overrides UI defaults)",
+        [](common_params & params, const std::string & value) {
+            params.ui_config_json = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI_CONFIG"));
+    add_opt(common_arg(
+        {"--ui-config-file", "--webui-config-file"}, "PATH",
+        "JSON file that provides default UI settings (overrides UI defaults)",
+        [](common_params & params, const std::string & value) {
+            params.ui_config_json = read_file(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI_CONFIG_FILE"));
+    add_opt(common_arg(
+        {"--ui-mcp-proxy", "--webui-mcp-proxy"},
+        {"--no-ui-mcp-proxy", "--no-webui-mcp-proxy"},
+        "experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments (default: disabled)",
+        [](common_params & params, bool value) {
+            params.ui_mcp_proxy = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI_MCP_PROXY"));
+    add_opt(common_arg(
+        {"--tools"}, "TOOL1,TOOL2,...",
+        "experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)\n"
+        "specify \"all\" to enable all tools\n"
+        "available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_info\n"
+        "note: for security reasons, this will limit --cors-origins to localhost by default",
+        [](common_params & params, const std::string & value) {
+            params.server_tools = parse_csv_row(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TOOLS"));
+    add_opt(common_arg(
+        {"--tools-runtime"}, "OPTION",
+        "experimental: run tools in a separate runtime environment (default: none, use host environment)\n"
+        "available options:\n"
+        "  'docker:<image>', 'podman:<image>': spin up a new container and reuse it for all invocations, clean up on server exit\n"
+        "  'docker-container:<id>', 'podman-container:<id>': use an existing container by ID, won't stop on server exit\n"
+        "  'ssh:<target>': run tools on a remote POSIX host over SSH, key-based auth and a trusted host key are required\n",
+        [](common_params & params, const std::string & value) {
+            params.server_tools_runtime = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TOOLS_RUNTIME"));
+    add_opt(common_arg(
+        {"--mcp-servers-config"}, "PATH",
+        "experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)\n"
+        "note: for security reasons, this will limit --cors-origins to localhost by default",
+        [](common_params & params, const std::string & value) {
+            params.mcp_servers_config = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_CONFIG"));
+    add_opt(common_arg(
+        {"--mcp-servers-json"}, "JSON",
+        "experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)\n"
+        "note: for security reasons, this will limit --cors-origins to localhost by default",
+        [](common_params & params, const std::string & value) {
+            params.mcp_servers_json = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_JSON"));
+    add_opt(common_arg(
+        {"-ag", "--agent"},
+        {"-no-ag", "--no-agent"},
+        "whether to enable CORS proxy and all built-in tools - do not enable in untrusted environments (default: disabled)\n"
+        "note: for security reasons, this will limit --cors-origins to localhost by default",
+        [](common_params & params, bool value) {
+            if (value) {
+                params.server_tools = {"all"};
+                params.ui_mcp_proxy = true;
+            } else {
+                params.server_tools.clear();
+                params.ui_mcp_proxy = false;
+            }
+            // note: do not modify cors_origins here, as the options are not evaluated in order (user may explicitly set --cors-origins before --agent)
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_AGENT"));
+    add_opt(common_arg(
+        {"--ui", "--webui"},
+        {"--no-ui", "--no-webui"},
+        string_format("whether to enable the Web UI (default: %s)", params.ui ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.ui = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_UI"));
+    add_opt(common_arg(
+        {"--embedding", "--embeddings"},
+        string_format("restrict to only support embedding use case; use only with dedicated embedding models (default: %s)", params.embedding ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.embedding = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}).set_env("LLAMA_ARG_EMBEDDINGS"));
+    add_opt(common_arg(
+        {"--rerank", "--reranking"},
+        string_format("enable reranking endpoint on server (default: %s)", "disabled"),
+        [](common_params & params) {
+            params.embedding = true;
+            params.pooling_type = LLAMA_POOLING_TYPE_RANK;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RERANKING"));
+    add_opt(common_arg(
+        {"--api-key"}, "KEY",
+        "API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none)",
+        [](common_params & params, const std::string & value) {
+            for (const auto & key : parse_csv_row(value)) {
+                if (!key.empty()) {
+                    params.api_keys.push_back(key);
+                }
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_API_KEY"));
+    add_opt(common_arg(
+        {"--api-key-file"}, "FNAME",
+        "path to file containing API keys, one per line; lines starting with a hash are treated as comments (default: none)",
+        [](common_params & params, const std::string & value) {
+            std::ifstream key_file(value);
+            if (!key_file) {
+                throw std::runtime_error(string_format("error: failed to open file '%s'\n", value.c_str()));
+            }
+            std::string key;
+            while (std::getline(key_file, key)) {
+                if (!key.empty() && key[0] != '#') {
+                    params.api_keys.push_back(key);
+                }
+            }
+            key_file.close();
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_KEY_FILE"));
+    add_opt(common_arg(
+        {"--ssl-key-file"}, "FNAME",
+        "path to file a PEM-encoded SSL private key",
+        [](common_params & params, const std::string & value) {
+            params.ssl_file_key = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SSL_KEY_FILE"));
+    add_opt(common_arg(
+        {"--ssl-cert-file"}, "FNAME",
+        "path to file a PEM-encoded SSL certificate",
+        [](common_params & params, const std::string & value) {
+            params.ssl_file_cert = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SSL_CERT_FILE"));
+    add_opt(common_arg(
+        {"--chat-template-kwargs"}, "STRING",
+        "sets additional params for the json template parser, must be a valid json object string, e.g. '{\"key1\":\"value1\",\"key2\":\"value2\"}'",
+        [](common_params & params, const std::string & value) {
+            auto parsed = json::parse(value);
+            for (const auto & item : parsed.items()) {
+                if (item.key() == "enable_thinking") {
+                    LOG_WRN("Setting 'enable_thinking' via --chat-template-kwargs is deprecated. "
+                            "Use --reasoning on / --reasoning off instead.\n");
+                }
+                if (item.key() == "preserve_reasoning") {
+                    LOG_WRN("Setting 'preserve_reasoning' via --chat-template-kwargs is deprecated. "
+                            "Use --reasoning-preserve / --no-reasoning-preserve instead.\n");
+                }
+                params.default_template_kwargs[item.key()] = item.value().dump();
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_CHAT_TEMPLATE_KWARGS"));
+    add_opt(common_arg(
+        {"-to", "--timeout"}, "N",
+        string_format("server read/write timeout in seconds (default: %d)", params.timeout_read),
+        [](common_params & params, int value) {
+            params.timeout_read  = value;
+            params.timeout_write = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TIMEOUT"));
+    add_opt(common_arg(
+        {"--sse-ping-interval"}, "N",
+        string_format("server SSE ping interval in seconds (-1 = disabled, default: %d)", params.sse_ping_interval),
+        [](common_params & params, int value) {
+            params.sse_ping_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SSE_PING_INTERVAL"));
+    add_opt(common_arg(
+        {"--threads-http"}, "N",
+        string_format("number of threads used to process HTTP requests (default: %d)", params.n_threads_http),
+        [](common_params & params, int value) {
+            params.n_threads_http = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_THREADS_HTTP"));
+    add_opt(common_arg(
+        {"--cache-prompt"},
+        {"--no-cache-prompt"},
+        string_format("whether to enable prompt caching (default: %s)", params.cache_prompt ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.cache_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_PROMPT"));
+    add_opt(common_arg(
+        {"--cache-reuse"}, "N",
+        string_format(
+            "min chunk size to attempt reusing from the cache via KV shifting, requires prompt caching to be enabled (default: %d)\n"
+            "[(card)](https://ggml.ai/f0.png)", params.n_cache_reuse
+        ),
+        [](common_params & params, int value) {
+            params.n_cache_reuse = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CACHE_REUSE"));
+    add_opt(common_arg(
+        {"--metrics"},
+        string_format("enable prometheus compatible metrics endpoint (default: %s)", params.endpoint_metrics ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.endpoint_metrics = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_METRICS"));
+    add_opt(common_arg(
+        {"--props"},
+        string_format("enable changing global properties via POST /props (default: %s)", params.endpoint_props ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.endpoint_props = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_PROPS"));
+    add_opt(common_arg(
+        {"--slots"},
+        {"--no-slots"},
+        string_format("expose slots monitoring endpoint (default: %s)", params.endpoint_slots ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.endpoint_slots = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ENDPOINT_SLOTS"));
+    add_opt(common_arg(
+        {"--slot-save-path"}, "PATH",
+        "path to save slot kv cache (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.slot_save_path = value;
+            if (!fs_is_directory(params.slot_save_path)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            // if doesn't end with DIRECTORY_SEPARATOR, add it
+            if (!params.slot_save_path.empty() && params.slot_save_path[params.slot_save_path.size() - 1] != DIRECTORY_SEPARATOR) {
+                params.slot_save_path += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_SAVE_PATH"));
+    add_opt(common_arg(
+        {"--media-path"}, "PATH",
+        "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.media_path = value;
+            if (!fs_is_directory(params.media_path)) {
+                throw std::invalid_argument("not a directory: " + value);
+            }
+            // if doesn't end with DIRECTORY_SEPARATOR, add it
+            if (!params.media_path.empty() && params.media_path[params.media_path.size() - 1] != DIRECTORY_SEPARATOR) {
+                params.media_path += DIRECTORY_SEPARATOR;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--models-dir"}, "PATH",
+        "directory containing models for the router server (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.models_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_DIR"));
+    add_opt(common_arg(
+        {"--models-preset"}, "PATH",
+        "path to INI file containing model presets for the router server (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.models_preset = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_PRESET"));
+    add_opt(common_arg(
+        {"--models-max"}, "N",
+        string_format("for router server, maximum number of models to load simultaneously (default: %d, 0 = unlimited)", params.models_max),
+        [](common_params & params, int value) {
+            params.models_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX"));
+    add_opt(common_arg(
+        {"--models-autoload"},
+        {"--no-models-autoload"},
+        string_format("for router server, whether to automatically load models (default: %s)", params.models_autoload ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.models_autoload = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
+    add_opt(common_arg(
+        {"--jinja"},
+        {"--no-jinja"},
+        string_format("whether to use jinja template engine for chat (default: %s)", params.use_jinja ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.use_jinja = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_JINJA"));
+    add_opt(common_arg(
+        {"--reasoning-format"}, "FORMAT",
+        "controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:\n"
+        "- none: leaves thoughts unparsed in `message.content`\n"
+        "- deepseek: puts thoughts in `message.reasoning_content`\n"
+        "- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`\n"
+        "(default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.reasoning_format = common_reasoning_format_from_name(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK"));
+    add_opt(common_arg(
+        {"-rea", "--reasoning"}, "[on|off|auto]",
+        "Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))",
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.enable_reasoning = 1;
+                params.default_template_kwargs["enable_thinking"] = "true";
+            } else if (is_falsey(value)) {
+                params.enable_reasoning = 0;
+                params.default_template_kwargs["enable_thinking"] = "false";
+            } else if (is_autoy(value)) {
+                params.enable_reasoning = -1;
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --reasoning: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING"));
+    add_opt(common_arg(
+        {"--reasoning-effort"}, "LEVEL",
+        "reasoning effort level given to the chat template: 'default' to keep the template default,\n"
+        "or a level such as 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max' (default: default)",
+        [](common_params & params, const std::string & value) {
+            if (value == "default") {
+                params.default_template_kwargs.erase("reasoning_effort");
+            } else {
+                params.default_template_kwargs["reasoning_effort"] = json(value).dump();
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_EFFORT"));
+    add_opt(common_arg(
+        {"--reasoning-budget"}, "N",
+        "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_budget_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
+    add_opt(common_arg(
+        {"--reasoning-budget-message"}, "MESSAGE",
+        "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_budget_message = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
+    add_opt(common_arg(
+        {"--reasoning-preserve"},
+        {"--no-reasoning-preserve"},
+        "preserve reasoning trace in the full history, not just the last assistant message (default: enabled)\n"
+        "compatible with certain templates having 'supports_preserve_reasoning' capability\n"
+        "example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking",
+        [](common_params & params, bool value) {
+            if (value) {
+                params.default_template_kwargs["preserve_reasoning"] = "true";
+            } else {
+                params.default_template_kwargs["preserve_reasoning"] = "false";
+            }
+            params.preserve_reasoning_specified = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PRESERVE"));
+    add_opt(common_arg(
+        {"--chat-template"}, "JINJA_TEMPLATE",
+        string_format(
+            "set custom jinja chat template (default: template taken from model's metadata)\n"
+            "if suffix/prefix are specified, template will be disabled\n"
+            "only commonly used templates are accepted (unless --jinja is set before this flag):\n"
+            "list of built-in templates:\n%s", list_builtin_chat_templates().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.chat_template = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_CHAT_TEMPLATE"));
+    add_opt(common_arg(
+        {"--chat-template-file"}, "JINJA_TEMPLATE_FILE",
+        string_format(
+            "set custom jinja chat template file (default: template taken from model's metadata)\n"
+            "if suffix/prefix are specified, template will be disabled\n"
+            "only commonly used templates are accepted (unless --jinja is set before this flag):\n"
+            "list of built-in templates:\n%s", list_builtin_chat_templates().c_str()
+        ),
+        [](common_params & params, const std::string & value) {
+            params.chat_template = read_file(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CHAT_TEMPLATE_FILE"));
+    add_opt(common_arg(
+        {"--skip-chat-parsing"},
+        {"--no-skip-chat-parsing"},
+        string_format(
+            "force a pure content parser, even if a Jinja template is specified; model will output everything "
+            "in the content section, including any reasoning and/or tool calls (default: disabled)"
+        ),
+        [](common_params & params, bool value) {
+            params.force_pure_content_parser = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SKIP_CHAT_PARSING"));
+    add_opt(common_arg(
+        {"--prefill-assistant"},
+        {"--no-prefill-assistant"},
+        string_format(
+            "whether to prefill the assistant's response if the last message is an assistant message (default: prefill enabled)\n"
+            "when this flag is set, if the last message is an assistant message then it will be treated as a full message and not prefilled\n"
+        ),
+        [](common_params & params, bool value) {
+            params.prefill_assistant = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_ASSISTANT"));
+    add_opt(common_arg(
+        {"-sps", "--slot-prompt-similarity"}, "SIMILARITY",
+        string_format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),
+        [](common_params & params, const std::string & value) {
+            params.slot_prompt_similarity = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--lora-init-without-apply"},
+        string_format("load LoRA adapters without applying them (apply later via POST /lora-adapters) (default: %s)", params.lora_init_without_apply ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.lora_init_without_apply = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--sleep-idle-seconds"}, "SECONDS",
+        string_format("number of seconds of idleness after which the server will sleep (default: %d; -1 = disabled)", params.sleep_idle_seconds),
+        [](common_params & params, int value) {
+            if (value == 0 || value < -1) {
+                throw std::invalid_argument("invalid value: cannot be 0 or less than -1");
+            }
+            params.sleep_idle_seconds = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--simple-io"},
+        "use basic IO for better compatibility in subprocesses and limited consoles",
+        [](common_params & params) {
+            params.simple_io = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--positive-file"}, "FNAME",
+        string_format("positive prompts file, one prompt per line (default: '%s')", params.cvector_positive_file.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.cvector_positive_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--negative-file"}, "FNAME",
+        string_format("negative prompts file, one prompt per line (default: '%s')", params.cvector_negative_file.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.cvector_negative_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--pca-batch"}, "N",
+        string_format("batch size used for PCA. Larger batch runs faster, but uses more memory (default: %d)", params.n_pca_batch),
+        [](common_params & params, int value) {
+            params.n_pca_batch = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--pca-iter"}, "N",
+        string_format("number of iterations used for PCA (default: %d)", params.n_pca_iterations),
+        [](common_params & params, int value) {
+            params.n_pca_iterations = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--method"}, "{pca, mean}",
+        "dimensionality reduction method to be used (default: pca)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "pca") { params.cvector_dimre_method = DIMRE_METHOD_PCA; }
+            else if (value == "mean") { params.cvector_dimre_method = DIMRE_METHOD_MEAN; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_CVECTOR_GENERATOR}));
+    add_opt(common_arg(
+        {"--output-format"}, "{md,jsonl}",
+        "output format for batched-bench results (default: md)",
+        [](common_params & params, const std::string & value) {
+            /**/ if (value == "jsonl") { params.batched_bench_output_jsonl = true; }
+            else if (value == "md") { params.batched_bench_output_jsonl = false; }
+            else { throw std::invalid_argument("invalid value"); }
+        }
+    ).set_examples({LLAMA_EXAMPLE_BENCH}));
+    add_opt(common_arg(
+        {"--log-disable"},
+        "Log disable",
+        [](common_params &) {
+            common_log_pause(common_log_main());
+        }
+    ));
+    add_opt(common_arg(
+        {"--log-file"}, "FNAME",
+        "Log to file",
+        [](common_params &, const std::string & value) {
+            common_log_set_file(common_log_main(), value.c_str());
+        }
+    ).set_env("LLAMA_ARG_LOG_FILE"));
+    add_opt(common_arg(
+        {"--log-jsonl"},
+        {"--no-log-jsonl"},
+        "Log as JSONL (one JSON object per line) to stdout, this also disables colored logging (default: disabled)",
+        [](common_params &, bool value) {
+            common_log_set_jsonl(value);
+        }
+    ).set_env("LLAMA_ARG_LOG_JSONL"));
+    add_opt(common_arg(
+        {"--log-prompts-dir"}, "PATH",
+        "Log prompts to directory (auto-created if not present; only used for debugging, default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.path_prompts_log_dir = value;
+            std::error_code ec;
+            std::filesystem::create_directories(value, ec);
+            if (ec) {
+                fprintf(stderr, "warning: failed to create prompts-log-dir '%s': %s\n", value.c_str(), ec.message().c_str());
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--log-colors"}, "[on|off|auto]",
+        "Set colored logging ('on', 'off', or 'auto', default: 'auto')\n"
+        "'auto' enables colors when output is to a terminal",
+        [](common_params &, const std::string & value) {
+            if (is_truthy(value)) {
+                common_log_set_colors(common_log_main(), LOG_COLORS_ENABLED);
+            } else if (is_falsey(value)) {
+                common_log_set_colors(common_log_main(), LOG_COLORS_DISABLED);
+            } else if (is_autoy(value)) {
+                common_log_set_colors(common_log_main(), LOG_COLORS_AUTO);
+            } else {
+                throw std::invalid_argument(
+                    string_format("error: unknown value for --log-colors: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_LOG_COLORS"));
+    add_opt(common_arg(
+        {"-v", "--verbose", "--log-verbose"},
+        "Set verbosity level to infinity (i.e. log all messages, useful for debugging)",
+        [](common_params & params) {
+            params.verbosity = INT_MAX;
+            common_log_set_verbosity_thold(INT_MAX);
+        }
+    ));
+    add_opt(common_arg(
+        {"--offline"},
+        "Offline mode: forces use of cache, prevents network access",
+        [](common_params & params) {
+            params.offline = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_OFFLINE"));
+    add_opt(common_arg(
+        {"-lv", "--verbosity", "--log-verbosity"}, "N",
+        string_format("Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:\n"
+            " - 0: generic output\n"
+            " - 1: error\n"
+            " - 2: warning\n"
+            " - 3: info\n"
+            " - 4: trace (more info)\n"
+            " - 5: debug\n"
+            "(default: %d)\n", params.verbosity),
+        [](common_params & params, int value) {
+            params.verbosity = value;
+            common_log_set_verbosity_thold(value);
+        }
+    ).set_env("LLAMA_ARG_LOG_VERBOSITY"));
+    add_opt(common_arg(
+        {"--log-prefix"},
+        {"--no-log-prefix"},
+        "Enable prefix in log messages",
+        [](common_params &, bool value) {
+            common_log_set_prefix(common_log_main(), value);
+        }
+    ).set_env("LLAMA_ARG_LOG_PREFIX"));
+    add_opt(common_arg(
+        {"--log-timestamps"},
+        {"--no-log-timestamps"},
+        "Enable timestamps in log messages",
+        [](common_params &, bool value) {
+            common_log_set_timestamps(common_log_main(), value);
+        }
+    ).set_env("LLAMA_ARG_LOG_TIMESTAMPS"));
+
+    //
+    // speculative parameters
+    //
+
+    add_opt(common_arg(
+        {"--spec-draft-hf", "-hfd", "-hfrd", "--hf-repo-draft"}, "<user>/<model>[:quant]",
+        "Same as --hf-repo, but for the draft model (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mparams.hf_repo = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_HF_REPO"));
+    add_opt(common_arg(
+        {"--spec-draft-threads", "-td", "--threads-draft"}, "N",
+        "number of threads to use during generation (default: same as --threads)",
+        [](common_params & params, int value) {
+            params.speculative.draft.cpuparams.n_threads = value;
+            if (params.speculative.draft.cpuparams.n_threads <= 0) {
+                params.speculative.draft.cpuparams.n_threads = std::thread::hardware_concurrency();
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-threads-batch", "-tbd", "--threads-batch-draft"}, "N",
+        "number of threads to use during batch and prompt processing (default: same as --threads-draft)",
+        [](common_params & params, int value) {
+            params.speculative.draft.cpuparams_batch.n_threads = value;
+            if (params.speculative.draft.cpuparams_batch.n_threads <= 0) {
+                params.speculative.draft.cpuparams_batch.n_threads = std::thread::hardware_concurrency();
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-cpu-mask", "-Cd", "--cpu-mask-draft"}, "M",
+        "Draft model CPU affinity mask. Complements cpu-range-draft (default: same as --cpu-mask)",
+        [](common_params & params, const std::string & mask) {
+            params.speculative.draft.cpuparams.mask_valid = true;
+            if (!parse_cpu_mask(mask, params.speculative.draft.cpuparams.cpumask)) {
+                throw std::invalid_argument("invalid cpumask");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-cpu-range", "-Crd", "--cpu-range-draft"}, "lo-hi",
+        "Ranges of CPUs for affinity. Complements --cpu-mask-draft",
+        [](common_params & params, const std::string & range) {
+            params.speculative.draft.cpuparams.mask_valid = true;
+            if (!parse_cpu_range(range, params.speculative.draft.cpuparams.cpumask)) {
+                throw std::invalid_argument("invalid range");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-cpu-strict", "--cpu-strict-draft"}, "<0|1>",
+        "Use strict CPU placement for draft model (default: same as --cpu-strict)",
+        [](common_params & params, int value) {
+            params.speculative.draft.cpuparams.strict_cpu = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-prio", "--prio-draft"}, "N",
+        string_format("set draft process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime (default: %d)\n", params.speculative.draft.cpuparams.priority),
+        [](common_params & params, int prio) {
+            if (prio < 0 || prio > 3) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.cpuparams.priority = (enum ggml_sched_priority) prio;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-poll", "--poll-draft"}, "<0|1>",
+        "Use polling to wait for draft model work (default: same as --poll)",
+        [](common_params & params, int value) {
+            params.speculative.draft.cpuparams.poll = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-cpu-mask-batch", "-Cbd", "--cpu-mask-batch-draft"}, "M",
+        "Draft model CPU affinity mask. Complements cpu-range-draft (default: same as --cpu-mask)",
+        [](common_params & params, const std::string & mask) {
+            params.speculative.draft.cpuparams_batch.mask_valid = true;
+            if (!parse_cpu_mask(mask, params.speculative.draft.cpuparams_batch.cpumask)) {
+                throw std::invalid_argument("invalid cpumask");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-cpu-range-batch", "-Crbd", "--cpu-range-batch-draft"}, "lo-hi",
+        "Ranges of CPUs for affinity. Complements --cpu-mask-draft-batch)",
+        [](common_params & params, const std::string & range) {
+            params.speculative.draft.cpuparams_batch.mask_valid = true;
+            if (!parse_cpu_range(range, params.speculative.draft.cpuparams_batch.cpumask)) {
+                throw std::invalid_argument("invalid cpumask");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE}));
+    add_opt(common_arg(
+        {"--spec-draft-cpu-strict-batch", "--cpu-strict-batch-draft"}, "<0|1>",
+        "Use strict CPU placement for draft model (default: --cpu-strict-draft)",
+        [](common_params & params, int value) {
+            params.speculative.draft.cpuparams_batch.strict_cpu = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-prio-batch", "--prio-batch-draft"}, "N",
+        string_format("set draft process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime (default: %d)\n", params.speculative.draft.cpuparams_batch.priority),
+        [](common_params & params, int prio) {
+            if (prio < 0 || prio > 3) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.cpuparams_batch.priority = (enum ggml_sched_priority) prio;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-poll-batch", "--poll-batch-draft"}, "<0|1>",
+        "Use polling to wait for draft model work (default: --poll-draft)",
+        [](common_params & params, int value) {
+            params.speculative.draft.cpuparams_batch.poll = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
+        string_format(
+            "KV cache data type for K for the draft model\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.speculative.draft.cache_type_k)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.cache_type_k = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K"));
+    add_opt(common_arg(
+        {"--spec-draft-type-v", "-ctvd", "--cache-type-v-draft"}, "TYPE",
+        string_format(
+            "KV cache data type for V for the draft model\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_kv_cache_types().c_str(),
+            ggml_type_name(params.speculative.draft.cache_type_v)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.cache_type_v = kv_cache_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
+        "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
+            parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-draft-cpu-moe", "-cmoed", "--cpu-moe-draft"},
+        "keep all Mixture of Experts (MoE) weights in the CPU for the draft model",
+        [](common_params & params) {
+            params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
+    add_opt(common_arg(
+        {"--spec-draft-n-cpu-moe", "--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"}, "N",
+        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
+
+    add_opt(common_arg(
+        {"--spec-draft-n-max"}, "N",
+        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    add_opt(common_arg(
+        {"--spec-draft-n-min"}, "N",
+        string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_min = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-n-ubatch"}, "N",
+        string_format("physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: %d - same as --n-ubatch)", params.speculative.draft.n_ubatch),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
+    add_opt(common_arg(
+        {"--spec-synth-len"}, "L",
+        "target mean synthetic acceptance length, including the target token (benchmarking only)",
+        [](common_params & params, const std::string & value) {
+            const std::string text = string_strip(value);
+            size_t pos = 0;
+            const double length = std::stod(text, &pos);
+            if (pos != text.size() || length == -1.0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.synth_len = length;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_LEN"));
+    add_opt(common_arg(
+        {"--spec-synth-rates"}, "P0,P1,...",
+        "comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)",
+        [](common_params & params, const std::string & value) {
+            const auto values = string_split<std::string>(value, ',');
+            std::vector<double> rates;
+            rates.reserve(values.size());
+            for (const auto & raw : values) {
+                const std::string text = string_strip(raw);
+                size_t pos = 0;
+                const double rate = std::stod(text, &pos);
+                if (pos != text.size()) {
+                    throw std::invalid_argument("invalid value");
+                }
+                rates.push_back(rate);
+            }
+            params.speculative.synth_rates = std::move(rates);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_RATES"));
+
+    add_opt(common_arg(
+        {"--spec-draft-p-split", "--draft-p-split"}, "P",
+        string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.p_split = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
+    add_opt(common_arg(
+        {"--spec-draft-p-min", "--draft-p-min"}, "P",
+        string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.p_min = std::stof(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-backend-sampling"},
+        {"--no-spec-draft-backend-sampling"},
+        string_format("offload draft sampling to the backend (default: %s)",
+                      params.speculative.draft.backend_sampling ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.backend_sampling = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-draft-sampling"}, "{greedy,probabilistic}",
+        string_format("how the draft is sampled: greedy takes its argmax, probabilistic samples it and has "
+                      "the target verify by rejection sampling (default: %s)",
+                      params.speculative.draft.probabilistic ? "probabilistic" : "greedy"),
+        [](common_params & params, const std::string & value) {
+            if (value == "greedy") {
+                params.speculative.draft.probabilistic = false;
+            } else if (value == "probabilistic") {
+                params.speculative.draft.probabilistic = true;
+            } else {
+                throw std::invalid_argument("invalid value, must be one of: greedy, probabilistic");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
+    add_opt(common_arg(
+        {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
+        "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
+        "use --list-devices to see a list of available devices",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.devices = parse_device_list(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    GGML_ASSERT(params.speculative.draft.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
+    add_opt(common_arg(
+        {"--spec-draft-ngl", "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"}, "N",
+        string_format("max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)",
+            params.speculative.draft.n_gpu_layers == -1 ? "auto" : "all"),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.speculative.draft.n_gpu_layers = -1;
+            } else if (value == "all") {
+                params.speculative.draft.n_gpu_layers = -2;
+            } else {
+                params.speculative.draft.n_gpu_layers = std::stoi(value);
+            }
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: no usable GPU found, --gpu-layers-draft option will be ignored\n");
+                fprintf(stderr, "warning: one possible reason is that llama.cpp was compiled without GPU support\n");
+                fprintf(stderr, "warning: consult docs/building.md for compilation instructions\n");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
+    add_opt(common_arg(
+        {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
+        "draft model for speculative decoding (default: unused)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.mparams.path = value;
+            params.speculative.draft.mparams.hf_file = value; // will be used if --spec-draft-hf is set
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_MODEL"));
+    add_opt(common_arg(
+        {"--spec-type"}, common_speculative_all_types_str(),
+        string_format("comma-separated list of types of speculative decoding to use (default: %s)\n",
+            common_speculative_type_name_str(params.speculative.types).c_str()),
+        [](common_params & params, const std::string & value) {
+            const auto types_str = string_split<std::string>(value, ',');
+            auto types = common_speculative_types_from_names(types_str);
+            params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-n-min"}, "N",
+        string_format("minimum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_min),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram n-min must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_mod.n_min = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-n-max"}, "N",
+        string_format("maximum number of ngram tokens to use for ngram-based speculative decoding (default: %d)", params.speculative.ngram_mod.n_max),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 1024) {
+                throw std::invalid_argument("ngram n-max must be between 0 and 1024 inclusive");
+            }
+            params.speculative.ngram_mod.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-mod-n-match"}, "N",
+        string_format("ngram-mod lookup length (default: %d)", params.speculative.ngram_mod.n_match),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_mod.n_match = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-ngram-simple-size-n"}, "N",
+        string_format("ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_simple.size_n),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_simple.size_n = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-simple-size-m"}, "N",
+        string_format("ngram size M for ngram-simple speculative decoding, length of draft m-gram (default: %d)", params.speculative.ngram_simple.size_m),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size M must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_simple.size_m = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-simple-min-hits"}, "N",
+        string_format("minimum hits for ngram-simple speculative decoding (default: %d)", params.speculative.ngram_simple.min_hits),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("ngram min hits must be at least 1");
+            }
+            params.speculative.ngram_simple.min_hits = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-ngram-map-k-size-n"}, "N",
+        string_format("ngram size N for ngram-map-k speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_map_k.size_n),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_map_k.size_n = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k-size-m"}, "N",
+        string_format("ngram size M for ngram-map-k speculative decoding, length of draft m-gram (default: %d)", params.speculative.ngram_map_k.size_m),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size M must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_map_k.size_m = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k-min-hits"}, "N",
+        string_format("minimum hits for ngram-map-k speculative decoding (default: %d)", params.speculative.ngram_map_k.min_hits),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("ngram min hits must be at least 1");
+            }
+            params.speculative.ngram_map_k.min_hits = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-ngram-map-k4v-size-n"}, "N",
+        string_format("ngram size N for ngram-map-k4v speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_map_k4v.size_n),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size N must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_map_k4v.size_n = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k4v-size-m"}, "N",
+        string_format("ngram size M for ngram-map-k4v speculative decoding, length of draft m-gram (default: %d)", params.speculative.ngram_map_k4v.size_m),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram size M must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_map_k4v.size_m = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-map-k4v-min-hits"}, "N",
+        string_format("minimum hits for ngram-map-k4v speculative decoding (default: %d)", params.speculative.ngram_map_k4v.min_hits),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("ngram min hits must be at least 1");
+            }
+            params.speculative.ngram_map_k4v.min_hits = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    //
+    // removed params
+    //
+
+    add_opt(common_arg(
+        {"--draft", "--draft-n", "--draft-max"}, "N",
+        "the argument has been removed. use --spec-draft-n-max or --spec-ngram-mod-n-max",
+        [](common_params & /*params*/, int /*value*/) {
+            arg_removed("use --spec-draft-n-max or --spec-ngram-mod-n-max");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MAX"));
+    add_opt(common_arg(
+        {"--draft-min", "--draft-n-min"}, "N",
+        "the argument has been removed. use --spec-draft-n-min or --spec-ngram-mod-n-min",
+        [](common_params & /*params*/, int /*value*/) {
+            arg_removed("use --spec-draft-n-min or --spec-ngram-mod-n-min");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_DRAFT_MIN"));
+    add_opt(common_arg(
+        {"--spec-ngram-size-n"}, "N",
+        "the argument has been removed. use the respective --spec-ngram-*-size-n or --spec-ngram-mod-n-match",
+        [](common_params & /*params*/, int /*value*/) {
+            arg_removed("use the respective --spec-ngram-*-size-n");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-size-m"}, "N",
+        "the argument has been removed. use the respective --spec-ngram-*-size-m",
+        [](common_params & /*params*/, int /*value*/) {
+            arg_removed("use the respective --spec-ngram-*-size-m");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--spec-ngram-min-hits"}, "N",
+        "the argument has been removed. use the respective --spec-ngram-*-min-hits",
+        [](common_params & /*params*/, int /*value*/) {
+            arg_removed("use the respective --spec-ngram-*-min-hits");
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    //
+    // TTS params
+    //
+
+    add_opt(common_arg(
+        {"--tts-lang"}, "FNAME",
+        "language (ISO 639-1) for audio generation\n"
+        "see tts/README.md for per-model usage notes",
+        [](common_params & params, const std::string & value) {
+            params.tts_lang = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
+        {"--tts-speaker-file"}, "FNAME",
+        "speaker file path for audio generation",
+        [](common_params & params, const std::string & value) {
+            params.tts_speaker_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+
+    //
+    // diffusion params
+    //
+
+    add_opt(common_arg(
+        {"--diffusion-steps"}, "N",
+        string_format("number of diffusion steps (default: %d)", params.diffusion.steps),
+        [](common_params & params, int value) { params.diffusion.steps = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-visual"},
+        string_format("enable visual diffusion mode (show progressive generation) (default: %s)", params.diffusion.visual_mode ? "true" : "false"),
+        [](common_params & params) { params.diffusion.visual_mode = true; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-eps"}, "F",
+        string_format("epsilon for timesteps (default: %.6f)", (double) params.diffusion.eps),
+        [](common_params & params, const std::string & value) { params.diffusion.eps = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-algorithm"}, "N",
+        string_format(
+            "diffusion algorithm: 0=DIFFUSION_ALGORITHM_ORIGIN, 1=DIFFUSION_ALGORITHM_ENTROPY_BASED, "
+            "2=DIFFUSION_ALGORITHM_MARGIN_BASED, 3=DIFFUSION_ALGORITHM_RANDOM, "
+            "4=DIFFUSION_ALGORITHM_CONFIDENCE_BASED (default: %d)", params.diffusion.algorithm),
+        [](common_params & params, int value) { params.diffusion.algorithm = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-alg-temp"}, "F",
+        string_format("dream algorithm temperature (default: %.3f)", (double) params.diffusion.alg_temp),
+        [](common_params & params, const std::string & value) { params.diffusion.alg_temp = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-block-length"}, "N",
+        string_format("llada block length for generation (default: %d)", params.diffusion.block_length),
+        [](common_params & params, int value) { params.diffusion.block_length = value; }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-cfg-scale"}, "F",
+        string_format("llada classifier-free guidance scale (default: %.3f)", (double) params.diffusion.cfg_scale),
+        [](common_params & params, const std::string & value) { params.diffusion.cfg_scale = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        {"--diffusion-add-gumbel-noise"}, "F",
+        string_format("add gumbel noise to the logits if temp > 0.0 (default: %s)", params.diffusion.add_gumbel_noise ? "true" : "false"),
+        [](common_params & params, const std::string & value) { params.diffusion.add_gumbel_noise = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_DIFFUSION }));
+    add_opt(common_arg(
+        { "-lr", "--learning-rate" }, "ALPHA",
+        string_format("adamw or sgd optimizer alpha (default: %.2g); note: sgd alpha recommended ~10x (no momentum)", (double) params.lr.lr0),
+        [](common_params & params, const std::string & value) { params.lr.lr0 = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg({ "-lr-min", "--learning-rate-min" }, "ALPHA",
+        string_format("(if >0) final learning rate after decay (if -decay-epochs is set, default=%.2g)",
+            (double) params.lr.lr_min),
+        [](common_params & params, const std::string & value) { params.lr.lr_min = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"-decay-epochs", "--learning-rate-decay-epochs"}, "ALPHA",
+        string_format("(if >0) decay learning rate to -lr-min after this many epochs (exponential decay, default=%.2g)", (double) params.lr.decay_epochs),
+        [](common_params & params, const std::string & value) { params.lr.decay_epochs = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"-wd", "--weight-decay"}, "WD",
+        string_format("adamw or sgd optimizer weight decay (0 is off; recommend very small e.g. 1e-9) (default: %.2g).", (double) params.lr.wd),
+        [](common_params & params, const std::string & value) { params.lr.wd = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"-val-split", "--val-split"}, "FRACTION",
+        string_format("fraction of data to use as validation set for training (default: %.2g).", (double) params.val_split),
+        [](common_params & params, const std::string & value) { params.val_split = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"-epochs", "--epochs"}, "N",
+        string_format("optimizer max # of epochs (default: %d)", params.lr.epochs),
+        [](common_params & params, int epochs) { params.lr.epochs = epochs; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"-opt", "--optimizer"}, "sgd|adamw", "adamw or sgd",
+        [](common_params & params, const std::string & name) {
+            params.optimizer = common_opt_get_optimizer(name.c_str());
+            if (params.optimizer == GGML_OPT_OPTIMIZER_TYPE_COUNT) {
+                throw std::invalid_argument("invalid --optimizer, valid options: adamw, sgd");
+            }
+        }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
+        {"--check"},
+        string_format("check rather than generate results (default: %s)", params.check ? "true" : "false"),
+        [](common_params & params) {
+            params.check = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_RESULTS}));
+    add_opt(common_arg(
+        {"--save-logits"},
+        string_format("save final logits to files for verification (default: %s)", params.save_logits ? "true" : "false"),
+        [](common_params & params) {
+            params.save_logits = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--logits-output-dir"}, "PATH",
+        string_format("directory for saving logits output files (default: %s)", params.logits_output_dir.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.logits_output_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--tensor-filter"}, "REGEX",
+        "filter tensor names for debug output (regex pattern, can be specified multiple times)",
+        [](common_params & params, const std::string & value) {
+            params.tensor_filter.push_back(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_DEBUG}));
+
+    // presets
+
+    add_opt(common_arg(
+        {"--embd-gemma-default"},
+        string_format("use default EmbeddingGemma model (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/embeddinggemma-300M-qat-q4_0-GGUF";
+            params.model.hf_file = "embeddinggemma-300M-qat-Q4_0.gguf";
+            params.port = 8011;
+            params.n_ubatch = 2048;
+            params.n_batch = 2048;
+            params.n_parallel = 32;
+            params.n_ctx = 2048*params.n_parallel;
+            params.verbose_prompt = true;
+            params.embedding = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--fim-qwen-1.5b-default"},
+        string_format("use default Qwen 2.5 Coder 1.5B (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/Qwen2.5-Coder-1.5B-Q8_0-GGUF";
+            params.model.hf_file = "qwen2.5-coder-1.5b-q8_0.gguf";
+            params.port = 8012;
+            params.n_ubatch = 1024;
+            params.n_batch = 1024;
+            params.n_ctx = 0;
+            params.n_cache_reuse = 256;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--fim-qwen-3b-default"},
+        string_format("use default Qwen 2.5 Coder 3B (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/Qwen2.5-Coder-3B-Q8_0-GGUF";
+            params.model.hf_file = "qwen2.5-coder-3b-q8_0.gguf";
+            params.port = 8012;
+            params.n_ubatch = 1024;
+            params.n_batch = 1024;
+            params.n_ctx = 0;
+            params.n_cache_reuse = 256;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--fim-qwen-7b-default"},
+        string_format("use default Qwen 2.5 Coder 7B (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/Qwen2.5-Coder-7B-Q8_0-GGUF";
+            params.model.hf_file = "qwen2.5-coder-7b-q8_0.gguf";
+            params.port = 8012;
+            params.n_ubatch = 1024;
+            params.n_batch = 1024;
+            params.n_ctx = 0;
+            params.n_cache_reuse = 256;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--fim-qwen-7b-spec"},
+        string_format("use Qwen 2.5 Coder 7B + 0.5B draft for speculative decoding (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/Qwen2.5-Coder-7B-Q8_0-GGUF";
+            params.model.hf_file = "qwen2.5-coder-7b-q8_0.gguf";
+            params.speculative.draft.mparams.hf_repo = "ggml-org/Qwen2.5-Coder-0.5B-Q8_0-GGUF";
+            params.speculative.draft.mparams.hf_file = "qwen2.5-coder-0.5b-q8_0.gguf";
+            params.port = 8012;
+            params.n_ubatch = 1024;
+            params.n_batch = 1024;
+            params.n_ctx = 0;
+            params.n_cache_reuse = 256;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--fim-qwen-14b-spec"},
+        string_format("use Qwen 2.5 Coder 14B + 0.5B draft for speculative decoding (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/Qwen2.5-Coder-14B-Q8_0-GGUF";
+            params.model.hf_file = "qwen2.5-coder-14b-q8_0.gguf";
+            params.speculative.draft.mparams.hf_repo = "ggml-org/Qwen2.5-Coder-0.5B-Q8_0-GGUF";
+            params.speculative.draft.mparams.hf_file = "qwen2.5-coder-0.5b-q8_0.gguf";
+            params.port = 8012;
+            params.n_ubatch = 1024;
+            params.n_batch = 1024;
+            params.n_ctx = 0;
+            params.n_cache_reuse = 256;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--fim-qwen-30b-default"},
+        string_format("use default Qwen 3 Coder 30B A3B Instruct (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/Qwen3-Coder-30B-A3B-Instruct-Q8_0-GGUF";
+            params.model.hf_file = "qwen3-coder-30b-a3b-instruct-q8_0.gguf";
+            params.port = 8012;
+            params.n_ubatch = 1024;
+            params.n_batch = 1024;
+            params.n_ctx = 0;
+            params.n_cache_reuse = 256;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+
+    add_opt(common_arg(
+        {"--gpt-oss-20b-default"},
+        string_format("use gpt-oss-20b (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/gpt-oss-20b-GGUF";
+            params.model.hf_file = "gpt-oss-20b-mxfp4.gguf";
+            params.port = 8013;
+            params.n_ubatch = 2048;
+            params.n_batch = 32768;
+            params.n_parallel = 2;
+            params.n_ctx = 131072*params.n_parallel;
+            params.sampling.temp = 1.0f;
+            params.sampling.top_p = 1.0f;
+            params.sampling.top_k = 0;
+            params.sampling.min_p = 0.01f;
+            params.use_jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--gpt-oss-120b-default"},
+        string_format("use gpt-oss-120b (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/gpt-oss-120b-GGUF";
+            params.port = 8013;
+            params.n_ubatch = 2048;
+            params.n_batch = 32768;
+            params.n_parallel = 2;
+            params.n_ctx = 131072*params.n_parallel;
+            params.sampling.temp = 1.0f;
+            params.sampling.top_p = 1.0f;
+            params.sampling.top_k = 0;
+            params.sampling.min_p = 0.01f;
+            params.use_jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--vision-gemma-4b-default"},
+        string_format("use Gemma 3 4B QAT (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/gemma-3-4b-it-qat-GGUF";
+            params.port = 8014;
+            params.n_ctx = 0;
+            params.use_jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--vision-gemma-12b-default"},
+        string_format("use Gemma 3 12B QAT (note: can download weights from the internet)"),
+        [](common_params & params) {
+            params.model.hf_repo = "ggml-org/gemma-3-12b-it-qat-GGUF";
+            params.port = 8014;
+            params.n_ctx = 0;
+            params.use_jinja = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--spec-default"},
+        string_format("enable default speculative decoding config"),
+        [](common_params & params) {
+            params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+            params.speculative.ngram_mod.n_match = 24;
+            params.speculative.ngram_mod.n_min = 48;
+            params.speculative.ngram_mod.n_max = 64;
+
+            // TODO: not sure if this is a good config - explore more settings and potentially enable it
+            //params.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
+            //params.speculative.ngram_map_k4v.size_n = 8;
+            //params.speculative.ngram_map_k4v.size_m = 24;
+            //params.speculative.ngram_map_k4v.min_hits = 2;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    return ctx_arg;
+}
+
+void common_params_add_preset_options(std::vector<common_arg> & args) {
+    // arguments below won't be treated as CLI args, only preset options
+    args.push_back(common_arg(
+        {"load-on-startup"}, "NAME",
+        "in server router mode, autoload this model on startup",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_LOAD_ON_STARTUP).set_preset_only());
+
+    args.push_back(common_arg(
+        {"stop-timeout"}, "SECONDS",
+        "in server router mode, force-kill model instance after this many seconds of graceful shutdown",
+        [](common_params &, int) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
+
+    args.push_back(common_arg(
+        {"dedup-cache-models"}, "0|1",
+        "in server router mode, hide a cached model from the model list when this preset resolves to the same model file",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_DEDUP_CACHE_MODELS).set_preset_only());
+
+    // args.push_back(common_arg(
+    //     {"pin"},
+    //     "in server router mode, do not unload this model if models_max is exceeded",
+    //     [](common_params &) { /* unused */ }
+    // ).set_preset_only());
+}

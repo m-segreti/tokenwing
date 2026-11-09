@@ -1,0 +1,2 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>A train leaves station A at 60 km/h. Two hours later a second train leaves the same station on the same track travelling at 90 km/h. If the second train catches the first, how far from station A does that happen? Show your reasoning step by step.<|role_end|><role>ASSISTANT</role>
+<think>

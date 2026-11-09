@@ -1,0 +1,302 @@
+#include "moe-mark.cuh"
+
+#include <vector>
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+// See moe-mark.cuh. One table per kind for the process (one engine registers, on one device);
+// written at start-up and at teardown, read by the graph thread.
+struct ggml_cuda_moe_mark_entry {
+    uint8_t        * slot     = nullptr;   // pinned
+    int64_t          cap      = 0;         // bytes of data the slot holds
+    uint32_t       * counter  = nullptr;   // pinned
+    const uint32_t * expected = nullptr;   // pinned: the host's number of this call
+    cudaEvent_t      ev       = nullptr;
+};
+
+struct ggml_cuda_moe_mark_kind_state {
+    std::vector<ggml_cuda_moe_mark_entry> e;
+    uint32_t bit  = 0;
+    int32_t  skip = -1;
+};
+
+static ggml_cuda_moe_mark_kind_state g_moe_mark[GGML_CUDA_MOE_MARK_N];
+static uint32_t                      g_moe_mark_bits   = 0;
+static const void *                  g_moe_mark_owner  = nullptr;
+static int                           g_moe_mark_device = -1;
+
+// the sources a mark copies (the node, then for a router mark its src[1..]), packed at 16-byte offsets
+#define MOE_MARK_MAX_SRC 4
+struct moe_mark_srcs {
+    const int32_t * src[MOE_MARK_MAX_SRC];
+    int32_t         n_words[MOE_MARK_MAX_SRC];
+    int32_t         dst_word[MOE_MARK_MAX_SRC];
+    int32_t         n_src;
+    // GGML_CUDA_MOE_MARK_IDS=1: source 0 is the router's top-k view itself (rows of v0_ne0 words, v0_nb1 words apart), copied
+    // into the slot AND into the ids CONT node's own memory (v0_cont), whose separate copy kernel is then not launched
+    int32_t       * v0_cont;
+    int32_t         v0_ne0;
+    int32_t         v0_nb1;
+};
+
+// one block: the data, a system-scope fence, then the counter - a reader that sees this call's counter sees this call's data.
+// 256 threads copy 16 bytes at a time where source and slot are both 16-byte aligned (the slot's offsets
+// are; the rest word by word); the call's number - pinned host memory, a PCIe read - is read first, so its wait overlaps the copy (the
+// host writes it before the graph is launched, no kernel does); every writer fences its own writes system-wide before the barrier
+// (as before), then thread 0 writes the counter.
+static constexpr int MOE_MARK_THREADS = 256;
+static __global__ void k_moe_mark(const moe_mark_srcs s, int32_t * dst, const uint32_t * expected, uint32_t * counter) {
+    uint32_t want = 0;
+    if (threadIdx.x == 0) {
+        want = *((const volatile uint32_t *) expected);
+    }
+    ggml_cuda_pdl_sync();   // PDL-launched - the sources are read only after the kernel before (the ids copy) ended
+    int k0 = 0;
+    if (s.v0_cont != nullptr) {   // the strided view, word by word, into the slot and the CONT node
+        int32_t * d = dst + s.dst_word[0];
+        for (int i = threadIdx.x; i < s.n_words[0]; i += blockDim.x) {
+            const int32_t v = s.src[0][(i / s.v0_ne0) * s.v0_nb1 + i % s.v0_ne0];
+            d[i]         = v;
+            s.v0_cont[i] = v;
+        }
+        k0 = 1;
+    }
+    for (int k = k0; k < s.n_src; k++) {
+        const int32_t * src = s.src[k];
+        int32_t       * d   = dst + s.dst_word[k];
+        const int       n   = s.n_words[k];
+        int             i0  = 0;
+        if ((((uintptr_t) src | (uintptr_t) d) & 15) == 0) {
+            const int4 * s4 = (const int4 *) src;
+            int4       * d4 = (int4 *) d;
+            for (int i = threadIdx.x; i < n/4; i += blockDim.x) {
+                d4[i] = s4[i];
+            }
+            i0 = n/4*4;
+        }
+        for (int i = i0 + threadIdx.x; i < n; i += blockDim.x) {
+            d[i] = src[i];
+        }
+    }
+    __threadfence_system();   // every writer orders its own data writes system-wide before the barrier
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *((volatile uint32_t *) counter) = want;
+    }
+}
+
+bool ggml_cuda_moe_mark_register(const void * owner, int device, int32_t n_layers,
+                                 const ggml_cuda_moe_mark_table * tables, int n_tables, const char ** why) {
+    if (g_moe_mark_owner != nullptr && g_moe_mark_owner != owner) {
+        *why = "another model in this process already uses needed-early (one per process)";
+        return false;
+    }
+    ggml_cuda_moe_mark_unregister(owner);
+    ggml_cuda_set_device(device);   // the events belong to the device whose stream records them
+    for (int k = 0; k < n_tables && k < GGML_CUDA_MOE_MARK_N; k++) {
+        const ggml_cuda_moe_mark_table & t = tables[k];
+        ggml_cuda_moe_mark_kind_state & st = g_moe_mark[k];
+        st.e.assign((size_t) n_layers, ggml_cuda_moe_mark_entry());
+        bool any = false;
+        for (int32_t il = 0; il < n_layers; il++) {
+            if (t.slots == nullptr || t.slots[il] == nullptr) {
+                continue;
+            }
+            ggml_cuda_moe_mark_entry & e = st.e[il];
+            e.slot     = (uint8_t *) t.slots[il];
+            e.cap      = t.caps[il];
+            e.counter  = t.counters[il];
+            e.expected = t.expected[il];
+            if (cudaEventCreateWithFlags(&e.ev, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                ggml_cuda_moe_mark_unregister(owner);
+                *why = "the GPU backend could not create the events";
+                return false;
+            }
+            any = true;
+        }
+        st.bit  = any ? t.flag_bit : 0;
+        st.skip = t.skip_layer;
+    }
+    g_moe_mark_owner  = owner;
+    g_moe_mark_device = device;
+    g_moe_mark_bits   = 0;
+    for (const auto & st : g_moe_mark) {
+        g_moe_mark_bits |= st.bit;
+    }
+    return true;
+}
+
+bool ggml_cuda_moe_mark_wait(int32_t kind, int32_t il) {
+    if (kind < 0 || kind >= GGML_CUDA_MOE_MARK_N || il < 0 || (size_t) il >= g_moe_mark[kind].e.size() ||
+            g_moe_mark[kind].e[il].ev == nullptr) {
+        GGML_LOG_ERROR("%s: layer %d has no registered %s event\n", __func__, il, kind == GGML_CUDA_MOE_MARK_ROUTER ? "\"router done\"" :
+                kind == GGML_CUDA_MOE_MARK_DONE ? "\"gate/up done\"" : "\"guess done\"");
+        return false;
+    }
+    const cudaError_t err = cudaEventSynchronize(g_moe_mark[kind].e[il].ev);
+    if (err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: layer %d: CUDA error %s\n", __func__, il, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_moe_mark_unregister(const void * owner) {
+    if (g_moe_mark_owner != nullptr && g_moe_mark_owner != owner) {
+        return;   // Another engine's table
+    }
+    g_moe_mark_bits = 0;
+    for (auto & st : g_moe_mark) {
+        for (auto & e : st.e) {
+            if (e.ev != nullptr) {
+                (void) cudaEventDestroy(e.ev);
+            }
+        }
+        st.e.clear();
+        st.bit  = 0;
+        st.skip = -1;
+    }
+    g_moe_mark_owner  = nullptr;
+    g_moe_mark_device = -1;
+}
+
+uint32_t ggml_cuda_moe_mark_bits(void) {
+    return g_moe_mark_bits;
+}
+
+// After a call aborted part-way, every producer kernel it enqueued has run before the next call's number is written
+bool ggml_cuda_moe_mark_sync(void) {
+    if (g_moe_mark_device < 0) {
+        return true;
+    }
+    ggml_cuda_set_device(g_moe_mark_device);
+    const cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: CUDA error %s\n", __func__, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+// GGML_CUDA_MOE_MARK_IDS=1 - a router mark whose node is the CONT of the top-k view (I32, rows contiguous) takes the CONT's
+// work: the mark kernel reads the view and writes the CONT node's memory too, so the CONT is not launched (its readers - the VRAM
+// pass's get_rows, the scheduler's copies - read the same bytes, written earlier in the same stream)
+static bool ggml_cuda_moe_mark_ids_on() {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_MOE_MARK_IDS");
+        const bool r = v != nullptr && atoi(v) != 0;
+        if (r) {
+            fprintf(stderr, "%s: GGML_CUDA_MOE_MARK_IDS=1: the router mark copies the top-k ids itself (no separate ids copy)\n", __func__);
+        }
+        return r;
+    }();
+    return on;
+}
+
+bool ggml_cuda_moe_mark_takes_node(const ggml_tensor * node) {
+    if (!ggml_cuda_moe_mark_ids_on() || (node->flags & g_moe_mark[GGML_CUDA_MOE_MARK_ROUTER].bit) == 0 ||
+            g_moe_mark[GGML_CUDA_MOE_MARK_ROUTER].bit == 0 || node->op != GGML_OP_CONT) {
+        return false;
+    }
+    const ggml_tensor * v = node->src[0];
+    return v != nullptr && v->type == GGML_TYPE_I32 && node->type == GGML_TYPE_I32 && v->nb[0] == 4 && v->nb[1] % 4 == 0 &&
+           v->ne[2] == 1 && v->ne[3] == 1 && ggml_is_contiguous(node) && ggml_nelements(node) == ggml_nelements(v) &&
+           node->ne[0] == v->ne[0] && v->data != nullptr && node->data != nullptr;
+}
+
+void ggml_cuda_moe_mark_after(const ggml_cgraph * cgraph, int i0, int i1, cudaStream_t stream, bool capturing, int device) {
+    for (int i = i0; i <= i1 && i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int k = 0; k < GGML_CUDA_MOE_MARK_N; k++) {
+            ggml_cuda_moe_mark_kind_state & st = g_moe_mark[k];
+            if ((node->flags & st.bit) == 0) {
+                continue;
+            }
+            const int32_t il = node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1];
+            if (il < 0 || (size_t) il >= st.e.size() || st.e[il].slot == nullptr) {
+                GGML_ABORT("%s: node %s is marked for layer %d, which has no registered slot", __func__, node->name, il);
+            }
+            if (device != g_moe_mark_device) {
+                GGML_ABORT("%s: node %s (layer %d) runs on CUDA%d, but needed-early's events belong to CUDA%d", __func__, node->name,
+                        il, device, g_moe_mark_device);
+            }
+            ggml_cuda_moe_mark_entry & e = st.e[il];
+            // the sources: the node itself; a router mark also copies its src[1..] (the other inputs of the layer's CPU split)
+            moe_mark_srcs s = {};
+            int64_t off = 0;
+            for (int j = 0; j < MOE_MARK_MAX_SRC; j++) {
+                const ggml_tensor * t = k == GGML_CUDA_MOE_MARK_DONE ? nullptr :   // a "done" mark copies nothing
+                                        j == 0 ? node : k == GGML_CUDA_MOE_MARK_ROUTER ? node->src[j] : nullptr;
+                if (t == nullptr) {
+                    break;
+                }
+                GGML_ASSERT(ggml_is_contiguous(t) && ggml_type_size(t->type) == 4 && t->data != nullptr);
+                const int64_t nb = ggml_nbytes(t);
+                if (off + nb > e.cap) {
+                    GGML_ABORT("%s: layer %d's slot holds %lld bytes, the mark's sources need more (%s, %lld bytes at %lld)",
+                            __func__, il, (long long) e.cap, t->name, (long long) nb, (long long) off);
+                }
+                s.src[s.n_src]      = (const int32_t *) t->data;
+                s.n_words[s.n_src]  = (int32_t) (nb / 4);
+                s.dst_word[s.n_src] = (int32_t) (off / 4);
+                s.n_src++;
+                off += (nb + 15) / 16 * 16;
+            }
+            if (k == GGML_CUDA_MOE_MARK_ROUTER && ggml_cuda_moe_mark_takes_node(node)) {   // source 0 = the view
+                s.src[0]   = (const int32_t *) node->src[0]->data;
+                s.v0_cont  = (int32_t *) node->data;
+                s.v0_ne0   = (int32_t) node->src[0]->ne[0];
+                s.v0_nb1   = (int32_t) (node->src[0]->nb[1] / 4);
+            }
+            if (il == st.skip) {
+                continue;   // test only: this layer's producer never runs - its counter check must stop the run
+            }
+            // With the PDL attribute, so it starts while the ids copy ends (the copy signals at its top)
+            ggml_cuda_kernel_launch(k_moe_mark, ggml_cuda_kernel_launch_params(1, MOE_MARK_THREADS, 0, stream),
+                                    s, (int32_t *) e.slot, e.expected, e.counter);
+            if (capturing) {
+                CUDA_CHECK(cudaEventRecordWithFlags(e.ev, stream, cudaEventRecordExternal));
+            } else {
+                CUDA_CHECK(cudaEventRecord(e.ev, stream));
+            }
+        }
+    }
+}
+
+// test only: see moe-mark.cuh
+static __global__ void k_moe_test_spin(uint64_t ns) {
+    uint64_t t0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    for (;;) {
+        uint64_t t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        if (t - t0 >= ns) {
+            break;
+        }
+        __nanosleep(1000);
+    }
+}
+
+bool ggml_cuda_moe_test_spin(cudaStream_t stream, int64_t us) {
+    k_moe_test_spin<<<1, 1, 0, stream>>>((uint64_t) us*1000);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+#else // HIP / MUSA: no producer (the host-side stand-in stays: the register function is not exported)
+
+bool ggml_cuda_moe_test_spin(cudaStream_t, int64_t) { return false; }
+
+bool ggml_cuda_moe_mark_register(const void *, int, int32_t, const ggml_cuda_moe_mark_table *, int, const char ** why) {
+    *why = "this GPU backend has no producer";
+    return false;
+}
+bool ggml_cuda_moe_mark_wait(int32_t, int32_t) { return false; }
+void ggml_cuda_moe_mark_unregister(const void *) {}
+void ggml_cuda_moe_mark_after(const ggml_cgraph *, int, int, cudaStream_t, bool, int) {}
+uint32_t ggml_cuda_moe_mark_bits(void) { return 0; }
+bool ggml_cuda_moe_mark_sync(void) { return true; }
+bool ggml_cuda_moe_mark_takes_node(const ggml_tensor *) { return false; }
+
+#endif

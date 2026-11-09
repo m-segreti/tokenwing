@@ -1,0 +1,2 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Write a short story, about 600 words, about a lighthouse keeper on a remote island who starts receiving letters addressed to nobody at that address. Keep the tone quiet and slightly unsettling, and end without explaining the mystery.<|role_end|><role>ASSISTANT</role>
+<think>

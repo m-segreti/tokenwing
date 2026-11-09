@@ -1,0 +1,21 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Summarise the following article in four bullet points, then give a one-sentence takeaway.
+
+The Amazon rainforest covers roughly 5.5 million square kilometres across nine countries, roughly nine
+per cent of the world's land surface. About 390 billion individual trees grow there, and scientists
+believe somewhere between three and four million species live inside the region -- around a quarter of
+all the species on the planet. The trees pump about six billion tonnes of carbon dioxide out of the
+atmosphere each year, which is close to ten per cent of the annual global total.
+
+The river system is just as remarkable. The Amazon discharges roughly 209,000 cubic metres per second
+into the Atlantic, more than the next seven largest rivers combined, and it carries an estimated
+six to nine million tonnes of sediment to the ocean every year. That sediment load feeds a plume of
+nutrients in the Atlantic which, in turn, supports an enormous fishery far from shore.
+
+Deforestation remains the main threat. Satellite monitoring recorded roughly 1.5 million hectares of
+primary forest loss in 2022 alone, the lowest figure in fifteen years but still an area roughly the
+size of Delaware disappearing every year. Conservation efforts in Brazil, Colombia, Ecuador and Peru
+have held total loss below the peaks of the early 2000s, but the long-term trend of roads and
+fragmentation continues to raise the odds that the remaining forest is split into fragments too small
+to support the species that depend on it.
+<|role_end|><role>ASSISTANT</role>
+<think>

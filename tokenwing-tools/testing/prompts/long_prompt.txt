@@ -1,0 +1,36 @@
+detailed thinking onHey! I've had a genuinely weird afternoon. I went to the corner shop for milk and came home with a tub of ice cream, a bag of flour, and no milk. How does that even happen? Tell me your theory.
+<think>
+
+detailed thinking onExplain how a mixture-of-experts transformer layer decides which experts to use for a token, in the grouped-routing style used by models like Mixtral and Ling. Start from the router linear layer and go step by step, mentioning the sigmoid scoring and the expert bias. Assume I know what a matmul is but not how the routing is implemented.
+<think>
+
+detailed thinking onWrite a Python function `dijkstra(graph, source)` where graph is a dict mapping nodes to lists of (neighbour, weight) tuples. Use a heap, handle negative weights by raising a ValueError, and add a type-annotated version using `heapq` and `collections`. Add a docstring with a doctest example.
+<think>
+
+detailed thinking onWrite a modern C++20 function that reads a directory recursively and returns a map from file extension to total size in bytes. Use <filesystem>, structured bindings and `std::ranges`. Skip files larger than 100 MiB and say why in a comment.
+<think>
+
+detailed thinking onA train leaves station A at 60 km/h. Two hours later a second train leaves the same station on the same track travelling at 90 km/h. If the second train catches the first, how far from station A does that happen? Show your reasoning step by step.
+<think>
+
+detailed thinking onReturn a single valid JSON object and nothing else. It must have the keys "features" (array of 3 strings), "confidence" (number between 0 and 1), and "labels" (object mapping each feature string to an integer 0-10). Describe this text: "The library API is clean, the error messages are unhelpful, and the documentation is out of date."
+<think>
+
+detailed thinking onHey! I've had a genuinely weird afternoon. I went to the corner shop for milk and came home with a tub of ice cream, a bag of flour, and no milk. How does that even happen? Tell me your theory.
+<think>
+
+detailed thinking onExplain how a mixture-of-experts transformer layer decides which experts to use for a token, in the grouped-routing style used by models like Mixtral and Ling. Start from the router linear layer and go step by step, mentioning the sigmoid scoring and the expert bias. Assume I know what a matmul is but not how the routing is implemented.
+<think>
+
+detailed thinking onWrite a Python function `dijkstra(graph, source)` where graph is a dict mapping nodes to lists of (neighbour, weight) tuples. Use a heap, handle negative weights by raising a ValueError, and add a type-annotated version using `heapq` and `collections`. Add a docstring with a doctest example.
+<think>
+
+detailed thinking onWrite a modern C++20 function that reads a directory recursively and returns a map from file extension to total size in bytes. Use <filesystem>, structured bindings and `std::ranges`. Skip files larger than 100 MiB and say why in a comment.
+<think>
+
+detailed thinking onA train leaves station A at 60 km/h. Two hours later a second train leaves the same station on the same track travelling at 90 km/h. If the second train catches the first, how far from station A does that happen? Show your reasoning step by step.
+<think>
+
+detailed thinking onReturn a single valid JSON object and nothing else. It must have the keys "features" (array of 3 strings), "confidence" (number between 0 and 1), and "labels" (object mapping each feature string to an integer 0-10). Describe this text: "The library API is clean, the error messages are unhelpful, and the documentation is out of date."
+<think>
+

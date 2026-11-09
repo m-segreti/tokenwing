@@ -1,0 +1,2 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Give me a bulleted list of practical things to check when a Python web service starts returning intermittent 502 errors under load. Group the bullets under short headings, and put the three most common causes first.<|role_end|><role>ASSISTANT</role>
+<think>

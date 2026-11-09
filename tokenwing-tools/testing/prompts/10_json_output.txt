@@ -1,0 +1,2 @@
+<role>SYSTEM</role>detailed thinking on<|role_end|><role>HUMAN</role>Return a single valid JSON object and nothing else. It must have the keys "features" (array of 3 strings), "confidence" (number between 0 and 1), and "labels" (object mapping each feature string to an integer 0-10). Describe this text: "The library API is clean, the error messages are unhelpful, and the documentation is out of date."<|role_end|><role>ASSISTANT</role>
+<think>
