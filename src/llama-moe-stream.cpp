@@ -12631,6 +12631,8 @@ void llama_moe_stream::vx_lists_by_id(const char * why) {
     fprintf(stderr, "llama_moe_stream: --moe-stream-vram-experts-file: %s - the GPU pool's lists are in expert-id order (VRAM follow moves the used "
             "experts in)\n", why);
     vx_file_layers.clear();
+    vx_file_scores.clear();
+    vx_non_uniform = false;
     // a pinned N without --moe-stream-vram-free: each list is N long, as a file's is (whole lists overran the pool)
     const uint32_t n_list = p1.vram_free > 0 || p1.vram_experts == 0 ? n_expert_total : std::min<uint32_t>(p1.vram_experts, n_expert_total);
     for (const int32_t il : il_of_moe) {
@@ -12697,22 +12699,27 @@ void llama_moe_stream::vx_load_list() {
     }
 
     vx_file_layers.clear();
+    vx_file_scores.clear();
+    vx_non_uniform = j.value("counted", std::string()).find("non-uniform") != std::string::npos;
     int64_t n_short = 0, n_bad_all = 0;   // the layers filled in id order, the entries left out
     for (const int32_t il : il_of_moe) {
         const std::string key = std::to_string(il);
         std::vector<int32_t> lst;
+        std::vector<int64_t> sc_lst;
         std::vector<uint8_t> seen(n_expert_total, 0);
         int64_t n_bad = 0;
         if (j["layers"].contains(key)) {
             for (const auto & ent : j["layers"][key]) {
-                const int64_t e = ent.is_array() ? ent.at(0).get<int64_t>() : ent.get<int64_t>();
+                const int64_t e  = ent.is_array() ? ent.at(0).get<int64_t>() : ent.get<int64_t>();
+                const int64_t sc = (ent.is_array() && ent.size() >= 2 && ent.at(1).is_number_integer()) ? ent.at(1).get<int64_t>() : 0;
                 if (e < 0 || e >= (int64_t) n_expert_total || seen[e]) {
                     n_bad += 1;   // (an expert out of range or listed twice is left out)
                     continue;
                 }
                 seen[e] = 1;
                 lst.push_back((int32_t) e);
-                if (!auto_n && lst.size() == N) {
+                sc_lst.push_back(sc);
+                if (!auto_n && !vx_non_uniform && lst.size() == N) {
                     break;
                 }
             }
@@ -12726,11 +12733,13 @@ void llama_moe_stream::vx_load_list() {
                 if (!seen[e]) {
                     seen[e] = 1;
                     lst.push_back((int32_t) e);
+                    sc_lst.push_back(0);
                 }
             }
         }
         vx_list_min = vx_file_layers.empty() ? (uint32_t) lst.size() : std::min<uint32_t>(vx_list_min, (uint32_t) lst.size());
         vx_file_layers[il] = lst;
+        vx_file_scores[il] = sc_lst;
     }
     if (n_short > 0 || n_bad_all > 0) {
         fprintf(stderr, "llama_moe_stream: --moe-stream-vram-experts-file '%s': %lld streamed layers missing or short of %u - the rest of their "
@@ -12852,6 +12861,38 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     // the list of layer il is cut to its places: N, or N + 1 in the first vx_extra layers of the group
     // (rebuilt from the whole list file every time: the loop may also GROW a layer's list again, and a resize of a cut list would pad it with zeros)
     const auto cut_lists = [&](uint32_t N_now) {
+        if (vx_non_uniform && !test_uniform) {
+            for (size_t gi = 0; gi < vx_groups.size(); gi++) {
+                const auto & G = vx_groups[gi];
+                const size_t total_places = (size_t) N_now * G.layers.size() + (gi == 0 ? (size_t) vx_extra : 0u);
+                std::map<int32_t, size_t> cnt_per_il;
+                std::vector<std::tuple<int64_t, int32_t, int32_t>> cands;   // (score, -rank, il)
+                for (const int32_t il : G.layers) {
+                    const auto & full = vx_rank_lists.at(il);
+                    const auto & scs  = vx_file_scores.at(il);
+                    cnt_per_il[il] = full.empty() ? 0u : 1u;   // guarantee at least 1 place per layer
+                    for (size_t r = 1; r < full.size(); r++) {
+                        const int64_t sc = r < scs.size() ? scs[r] : 0;
+                        cands.emplace_back(sc, -(int32_t) r, -il);
+                    }
+                }
+                std::sort(cands.begin(), cands.end(), std::greater<>());
+                size_t used = G.layers.size();
+                for (const auto & c : cands) {
+                    if (used >= total_places) {
+                        break;
+                    }
+                    cnt_per_il[-std::get<2>(c)]++;
+                    used++;
+                }
+                for (const int32_t il : G.layers) {
+                    const auto & full = vx_rank_lists.at(il);
+                    const size_t n    = std::min<size_t>(full.size(), cnt_per_il[il]);
+                    vx_file_layers[il].assign(full.begin(), full.begin() + n);
+                }
+            }
+            return;
+        }
         for (auto & kv : vx_file_layers) {
             const auto & slc  = *layers[kv.first];
             const auto & full = vx_rank_lists.at(kv.first);
@@ -12904,20 +12945,20 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         }
         N = (uint32_t) n_use;
         p1.vram_experts = N;   // from here on the run has N places per layer, as if it had been pinned
-        // The whole list stays for the tail's extras and for the fill's tie-break (the lists are cut to N below)
-        vx_rank_lists = vx_file_layers;
-        vx_rank_of.assign(layers.size(), {});
-        for (const auto & kv : vx_rank_lists) {
-            if (kv.first >= 0 && (size_t) kv.first < vx_rank_of.size()) {
-                auto & rk = vx_rank_of[(size_t) kv.first];
-                rk.assign(n_expert_total, -1);
-                for (size_t i = 0; i < kv.second.size(); i++) {
-                    rk[(size_t) kv.second[i]] = (int16_t) std::min<size_t>(i, 32767);
-                }
+    }
+    // The whole list stays for the tail's extras and for the fill's tie-break (the lists are cut to N below)
+    vx_rank_lists = vx_file_layers;
+    vx_rank_of.assign(layers.size(), {});
+    for (const auto & kv : vx_rank_lists) {
+        if (kv.first >= 0 && (size_t) kv.first < vx_rank_of.size()) {
+            auto & rk = vx_rank_of[(size_t) kv.first];
+            rk.assign(n_expert_total, -1);
+            for (size_t i = 0; i < kv.second.size(); i++) {
+                rk[(size_t) kv.second[i]] = (int16_t) std::min<size_t>(i, 32767);
             }
         }
-        cut_lists(N);
     }
+    cut_lists(N);
 
     // 2b. The pool's tail - the last T places of the pool tensor, T = the largest RAM pool view in slots (the
     // slots + the zero slices). A GPU-wave graph's pool copies (one of those views per projection) get their memory there, so the compute
@@ -13121,11 +13162,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 p1.vram_experts_margin/1073741824.0, (long long) n_fit);
         N = (uint32_t) n_fit;
         p1.vram_experts = N;
-        for (auto & kv : vx_file_layers) {   // (a pinned N keeps no whole lists - vx_rank_lists is the auto fit's: cut these)
-            if (kv.second.size() > N) {
-                kv.second.resize(N);
-            }
-        }
+        cut_lists(N);
         vx_list_min = std::min<uint32_t>(vx_list_min, N);
         vx_bytes = bytes_per_n*N + place_b*(int64_t) vx_extra + bytes_zero + bytes_tail;
     }
@@ -13380,6 +13417,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     lend_slot[(size_t) rk[j][1]][(size_t) rk[j][0]] = G.p0 + (int32_t) j;
                 }
             }
+            int32_t base = G.p0;                                                                  // (after the tail)
             for (size_t li = 0; li < G.layers.size(); li++) {
                 llama_moe_stream_layer & sl = *layers[G.layers[li]];
                 const auto & lst = vx_file_layers.at(sl.il);
@@ -13387,8 +13425,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 GGML_ASSERT(sl.weights[0].size == nb_g && sl.weights[1].size == nb_g && sl.weights[2].size == nb_d);
                 sl.vx_slot.assign(n_expert_total, -1);
                 sl.vx_list = lst;
-                const uint32_t n_li = (uint32_t) lst.size();                                      // N, or N + 1 in the first vx_extra layers
-                const int32_t  base = G.p0 + (int32_t) (li*N + std::min<size_t>(li, vx_extra));   // (after the tail)
+                const uint32_t n_li = (uint32_t) lst.size();                                      // per-layer count (uniform or score-allocated)
                 for (uint32_t s = 0; s < n_li; s++) {
                     const int32_t e    = lst[s];
                     const int32_t slot = lend_slot.empty() ? base + (int32_t) s : lend_slot[li][s];
@@ -13407,6 +13444,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     sl.vx_slot[e] = slot;
                     n_filled++;
                 }
+                base += (int32_t) n_li;
             }
         }
         // The tail's places hold the next experts of the file's ranking, one layer after the other (layer 0's N+1st, layer 1's N+1st,

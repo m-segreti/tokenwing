@@ -1076,6 +1076,8 @@ struct llama_moe_stream {
     };
     std::vector<vx_group_t> vx_groups;
     std::map<int32_t, std::vector<int32_t>> vx_file_layers;   // the list file, by model layer
+    std::map<int32_t, std::vector<int64_t>> vx_file_scores;   // optional per-expert priority scores from the list file
+    bool                                    vx_non_uniform = false;
     bool        vx_ready     = false;   // the pool is allocated (and filled): the graphs carry the device pass
     bool     (* vx_zero_unreg)(const void * pool) = nullptr;   // --moe-stream-gpu-skip-zero: the CUDA table's unregister
     bool        vx_test_empty = false;  // MOE_STREAM_VRAM_TEST_EMPTY=1: pool and device pass, but no expert held

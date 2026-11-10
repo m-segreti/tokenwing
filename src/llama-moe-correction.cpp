@@ -118,12 +118,23 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
                 return refuse(format("another model: the file covers layer %d, this model has %zu layers", X, model.layers.size()));
             }
             const llama_layer & L = model.layers[X];
-            for (const ggml_tensor * t : { L.ffn_gate_inp, L.ffn_exp_probs_b, L.ffn_norm }) {
-                if (t == nullptr || t->type != GGML_TYPE_F32 || t->buffer == nullptr) {
-                    return refuse(format("another model or quant: layer %d has no F32 router / bias / norm tensor", X));
-                }
-                hash_tensor(&st, t, tmp);
+            if (L.ffn_gate_inp == nullptr || L.ffn_gate_inp->buffer == nullptr ||
+                (L.ffn_gate_inp->type != GGML_TYPE_F32 && L.ffn_gate_inp->type != GGML_TYPE_BF16 && L.ffn_gate_inp->type != GGML_TYPE_F16)) {
+                return refuse(format("another model or quant: layer %d has no F32/BF16/F16 router tensor", X));
             }
+            hash_tensor(&st, L.ffn_gate_inp, tmp);
+            if (L.ffn_exp_probs_b != nullptr) {
+                if (L.ffn_exp_probs_b->type != GGML_TYPE_F32 || L.ffn_exp_probs_b->buffer == nullptr) {
+                    return refuse(format("another model or quant: layer %d has non-F32 bias tensor", X));
+                }
+                hash_tensor(&st, L.ffn_exp_probs_b, tmp);
+            } else if (arch == "bailingmoe3") {
+                return refuse(format("another model or quant: layer %d has no F32 bias tensor", X));
+            }
+            if (L.ffn_norm == nullptr || L.ffn_norm->type != GGML_TYPE_F32 || L.ffn_norm->buffer == nullptr) {
+                return refuse(format("another model or quant: layer %d has no F32 norm tensor", X));
+            }
+            hash_tensor(&st, L.ffn_norm, tmp);
         }
         unsigned char dig[SHA256_DIGEST_SIZE];
         sha256_final(&st, dig);
@@ -153,9 +164,11 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
             continue;
         }
         const llama_layer & L = model.layers[p.target];
-        if (L.ffn_gate_inp == nullptr || L.ffn_norm == nullptr || L.ffn_gate_inp->buffer == nullptr || L.ffn_norm->buffer == nullptr ||
-            L.ffn_gate_inp->type != GGML_TYPE_F32 || L.ffn_gate_inp->ne[0] != n_embd || L.ffn_gate_inp->ne[1] != n_exp ||
-            ggml_nbytes(L.ffn_gate_inp) != nb || L.ffn_norm->type != GGML_TYPE_F32 || ggml_nelements(L.ffn_norm) != n_embd) {
+        const bool ok_gate_type = L.ffn_gate_inp != nullptr &&
+            (L.ffn_gate_inp->type == GGML_TYPE_F32 || L.ffn_gate_inp->type == GGML_TYPE_BF16 || L.ffn_gate_inp->type == GGML_TYPE_F16);
+        if (!ok_gate_type || L.ffn_norm == nullptr || L.ffn_gate_inp->buffer == nullptr || L.ffn_norm->buffer == nullptr ||
+            L.ffn_gate_inp->ne[0] != n_embd || L.ffn_gate_inp->ne[1] != n_exp ||
+            L.ffn_norm->type != GGML_TYPE_F32 || ggml_nelements(L.ffn_norm) != n_embd) {
             skipped_shape++;
             continue;
         }
@@ -231,6 +244,7 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
     // the fold: W' = W_X * g_X + Bt (float32, one multiply and one add per element), done in the ONE pass that reads and hashes the payload: each wanted
     // pair's bytes are folded and uploaded the moment they are complete; the hash of the whole payload decides at the end, and a mismatch discards everything
     std::vector<float> Wx((size_t) n_embd * n_exp), out(Wx.size()), g((size_t) n_embd);
+    std::vector<uint16_t> Wx_half;
     std::map<const llama_moe_corr_pair *, ggml_tensor *> tensor_of;
     for (auto & [t, p] : dst_of) {
         tensor_of[p] = t;
@@ -244,7 +258,17 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
     const std::string bad_stream = llama_moe_corr_file_stream(path, h, want, [&](size_t k, const void * data) {
         const llama_moe_corr_pair & p = h.pairs[k];
         const llama_layer & L = model.layers[p.target];
-        ggml_backend_tensor_get(L.ffn_gate_inp, Wx.data(), 0, nb);
+        if (L.ffn_gate_inp->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(L.ffn_gate_inp, Wx.data(), 0, nb);
+        } else {
+            Wx_half.resize(Wx.size());
+            ggml_backend_tensor_get(L.ffn_gate_inp, Wx_half.data(), 0, Wx.size() * sizeof(uint16_t));
+            if (L.ffn_gate_inp->type == GGML_TYPE_BF16) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) Wx_half.data(), Wx.data(), (int64_t) Wx.size());
+            } else {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) Wx_half.data(), Wx.data(), (int64_t) Wx.size());
+            }
+        }
         ggml_backend_tensor_get(L.ffn_norm, g.data(), 0, (size_t) n_embd * sizeof(float));
         const float * Bt = (const float *) data;
         for (int64_t e = 0; e < n_exp; e++) {
