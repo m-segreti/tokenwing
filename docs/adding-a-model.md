@@ -44,6 +44,18 @@ python3 tokenwing-tools/experts/verify_sidecar.py MODEL.index.json MODEL.experts
 
 It compares a sample of experts (8 layers, 3 experts each; `--layers` and `--experts` change that) byte for byte with the GGUF, prints `same` or `MISMATCH` for each, and exits with 1 on any mismatch.
 
+### One file instead of two
+
+`make_model_file.py` turns the GGUF into a TokenWing model file: the same GGUF (same tensors, order, bytes and metadata) with every tensor on a 4096-byte boundary, the key `tokenwing.format`, checksums of the first, middle and last expert of every MoE layer, and optional data appended after the last tensor. Plain llama.cpp opens it like the original, and `--moe-stream model` streams the experts from it, so there is no experts file and no `.json`.
+
+```bash
+python3 tokenwing-tools/experts/make_model_file.py MODEL.gguf -o MODEL.tokenwing.gguf \
+    [--correction CORR.bin] [--vram-list MODEL.vram-experts.json] [--usage-seed SEED.json] [--layer-order ORDER.json]
+build/bin/llama-completion -m MODEL.tokenwing.gguf --moe-stream model -f prompt.txt -n 128 --load-mode dio
+```
+
+It refuses a split GGUF (merge the shards first) and a model whose expert slices are not a multiple of 4096 bytes, and names the layer and tensor. The data is streamed in chunks, so a 70 GB model needs little RAM; the file is written as `OUT.tmp` and renamed at the end, then read back and compared with the source (every tensor's bytes, the metadata, the checksums, the appended data; `--no-check` skips that). The appended data is used with `--moe-stream-correction model` and `--moe-stream-vram-experts-file model`; the layer order and the usage seed are used by `--moe-stream model` when no file of that name sits next to the model. `--moe-stream-verify` then checks the file's own checksums instead of comparing with a second copy.
+
 ### 3. Check the plan
 
 ```bash
@@ -67,7 +79,7 @@ python3 tokenwing-tools/experts/make_vram_list.py MODEL.vram-experts.json record
 python3 tokenwing-tools/experts/make_usage_seed.py MODEL.experts.usage-seed.json recordings/p01 recordings/p02
 ```
 
-The list ranks each layer's experts by how often replies picked them (prompt tokens are not counted) and keeps `--top` per layer. It feeds `--moe-stream-vram-experts-file`. The seed counts picks over prompts and replies for `--moe-stream-idle-load 1`; the engine reads it only until its own table, `MODEL.experts.usage.json`, exists. The seed's name is the experts file's name without `.json`, plus `.usage-seed.json`. Both tools refuse recordings of different models.
+The list ranks each layer's experts by how often replies picked them (prompt tokens are not counted) and keeps `--top` per layer. It feeds `--moe-stream-vram-experts-file`. Each entry is `[expert, count]`; the count is only used for the optional non-uniform split described in `docs/settings.md`. The seed counts picks over prompts and replies for `--moe-stream-idle-load 1`; the engine reads it only until its own table, `MODEL.experts.usage.json`, exists. The seed's name is the experts file's name without `.json`, plus `.usage-seed.json`. Both tools refuse recordings of different models.
 
 A third file is optional: `MODEL.experts.layer-order.json`, which orders the layers for whole-layer VRAM placement:
 
@@ -143,6 +155,6 @@ The start-up line `sidecar fingerprint ok` (shown with `-v`) means the experts f
 
 ## 5. The correction file
 
-The tools in `tokenwing-tools/correction/` have Ling 3.0 Flash's shape built in: 512 experts, a hidden size of 2,560, top 8 with 8 expert groups of which 4 are used, and layers 5 to 41 (`correction_file.py`, `correction_fit.py`, `make_correction.py`, `check_correction.py`). They cannot train or check a file for another model until those constants and the grouped top-k are changed.
+The tools in `tokenwing-tools/correction/` have Ling 3.0 Flash's shape built in: 512 experts, a hidden size of 2,560, top 8 with 8 expert groups of which 4 are used, and layers 5 to 41 (`correction_fit.py`, `make_correction.py`, `check_correction.py`). They cannot train or check a file for another model until those constants and the grouped top-k are changed. `correction_file.py`, which writes and reads the file format, takes the shape from the model.
 
-The engine reads any file whose header matches the model, but it uses one only with `--moe-stream-pred-shared 1` and when every covered layer's router, selection bias and `ffn_norm` tensors are F32 (`src/llama-moe-correction.cpp`). Otherwise it runs the plain guess and prints one line saying why. Flint's router weights are BF16, so a correction file would not be used for it.
+The engine reads any file whose header matches the model, but it uses one only with `--moe-stream-pred-shared 1` and when every covered layer's router tensor is F32, BF16 or F16, its `ffn_norm` is F32, and its selection bias, if the model has one, is F32 (`src/llama-moe-correction.cpp`; `bailingmoe3` must have the bias). A BF16 or F16 router is converted to F32 when the file is loaded. The bias is part of the file's model check whenever the model has it. Otherwise the engine runs the plain guess and prints one line saying why.

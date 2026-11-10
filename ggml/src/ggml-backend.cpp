@@ -727,13 +727,25 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
 
 // ------------------------------------------------------------------------------------------
 // The profiler, a no-op unless GGML_PROFILE is set
+// -1 = not decided yet (the variable decides on the first use), 0 / 1 = set by ggml_prof_enable() or read from the variable
+static std::atomic<int> g_prof_state{-1};
+
 static bool ggml_prof_on(void) {
-    static int on = -1;
+    int on = g_prof_state.load(std::memory_order_relaxed);
     if (on < 0) {
         const char * e = getenv("GGML_PROFILE");
         on = e && atoi(e) ? 1 : 0;
+        g_prof_state.store(on, std::memory_order_relaxed);
     }
     return on == 1;
+}
+
+void ggml_prof_enable(int on) {
+    g_prof_state.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool ggml_prof_enabled(void) {
+    return ggml_prof_on();
 }
 
 static int64_t g_prof_us[GGML_PROF_N_SLOTS] = {0};
@@ -2778,7 +2790,8 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     // streaming engine pays per token (measured: 82 of them for one Flash decode token)
     // Read once per process, not on every compute (otherwise 2 getenv calls per compute)
     static const bool dbg_splits = getenv("GGML_COUNT_SPLITS") != nullptr;
-    static const bool prof       = getenv("GGML_PROFILE") != nullptr;
+    // the profiler (GGML_PROFILE or ggml_prof_enable): decided per compute, so a run-time switch is seen at the next graph
+    const bool prof = ggml_prof_on();
     struct ggml_backend_sched_split * splits = sched->splits;
 
     ggml_tensor * prev_ids_tensor = nullptr;
@@ -2942,8 +2955,12 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 last_async_split = -1;
             }
             if constexpr (HO) { ho_t = ggml_time_us(); }
+            const int64_t t0_hook = prof ? ggml_time_us() : 0;
             inputs_provided = sched->input_hook(sched->input_hook_user_data, split_backend, split->n_inputs, split->inputs,
                     hook_cpys.data());
+            if (prof && inputs_provided) {   // the provider waits for its producer's event and fills the inputs
+                ggml_prof_add(GGML_PROF_SYNC, ggml_time_us() - t0_hook);
+            }
             if constexpr (HO) { if (inputs_provided) { ho_wait(ho_r, HO_W_HOOK, ho_t); } }
         }
 
@@ -3015,8 +3032,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
                     if (!sync_batch) {   // the batched wait above already did this
                         if constexpr (HO) { ho_t = ggml_time_us(); }
+                        const int64_t t0_mi = prof ? ggml_time_us() : 0;
                         ggml_backend_synchronize(input_backend);
                         async_synced(input_backend);
+                        if (prof) { ggml_prof_add(GGML_PROF_SYNC, ggml_time_us() - t0_mi); }
                         if constexpr (HO) { ho_wait(ho_r, HO_W_MOE_INPUT, ho_t); }
                     }
 
@@ -3035,8 +3054,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
 
                             ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                             if constexpr (HO) { ho_t = ggml_time_us(); }
+                            const int64_t t0_mids = prof ? ggml_time_us() : 0;
                             ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                             ggml_backend_synchronize(ids_backend);
+                            if (prof) { ggml_prof_add(GGML_PROF_SYNC, ggml_time_us() - t0_mids); }
                             if constexpr (HO) { ho_wait(ho_r, HO_W_MOE_IDS, ho_t); }
 
                             // find the used experts
@@ -3104,6 +3125,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                     if constexpr (HO) { ho_t = ggml_time_us(); }
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         if constexpr (HO) { ho_copy(ho_r, HO_C_ASYNC_FAIL, ho_t); ho_t = ggml_time_us(); }
+                        int64_t t0_dep = prof ? ggml_time_us() : 0;   // the profiler: the waits for the producer and the split, then the copy
                         if (!sync_batch) {   // the batched wait above already did this
                             if constexpr (HO) { ho_t = ggml_time_us(); }
                             ggml_backend_synchronize(input_backend);
@@ -3118,7 +3140,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                             async_synced(split_backend);
                         }
                         if constexpr (HO) { ho_wait(ho_r, HO_W_DEP_SPLIT, ho_t); ho_t = ggml_time_us(); }
+                        if (prof) {
+                            const int64_t t1_dep = ggml_time_us();
+                            ggml_prof_add(GGML_PROF_SYNC, t1_dep - t0_dep);
+                            t0_dep = t1_dep;
+                        }
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (prof) { ggml_prof_add(GGML_PROF_COPY, ggml_time_us() - t0_dep); }
                         if constexpr (HO) { ho_copy(ho_r, HO_C_SYNC, ho_t); }
                     } else if constexpr (HO) {
                         ho_copy(ho_r, HO_C_ASYNC, ho_t);

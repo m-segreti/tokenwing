@@ -8,6 +8,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "gguf.h"
 
 extern "C" bool ggml_op_can_inplace(enum ggml_op op);   // (ggml-alloc.c, GGML_API in ggml-impl.h: the ops its allocator computes in place)
 
@@ -880,6 +881,269 @@ static void verify_fingerprint(const json & meta, const std::string & model_path
             __func__, have, arch.c_str(), sha.substr(0, 16).c_str());
 }
 
+// ---- --moe-stream model: the experts are read from the model file itself -------------------------------------------------
+// A TokenWing model file (tokenwing-tools/experts/make_model_file.py) is a GGUF whose tensors all start on a 4096 boundary, with
+// the key tokenwing.format, FNV-1a 64-bit checksums of sample experts (tokenwing.sums.layers / .values: per MoE layer the gate, up and
+// down slice of the first, the middle (n_expert / 2) and the last expert) and optional data appended after the last tensor
+// (tokenwing.blob.<name>.offset / .size).
+static const char * MOE_STREAM_MODEL_FORMAT_KEY   = "tokenwing.format";
+static const char * MOE_STREAM_MODEL_FORMAT_VALUE = "tokenwing model v1";
+
+// FNV-1a, 64 bit, over a byte range (the checksum of the model file's sample experts)
+static uint64_t moe_stream_fnv1a64(const uint8_t * p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < n; i++) {
+        h = (h ^ p[i])*0x100000001b3ULL;
+    }
+    return h;
+}
+
+// The OS layer: a byte range of a file as a string (the data a model file carries after its last tensor). Linux / macOS: fseeko;
+// Windows: _fseeki64 (written from the documented API, to do: run on Windows).
+static std::string os_read_file_range(const std::string & path, uint64_t off, uint64_t size) {
+    FILE * f = llama_moe_os_fopen_utf8(path.c_str(), "rb");
+
+    if (!f) {
+        throw std::runtime_error(format("cannot open '%s': %s", path.c_str(), strerror(errno)));
+    }
+
+#ifdef _WIN32
+    const auto seek = [&](uint64_t o, int whence) { return _fseeki64(f, (long long) o, whence); };
+    const auto tell = [&]() { return (uint64_t) _ftelli64(f); };
+#else
+    const auto seek = [&](uint64_t o, int whence) { return fseeko(f, (off_t) o, whence); };
+    const auto tell = [&]() { return (uint64_t) ftello(f); };
+#endif
+    // the range is checked against the real size before anything is allocated: a cut-off file or a wrong size in the
+    // metadata must not become a huge allocation
+    const uint64_t file_size = seek(0, SEEK_END) == 0 ? tell() : 0;
+
+    if (off > file_size || size > file_size - off) {
+        fclose(f);
+        throw std::runtime_error(format("'%s' has %llu bytes but its metadata names %llu bytes at %llu: the file is cut off or damaged",
+                    path.c_str(), (unsigned long long) file_size, (unsigned long long) size, (unsigned long long) off));
+    }
+
+    std::string out(size, '\0');
+    const bool ok = seek(off, SEEK_SET) == 0 && fread(&out[0], 1, size, f) == size;
+
+    fclose(f);
+
+    if (!ok) {
+        throw std::runtime_error(format("cannot read the %llu bytes at %llu of '%s'", (unsigned long long) size, (unsigned long long) off, path.c_str()));
+    }
+
+    return out;
+}
+
+struct moe_model_file_info {
+    std::vector<std::array<uint64_t, 9>>                 sums;       // [n_layer_all]
+    std::vector<uint8_t>                                 has_sums;   // [n_layer_all]
+    std::map<std::string, std::pair<uint64_t, uint64_t>> blobs;      // name -> offset, size
+};
+
+// Opens the GGUF header of a TokenWing model file: its format key, the appended data, and, with `mi`, the experts. Throws one sentence on
+// anything that is not as a TokenWing model file must be. Returns the experts as the description an experts file's JSON gives, so that
+// the constructor reads one format: per MoE layer the three projections as one virtual block (gate | up | down, as a pool slot holds
+// them) with the file offset of each projection's expert 0.
+static json moe_model_file_read(const std::string & path, const llama_moe_stream::model_info * mi, moe_model_file_info & info) {
+    gguf_init_params gp = { /* .no_alloc = */ true, /* .ctx = */ nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+
+    if (!g) {
+        throw std::runtime_error(format("cannot read the GGUF header of '%s'", path.c_str()));
+    }
+
+    struct guard { gguf_context * g; ~guard() { gguf_free(g); } } guard_{ g };
+
+    const int64_t k_fmt = gguf_find_key(g, MOE_STREAM_MODEL_FORMAT_KEY);
+
+    if (k_fmt < 0 || gguf_get_kv_type(g, k_fmt) != GGUF_TYPE_STRING) {
+        throw std::runtime_error(format("'%s' is not a TokenWing model file (it has no %s key). Convert it first with "
+                    "python3 tokenwing-tools/experts/make_model_file.py MODEL.gguf -o OUT.gguf, or give --moe-stream the .json of an "
+                    "experts file", path.c_str(), MOE_STREAM_MODEL_FORMAT_KEY));
+    }
+
+    if (strcmp(gguf_get_val_str(g, k_fmt), MOE_STREAM_MODEL_FORMAT_VALUE) != 0) {
+        throw std::runtime_error(format("'%s' says %s = '%s', this program reads '%s'; convert the model again with "
+                    "tokenwing-tools/experts/make_model_file.py", path.c_str(), MOE_STREAM_MODEL_FORMAT_KEY,
+                    gguf_get_val_str(g, k_fmt), MOE_STREAM_MODEL_FORMAT_VALUE));
+    }
+
+    if (gguf_get_alignment(g) % MOE_STREAM_ALIGN != 0) {
+        throw std::runtime_error(format("'%s' has general.alignment %zu: a TokenWing model file has tensors on %zu-byte boundaries",
+                    path.c_str(), gguf_get_alignment(g), MOE_STREAM_ALIGN));
+    }
+
+    // the appended data
+    const int64_t n_kv = gguf_get_n_kv(g);
+
+    for (int64_t k = 0; k < n_kv; k++) {
+        const std::string key = gguf_get_key(g, k);
+        const std::string pre = "tokenwing.blob.";
+        const std::string suf = ".offset";
+
+        if (key.size() > pre.size() + suf.size() && key.compare(0, pre.size(), pre) == 0 &&
+                key.compare(key.size() - suf.size(), suf.size(), suf) == 0) {
+            const std::string name = key.substr(pre.size(), key.size() - pre.size() - suf.size());
+            const int64_t k_size = gguf_find_key(g, (pre + name + ".size").c_str());
+
+            if (k_size >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_UINT64 && gguf_get_kv_type(g, k_size) == GGUF_TYPE_UINT64) {
+                info.blobs[name] = { gguf_get_val_u64(g, k), gguf_get_val_u64(g, k_size) };
+            }
+        }
+    }
+
+    if (mi == nullptr) {
+        return json();
+    }
+
+    // the checksums
+    info.sums.assign(mi->n_layer_all, {});
+    info.has_sums.assign(mi->n_layer_all, 0);
+    {
+        const int64_t k_l = gguf_find_key(g, "tokenwing.sums.layers");
+        const int64_t k_v = gguf_find_key(g, "tokenwing.sums.values");
+        const int64_t k_a = gguf_find_key(g, "tokenwing.sums.algorithm");
+
+        if (k_l >= 0 && k_v >= 0 && k_a >= 0 && gguf_get_kv_type(g, k_a) == GGUF_TYPE_STRING && strcmp(gguf_get_val_str(g, k_a), "fnv1a-64") == 0 &&
+                gguf_get_kv_type(g, k_l) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, k_l) == GGUF_TYPE_UINT32 &&
+                gguf_get_kv_type(g, k_v) == GGUF_TYPE_ARRAY && gguf_get_arr_type(g, k_v) == GGUF_TYPE_UINT64 &&
+                gguf_get_arr_n(g, k_v) == 9*gguf_get_arr_n(g, k_l)) {
+            const uint32_t * ls = (const uint32_t *) gguf_get_arr_data(g, k_l);
+            const uint64_t * vs = (const uint64_t *) gguf_get_arr_data(g, k_v);
+
+            for (size_t i = 0; i < gguf_get_arr_n(g, k_l); i++) {
+                if (ls[i] < mi->n_layer_all) {
+                    for (int j = 0; j < 9; j++) {
+                        info.sums[ls[i]][j] = vs[9*i + j];
+                    }
+                    info.has_sums[ls[i]] = 1;
+                }
+            }
+        }
+    }
+
+    llama_file lf(path.c_str(), "rb");
+    const size_t file_size = lf.size();
+    const size_t data_off  = gguf_get_data_offset(g);
+
+    json meta;
+    meta["format"]                = MOE_STREAM_FORMAT;
+    meta["io_align"]              = MOE_STREAM_ALIGN;
+    meta["source"]                = { { "path", path } };
+    meta["n_expert"]              = mi->n_expert;
+    meta["n_expert_used"]         = mi->n_expert_used;
+    meta["block_bytes"]           = nullptr;
+    meta["block_bytes_per_layer"] = json::object();
+    meta["sidecar_bytes"]         = 0;
+    meta["blocks"]                = json::object();
+
+    static const char * const projs[3] = { "gate", "up", "down" };
+
+    for (uint32_t il = 0; il < mi->n_layer_all; il++) {
+        int64_t id[3];
+        int     n_found = 0;
+
+        for (int p = 0; p < 3; p++) {
+            id[p] = gguf_find_tensor(g, format("blk.%u.ffn_%s_exps.weight", il, projs[p]).c_str());
+            n_found += id[p] >= 0 ? 1 : 0;
+        }
+
+        if (n_found == 0) {
+            continue;   // a dense layer
+        }
+
+        if (n_found != 3) {
+            throw std::runtime_error(format("layer %u of '%s' has some but not all of its gate, up and down expert tensors", il, path.c_str()));
+        }
+
+        json   blk;
+        size_t total = 0;
+        json   pj;
+
+        for (int p = 0; p < 3; p++) {
+            const std::string name  = format("blk.%u.ffn_%s_exps.weight", il, projs[p]);
+            const size_t      tsize = gguf_get_tensor_size(g, id[p]);
+            const size_t      start = data_off + gguf_get_tensor_offset(g, id[p]);
+
+            if (tsize % mi->n_expert != 0) {
+                throw std::runtime_error(format("%s: %zu bytes do not divide into %u experts", name.c_str(), tsize, mi->n_expert));
+            }
+
+            const size_t slice = tsize/mi->n_expert;
+
+            if (slice % MOE_STREAM_ALIGN != 0 || start % MOE_STREAM_ALIGN != 0) {
+                throw std::runtime_error(format("%s: an expert slice of %zu bytes at file offset %zu is not %zu-aligned, so its experts "
+                            "cannot be read with O_DIRECT from the model file", name.c_str(), slice, start, MOE_STREAM_ALIGN));
+            }
+
+            if (start + tsize > file_size) {
+                throw std::runtime_error(format("%s ends at %zu, after the end of '%s' (%zu bytes): the file is cut off",
+                            name.c_str(), start + tsize, path.c_str(), file_size));
+            }
+
+            pj[projs[p]] = { { "offset", total }, { "size", slice }, { "source_tensor", name }, { "file_offset", start } };
+            total += slice;
+        }
+
+        blk["base_offset"]  = 0;
+        blk["block_bytes"]  = total;
+        blk["by_proj"]      = true;
+        blk["projections"]  = pj;
+        meta["blocks"][std::to_string(il)]                = blk;
+        meta["block_bytes_per_layer"][std::to_string(il)] = total;
+    }
+
+    return meta;
+}
+
+bool llama_moe_model_file_blob(const std::string & model_path, const char * name, uint64_t & offset, uint64_t & size) {
+    moe_model_file_info info;
+
+    try {
+        moe_model_file_read(model_path, nullptr, info);
+    } catch (const std::exception &) {
+        return false;
+    }
+
+    const auto it = info.blobs.find(name);
+
+    if (it == info.blobs.end()) {
+        return false;
+    }
+
+    offset = it->second.first;
+    size   = it->second.second;
+
+    return true;
+}
+
+std::string llama_moe_stream_sidecar_arg(const std::string & moe_stream, const std::string & model_path) {
+    return moe_stream == MOE_STREAM_MODEL_WORD ? model_path : moe_stream;
+}
+
+bool llama_moe_stream::model_file_blob(const char * name, std::string & out) const {
+    uint64_t off = 0, size = 0;
+
+    if (model_file) {
+        const auto it = mf_blobs.find(name);
+
+        if (it == mf_blobs.end()) {
+            return false;
+        }
+
+        off  = it->second.first;
+        size = it->second.second;
+    } else if (!llama_moe_model_file_blob(model_file_path, name, off, size)) {
+        return false;
+    }
+
+    out = os_read_file_range(model_file_path, off, size);
+
+    return true;
+}
+
 llama_moe_stream::llama_moe_stream(
         const std::string & json_path_in,
         const std::string & log_path,
@@ -951,8 +1215,8 @@ llama_moe_stream::llama_moe_stream(
     gpu_layers_mode(gpu_layers_mode_in.empty() ? "hot" : gpu_layers_mode_in),
     ram_free      (ram_free_in == 0 ? (int64_t) MOE_STREAM_DEFAULT_MIN_AVAIL : ram_free_in),
     other_bytes   (other_bytes_in),
-    sidecar   (sidecar_data_path(json_path_in)),
-    sidecar_json(json_path_in),
+    sidecar   (json_path_in == MOE_STREAM_MODEL_WORD ? model_path : sidecar_data_path(json_path_in)),
+    sidecar_json(json_path_in == MOE_STREAM_MODEL_WORD ? model_path : json_path_in),
     file      (sidecar.c_str(), "rb", /* use_direct_io = */ true),
     // 0 = no in-flight cap
     prefetch_inflight(prefetch_inflight_in > 0 ? prefetch_inflight_in : 0),
@@ -1421,7 +1685,27 @@ llama_moe_stream::llama_moe_stream(
 
     const uint32_t n_layer_in = mi.n_layer_all;
 
-    const json meta = json::parse(read_file(sidecar_json));
+    // --moe-stream model: the experts are in the model file itself; its metadata is turned into the description an experts
+    // file's JSON gives, and everything below reads that
+    model_file      = json_path_in == MOE_STREAM_MODEL_WORD;
+    model_file_path = model_path;
+
+    json meta;
+
+    if (model_file) {
+        if (model_bytes_total(model_path) > 0) {
+            throw std::runtime_error(format("'%s' is one file of a split GGUF: --moe-stream model needs one file (merge the shards with "
+                        "llama-gguf-split --merge, then convert it with tokenwing-tools/experts/make_model_file.py)", model_path.c_str()));
+        }
+
+        moe_model_file_info mfi;
+        meta        = moe_model_file_read(model_path, &mi, mfi);
+        mf_sums     = std::move(mfi.sums);
+        mf_has_sums = std::move(mfi.has_sums);
+        mf_blobs    = std::move(mfi.blobs);
+    } else {
+        meta = json::parse(read_file(sidecar_json));
+    }
 
     if (meta.at("format") != MOE_STREAM_FORMAT) {
         throw std::runtime_error(format("'%s' is not a %s metadata file", sidecar_json.c_str(), MOE_STREAM_FORMAT));
@@ -1437,7 +1721,9 @@ llama_moe_stream::llama_moe_stream(
                 __func__, meta.at("source").at("path").get<std::string>().c_str(), model_path.c_str());
     }
 
-    verify_fingerprint(meta, model_path, mi.arch, size_total);
+    if (!model_file) {   // (the model file is its own source)
+        verify_fingerprint(meta, model_path, mi.arch, size_total);
+    }
 
     // A read is one job whose length is an int32 (moe_stream_job::len), so an expert that does
     // not fit in 2 GiB cannot be read. Refuse it here instead of truncating the length silently.
@@ -1550,6 +1836,7 @@ llama_moe_stream::llama_moe_stream(
         }
 
         b.repacked = blay != "plain";
+        b.by_proj  = blk.value("by_proj", false);
 
         if (b.repacked) {
             n_repacked_blocks++;
@@ -1571,6 +1858,7 @@ llama_moe_stream::llama_moe_stream(
             out.has_src   = p.contains("source_offset");
             out.src_off   = out.has_src ? (size_t) p.at("source_offset") : 0;
             out.src_shard = p.contains("source_shard") ? (int32_t) p.at("source_shard") : 0;
+            out.file_off  = p.contains("file_offset") ? (size_t) p.at("file_offset") : 0;
 
             if (out.has_src && model_is_split && !p.contains("source_shard")) {
                 out.has_src = false;
@@ -1617,10 +1905,22 @@ llama_moe_stream::llama_moe_stream(
             const std::string base = sidecar_json.size() > 5 && sidecar_json.compare(sidecar_json.size() - 5, 5, ".json") == 0
                                    ? sidecar_json.substr(0, sidecar_json.size() - 5) : sidecar_json;
             file_order_path = base + ".layer-order.json";
-            if (FILE * f = llama_moe_os_fopen_utf8(file_order_path.c_str(), "rb")) {
-                fclose(f);
+            FILE * f_order = llama_moe_os_fopen_utf8(file_order_path.c_str(), "rb");
+            // no file next to the model: the data appended to it (read below, inside the try: a damaged file is one line and no order)
+            const bool from_blob = f_order == nullptr && model_file && mf_blobs.count("layer_order") > 0;
+            if (f_order != nullptr) {
+                fclose(f_order);
+            }
+            if (from_blob) {
+                file_order_path = model_file_path + " (its layer_order data)";
+            }
+            if (f_order != nullptr || from_blob) {
                 try {
-                    const json j = json::parse(read_file(file_order_path));
+                    std::string order_blob;
+                    if (from_blob) {
+                        model_file_blob("layer_order", order_blob);
+                    }
+                    const json j = json::parse(from_blob ? order_blob : read_file(file_order_path));
                     if (j.value("format", std::string()) != "tokenwing layer order v1" || j.value("arch", std::string()) != mi.arch) {
                         throw std::runtime_error(format("not a 'tokenwing layer order v1' file of '%s'", mi.arch.c_str()));
                     }
@@ -2542,6 +2842,9 @@ llama_moe_stream::llama_moe_stream(
         ggml_cpu_set_q8_tiled(p1.cpu_q8_tiled);   // (off unless asked: the environment's GGML_CPU_Q8_TILED stays the test tools' switch)
     }
     ggml_cpu_set_moe_dispatch(p1.cpu_dispatch ? 1 : 0);
+    if (p1.timing) {
+        ggml_prof_enable(1);   // --moe-stream-timing: the host / device / copy / sync timers of ggml's profiler
+    }
     ggml_cpu_set_moe_pieces(p1.cpu_pieces);
     ggml_cpu_set_moe_conv1(p1.cpu_conv1 ? 1 : 0);
     // GET_ROWS on all threads with --moe-stream-cpu-state-inplace (its conv / extra state rows; the main state
@@ -3240,6 +3543,10 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         }
         sl->base_offset = blk.base_offset;
         sl->repacked    = blk.repacked;
+        sl->by_proj     = blk.by_proj;
+        sl->file_off[0] = blk.gate.file_off;
+        sl->file_off[1] = blk.up.file_off;
+        sl->file_off[2] = blk.down.file_off;
         sl->block_bytes = blk.block_bytes;
         sl->slot_expert .assign(nsa, -1);
         sl->slot_state  .assign(nsa, MOE_STREAM_SLOT_EMPTY);
@@ -3617,6 +3924,7 @@ static bool moe_stream_read_range(
     const size_t off0 = sl.base_offset + (size_t) expert*sl.block_bytes + (size_t) off;
 
     iovec iov[3];
+    off_t io_off[3];   // by_proj: where in the model file each of the pieces is (one request per projection)
     int   n_iov = 0;
 
     int64_t p_off = 0;   // where this projection starts inside the block
@@ -3633,6 +3941,7 @@ static bool moe_stream_read_range(
             continue;
         }
 
+        io_off[n_iov]       = (off_t) (sl.file_off[p] + (size_t) expert*w.size + (size_t) (a - p0));
         iov[n_iov].iov_base = (char *) w.mem + (size_t) slot*w.size + (size_t) (a - p0);
         iov[n_iov].iov_len  = (size_t) (b - a);
         n_iov += 1;
@@ -3656,6 +3965,23 @@ static bool moe_stream_read_range(
                 *(volatile uint8_t *) a = 0;
             }
         }
+    }
+
+    if (sl.by_proj) {   // the model file holds the projections in separate places: one read for each piece
+        for (int i = 0; i < n_iov; i++) {
+            const ssize_t r = moe_stream_preadv(fd, &iov[i], 1, io_off[i]);
+
+            if (r < 0) {
+                return false;
+            }
+
+            if ((size_t) r != iov[i].iov_len) {
+                errno = EIO;
+                return false;
+            }
+        }
+
+        return true;
     }
 
     ssize_t r = moe_stream_preadv(fd, iov, n_iov, (off_t) off0);
@@ -3693,6 +4019,7 @@ static bool moe_stream_read_range_to(
     const size_t off0 = sl.base_offset + (size_t) expert*sl.block_bytes + (size_t) off;
 
     iovec iov[3];
+    off_t io_off[3];   // by_proj: where in the model file each of the pieces is
     int   n_iov = 0;
 
     int64_t p_off = 0;   // where this projection starts inside the block
@@ -3709,6 +4036,7 @@ static bool moe_stream_read_range_to(
             continue;
         }
 
+        io_off[n_iov]       = (off_t) (sl.file_off[p] + (size_t) expert*w.size + (size_t) (a - p0));
         iov[n_iov].iov_base = dst + sl.weights[p].offs + (size_t) (a - p0);
         iov[n_iov].iov_len  = (size_t) (b - a);
         n_iov += 1;
@@ -3716,6 +4044,23 @@ static bool moe_stream_read_range_to(
 
     if (n_iov == 0) {
         return false;
+    }
+
+    if (sl.by_proj) {   // one read for each piece, see moe_stream_read_range
+        for (int i = 0; i < n_iov; i++) {
+            const ssize_t r = moe_stream_preadv(fd, &iov[i], 1, io_off[i]);
+
+            if (r < 0) {
+                return false;
+            }
+
+            if ((size_t) r != iov[i].iov_len) {
+                errno = EIO;
+                return false;
+            }
+        }
+
+        return true;
     }
 
     const ssize_t got = moe_stream_preadv(fd, iov, n_iov, (off_t) off0);
@@ -3730,6 +4075,36 @@ static bool moe_stream_read_range_to(
     }
 
     return (size_t) got == done;
+}
+
+// One expert's whole block (gate | up | down, laid out as a pool slot holds them: each projection at weights[p].offs) into `buf`: one read
+// from the experts file, or from the model file one read per projection. Returns the bytes read, like pread of the whole block, or -1.
+static ssize_t moe_stream_pread_block(int fd, const llama_moe_stream_layer & sl, int32_t expert, void * buf) {
+    if (!sl.by_proj) {
+        const iovec iov = { buf, sl.block_bytes };
+
+        return moe_stream_preadv(fd, &iov, 1, (off_t) (sl.base_offset + (size_t) expert*sl.block_bytes));
+    }
+
+    size_t done = 0;
+
+    for (int p = 0; p < 3; p++) {
+        const size_t  n = sl.weights[p].size;
+        const iovec   iov = { (char *) buf + sl.weights[p].offs, n };
+        const ssize_t r = moe_stream_preadv(fd, &iov, 1, (off_t) (sl.file_off[p] + (size_t) expert*n));
+
+        if (r < 0) {
+            return -1;
+        }
+
+        done += (size_t) r;
+
+        if ((size_t) r != n) {
+            return (ssize_t) done;
+        }
+    }
+
+    return (ssize_t) done;
 }
 
 // The scratch the plain bytes land in: one expert block, page-aligned so an O_DIRECT read can
@@ -3964,7 +4339,8 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
     } else {
         // the sidecar's own bytes: the block is 4096-aligned (checked when the metadata was parsed), so
         // the O_DIRECT read of it is legal
-        off = (int64_t) (b.base_offset + (size_t) expert*b.block_bytes + pr.offs);
+        off = b.by_proj ? (int64_t) (pr.file_off + (size_t) expert*pr.size)   // (the model file: the projection's own place)
+                        : (int64_t) (b.base_offset + (size_t) expert*b.block_bytes + pr.offs);
 
         ssize_t got = pread(file.file_id(), buf, size, (off_t) off);
 
@@ -4059,7 +4435,7 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
             "(in memory %02x%02x%02x, %s %02x%02x%02x)",
             what, il, expert, p, size - i, i,
             h[i], h[(i + 1) % size], h[(i + 2) % size],
-            cpu_repack_on ? "repacked model" : (vs_model ? "model" : "sidecar"),
+            cpu_repack_on ? "repacked model" : (vs_model ? "model" : (model_file ? "model file" : "sidecar")),
             m[i], m[(i + 1) % size], m[(i + 2) % size]);
 
     if (vctx) {
@@ -4099,7 +4475,17 @@ void llama_moe_stream::verify_slot(llama_moe_stream_layer & sl, int32_t slot, in
     // exactly the pointers this task is about
     std::lock_guard<std::mutex> verify_lock(verify_mtx);
 
-    if (!verify_boundaries_done) {
+    if (model_file) {
+        // A read of the model file is one request per projection, on several threads. The thread that lands the last piece does the
+        // check: the read's last piece is not counted yet (the slot is still loading), so nothing can reuse the slot meanwhile
+        const auto it = mf_left.find({ sl.il, slot });
+
+        if (it == mf_left.end() || --it->second > 0) {
+            return;
+        }
+
+        mf_left.erase(it);
+    } else if (!verify_boundaries_done) {
         verify_boundaries_done = true;
         verify_boundaries(verify_layers_streamed);
     }
@@ -4107,6 +4493,10 @@ void llama_moe_stream::verify_slot(llama_moe_stream_layer & sl, int32_t slot, in
     const int64_t t0   = ggml_time_us();
     size_t         n   = 0;
     std::string    err;
+
+    if (model_file) {   // the file's own checksums (stops the run on a mismatch), then the slot against the file below
+        verify_model_file_layer(sl);
+    }
 
     for (int p = 0; p < 3 && err.empty(); p++) {
         const auto & w = sl.weights[p];
@@ -4130,18 +4520,73 @@ void llama_moe_stream::verify_slot(llama_moe_stream_layer & sl, int32_t slot, in
     if (!err.empty()) {
         n_verify_bad += 1;
         fprintf(stderr, "%s: read-back check FAILED: %s\n", __func__, err.c_str());
-        fprintf(stderr, "%s: the sidecar '%s' or the pool of layer %d does not hold the weights of the model: "
+        fprintf(stderr, "%s: the %s '%s' or the pool of layer %d does not hold the weights of the model: "
                 "every expert this run loads from now on would be wrong. --moe-stream-verify 0 turns the check off, "
-                "but do that only to reproduce a run, not to use it.\n", __func__, sidecar.c_str(), sl.il);
+                "but do that only to reproduce a run, not to use it.\n", __func__, model_file ? "model file" : "sidecar", sidecar.c_str(), sl.il);
         moe_stream_fail("read-back check: %s", err.c_str());
     }
 
     // one line for the whole run, when the last layer that was going to be checked has been
     if (n_verify == n_verify_layers()) {
-        fprintf(stderr, "%s: read-back check done: %lld experts of %zu streamed layers against the model, "
+        fprintf(stderr, "%s: read-back check done: %lld experts of %zu streamed layers against the model%s, "
                 "%.3f GB compared, %.1f ms in total (--moe-stream-verify 0 skips it, N>1 checks N layers)\n",
                 __func__, (long long) n_verify, (size_t) n_verify_layers(),
+                model_file ? " file (a filled slot, and the first, middle and last expert against the checksums in the file)" : "",
                 (double) bytes_verify/1e9, (double) t_verify_us/1e3);
+    }
+}
+
+// --moe-stream model: the read-back check of one layer. Its sample experts (the first, the middle, the last) are read from the model
+// file through the same per-projection mapping a pool read uses, and each projection's FNV-1a 64 is compared with the checksum in the
+// file's metadata. A mismatch stops the run naming the layer, the expert and the projection. verify_mtx is held; verify_slot
+// counts the layer and compares the filled slot with the file.
+void llama_moe_stream::verify_model_file_layer(llama_moe_stream_layer & sl) {
+    static const char * const pn[3] = { "gate", "up", "down" };
+
+    if (sl.il < 0 || (size_t) sl.il >= mf_sums.size() || !mf_has_sums[sl.il]) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            fprintf(stderr, "%s: the model file has no checksums for layer %d (and maybe others): the read-back check is skipped for them\n",
+                    __func__, sl.il);
+        }
+        return;
+    }
+
+    uint8_t * buf = moe_stream_scratch_try(verify_buf, sl.block_bytes);
+
+    if (buf == nullptr) {
+        return;   // the check is skipped (said once)
+    }
+
+    const int32_t ne = (int32_t) sl.n_expert;
+    const int32_t samples[3] = { 0, ne/2, ne - 1 };
+
+    for (int s = 0; s < 3; s++) {
+        const int32_t e = samples[s];
+
+        if (!moe_stream_read_range_to(file.file_id(), sl, e, buf, 0, 0)) {
+            n_verify_bad += 1;
+            moe_stream_fail("read-back check: cannot read expert %d of layer %d from the model file '%s' (%s)", e, sl.il, sidecar.c_str(),
+                    errno ? strerror(errno) : "short read");
+        }
+
+        for (int p = 0; p < 3; p++) {
+            const uint64_t have = moe_stream_fnv1a64(buf + sl.weights[p].offs, sl.weights[p].size);
+            const uint64_t want = mf_sums[sl.il][3*s + p];
+
+            if (have != want) {
+                n_verify_bad += 1;
+                fprintf(stderr, "%s: read-back check FAILED: layer %d expert %d %s: the FNV-1a 64 of its %zu bytes at file offset %zu is %016llx, "
+                        "the model file's metadata says %016llx\n", __func__, sl.il, e, pn[p], sl.weights[p].size,
+                        sl.file_off[p] + (size_t) e*sl.weights[p].size, (unsigned long long) have, (unsigned long long) want);
+                fprintf(stderr, "%s: '%s' does not hold the weights it was made with (a damaged or changed file): every expert this run loads "
+                        "from it may be wrong. --moe-stream-verify 0 turns the check off, but do that only to reproduce a run, not to use it.\n",
+                        __func__, sidecar.c_str());
+                moe_stream_fail("read-back check: layer %d expert %d %s does not match the checksum in the model file", sl.il, e, pn[p]);
+            }
+
+            bytes_verify += (int64_t) sl.weights[p].size;
+        }
     }
 }
 
@@ -4156,7 +4601,14 @@ void llama_moe_stream::verify_gpu_tensor(int32_t il, const std::string & proj, c
     const int64_t t0  = ggml_time_us();
     // expert 0: the first slice of the tensor, which is the one the loader had to get right for every
     // other expert as well (they are the same tensor, one slice_size apart)
-    const std::string err = compare_model(il, p, /* expert = */ 0, data, size, "GPU expert of a whole layer", false);
+    std::string err;
+    if (model_file) {   // against the file's checksum of expert 0
+        if ((size_t) il < mf_sums.size() && mf_has_sums[il] && moe_stream_fnv1a64((const uint8_t *) data, size) != mf_sums[il][p]) {
+            err = format("layer %d expert 0 %s (a GPU expert of a whole layer): its FNV-1a 64 is not the checksum in the model file", il, proj.c_str());
+        }
+    } else {
+        err = compare_model(il, p, /* expert = */ 0, data, size, "GPU expert of a whole layer", false);
+    }
 
     bytes_verify += (int64_t) size;
     t_verify_us  += ggml_time_us() - t0;
@@ -4212,7 +4664,7 @@ void llama_moe_stream::verify_boundaries(const std::vector<int32_t> & ils) {
                 }
 
                 // the sidecar's slice (O_DIRECT: the block is page-aligned)
-                const size_t soff = b.base_offset + (size_t) e*b.block_bytes + pr.offs;
+                const size_t soff = b.by_proj ? pr.file_off + (size_t) e*pr.size : b.base_offset + (size_t) e*b.block_bytes + pr.offs;
 
                 if (pread(file.file_id(), sb, pr.size, (off_t) soff) != (ssize_t) pr.size) {
                     fprintf(stderr, "%s: read-back check FAILED: cannot read expert %d of layer %d (%s, %zu bytes "
@@ -4491,6 +4943,11 @@ void llama_moe_stream::io_loop_t(int ith) {
                     ok = false;
                 } else {
                     for (int p = 0; p < 3; p++) {
+                        // (a read of the model file is one projection per job, the other two are another job's)
+                        const int64_t pa = (int64_t) sl.weights[p].offs, pb = pa + (int64_t) sl.weights[p].size;
+                        if (sl.by_proj && (job.off >= pb || job.off + (int64_t) job.len <= pa)) {
+                            continue;
+                        }
                         repack_slot(sl, p, job.slot, scratch + sl.weights[p].offs, ith);
                     }
                     ok = true;
@@ -5053,10 +5510,27 @@ void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int3
     // a split would only cost a request). Not a converted read (one job by rule, above), and not a layer's first needed read
     // while the start-up read-back check still wants it (it checks a whole slice after one job)
     const int64_t  gu_bytes = (int64_t) (sl.weights.size() == 3 ? sl.weights[0].size + sl.weights[1].size : 0);
+    // A layer read from the model file (--moe-stream model) has its three projections in three places of the file: a read is one request
+    // per projection (gate, up, down in that order), a chunk is a piece of one projection and never crosses into the next, and each piece
+    // is read from its own file offset. The pieces go through the same queue as any chunk of an experts file's block. The start-up check
+    // there compares the file's checksums on its own (it does not need a whole slice after one job), so it does not hold the split back
+    const bool     by_proj  = sl.by_proj;
+    std::vector<std::array<int64_t, 2>> pcs;   // by_proj: (offset in the block, bytes) of each piece, in queue order
+    if (by_proj) {
+        int64_t p0 = 0;
+        for (int p = 0; p < 3; p++) {
+            const int64_t sz   = (int64_t) sl.weights[p].size;
+            const int64_t step = chunk > 0 ? (int64_t) chunk : sz;
+            for (int64_t o = 0; o < sz; o += step) {
+                pcs.push_back({ p0 + o, std::min<int64_t>(step, sz - o) });
+            }
+            p0 += sz;
+        }
+    }
     const bool     pr_split = pr_on && pr_split_ok && !prefetch && chunk == 0 && !(convert_on_read && !sl.repacked) && gu_bytes > 0 && gu_bytes < block &&
-                              !(verify && sl.il >= 0 && (size_t) sl.il < verify_done.size() && !verify_done[sl.il] &&
-                                (!verify_claims_init || verify_claims.load() > 0));   // only while a claim is left
-    const int64_t  n_chunks = pr_split ? 2 : chunk > 0 ? (block + (int64_t) chunk - 1)/(int64_t) chunk : 1;
+                              (by_proj || !(verify && sl.il >= 0 && (size_t) sl.il < verify_done.size() && !verify_done[sl.il] &&
+                                            (!verify_claims_init || verify_claims.load() > 0)));   // only while a claim is left
+    const int64_t  n_chunks = by_proj ? (int64_t) pcs.size() : pr_split ? 2 : chunk > 0 ? (block + (int64_t) chunk - 1)/(int64_t) chunk : 1;
     if (pr_split) {
         sl.c().n_pr_split += 1;   // one more request than a whole read
     }
@@ -5072,6 +5546,7 @@ void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int3
     }
     sl.slot_chunk_bad[slot] = 0;
 
+    bool verify_all_pieces = false;   // by_proj: every piece of the read that carries the read-back check says so
     for (int64_t i = 0; i < n_chunks; i++) {
         llama_moe_stream_job job;
         job.sl       = &sl;
@@ -5082,7 +5557,13 @@ void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int3
         job.gahead      = n_inflight_pref < 3 ? (uint32_t) n_inflight_pref : 3;
         job.off      = i*(int64_t) chunk;
         job.len      = (int32_t) std::min<int64_t>(chunk > 0 ? (int64_t) chunk : block, block - job.off);
-        if (pr_split) {   // [0, gate+up) then [gate+up, block), queued in that order
+        if (by_proj) {
+            job.off = pcs[(size_t) i][0];
+            job.len = (int32_t) pcs[(size_t) i][1];
+        }
+        if (pr_split && by_proj) {   // the pieces of gate and up, then the pieces of down (held, queued after them)
+            job.pr_down = job.off >= gu_bytes;
+        } else if (pr_split) {   // [0, gate+up) then [gate+up, block), queued in that order
             job.off     = i == 0 ? 0 : gu_bytes;
             job.len     = (int32_t) (i == 0 ? gu_bytes : block - gu_bytes);
             job.pr_down = i == 1;
@@ -5093,7 +5574,7 @@ void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int3
 
         // The first demand read of a layer that the check has not covered yet carries it, and only
         // the first chunk of the slice (the rest of the slice is not in the slot yet)
-        if (!prefetch && !idle && n_chunks == 1 && verify && sl.il >= 0 && (size_t) sl.il < verify_done.size()) {   // an idle read can be taken back unread; a chunked read is not whole after its first chunk
+        if (!prefetch && !idle && (n_chunks == 1 || (by_proj && i == 0)) && verify && sl.il >= 0 && (size_t) sl.il < verify_done.size()) {   // an idle read can be taken back unread; a chunked read is not whole after its first chunk (the model file's check does not look at the slot, it rides on the first piece)
             std::lock_guard<std::mutex> lock(verify_mtx);
 
             // The count is taken at the first read of the run, not in the constructor: the layers
@@ -5107,10 +5588,17 @@ void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int3
                 verify_done[sl.il]   = 1;
                 verify_claims.fetch_sub(1);
                 job.verify           = true;
+                if (by_proj) {   // the check waits for the last piece of the slot (verify_slot)
+                    mf_left[{ sl.il, slot }] = (int32_t) n_chunks;
+                    verify_all_pieces        = true;
+                }
             }
         }
+        if (by_proj && i > 0) {
+            job.verify = verify_all_pieces;
+        }
 
-        if (pr_split && i == 1) {
+        if (pr_split && job.pr_down) {
             pr_down_hold.push_back(job);   // queued by the call after its gate+up jobs (pr_flush_downs)
             continue;
         }
@@ -5183,10 +5671,16 @@ void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int3
     }
 
     if (pr_split) {
-        cv_work.notify_one();   // the gate+up job; the down job is woken when the call queues it
-    } else if (p1.io_wake_chunk && n_chunks > 1) {
+        int64_t n_gu = 1;   // the gate+up jobs; the down jobs are woken when the call queues them
+        if (by_proj) {
+            n_gu = std::count_if(pcs.begin(), pcs.end(), [&](const std::array<int64_t, 2> & c) { return c[0] < gu_bytes; });
+        }
+        for (int64_t i = 0; i < n_gu; i++) {
+            cv_work.notify_one();
+        }
+    } else if ((p1.io_wake_chunk || by_proj) && n_chunks > 1) {
         for (int64_t i = 0; i < n_chunks; i++) {
-            cv_work.notify_one();   // one thread per chunk, so the chunks of a read run in parallel
+            cv_work.notify_one();   // one thread per chunk (a model-file read: one per projection), so the pieces of a read run in parallel
         }
     } else {
         cv_work.notify_one();
@@ -8096,14 +8590,25 @@ void llama_moe_stream::us_load() {
         }
     }
     for (int pass = 0; pass < 2; pass++) {
-        const std::string & path = pass == 0 ? idle_path : idle_seed_path;
+        std::string path = pass == 0 ? idle_path : idle_seed_path;
         FILE * f = llama_moe_os_fopen_utf8(path.c_str(), "rb");
-        if (!f) {
+        // no seed file next to the table: the seed appended to a TokenWing model file (--moe-stream model) is the first seed
+        const bool from_blob = !f && pass == 1 && model_file && mf_blobs.count("usage_seed") > 0;
+        if (!f && !from_blob) {
             continue;
         }
-        fclose(f);
+        if (f) {
+            fclose(f);
+        }
+        if (from_blob) {
+            path = model_file_path + " (its usage_seed data)";
+        }
         try {
-            const json j = json::parse(read_file(path));
+            std::string blob;
+            if (from_blob) {
+                model_file_blob("usage_seed", blob);
+            }
+            const json j = json::parse(from_blob ? blob : read_file(path));
             if (j.value("format", std::string()) != "tokenwing usage v1" || j.value("n_expert", 0) != (int) n_expert_total ||
                     (j.contains("arch") && !idle_arch.empty() && j.value("arch", std::string()) != idle_arch)) {
                 fprintf(stderr, "%s: the usage table '%s' is not a \"tokenwing usage v1\" table of %u experts of '%s': not used\n", __func__,
@@ -12631,6 +13136,8 @@ void llama_moe_stream::vx_lists_by_id(const char * why) {
     fprintf(stderr, "llama_moe_stream: --moe-stream-vram-experts-file: %s - the GPU pool's lists are in expert-id order (VRAM follow moves the used "
             "experts in)\n", why);
     vx_file_layers.clear();
+    vx_file_scores.clear();
+    vx_non_uniform = false;
     // a pinned N without --moe-stream-vram-free: each list is N long, as a file's is (whole lists overran the pool)
     const uint32_t n_list = p1.vram_free > 0 || p1.vram_experts == 0 ? n_expert_total : std::min<uint32_t>(p1.vram_experts, n_expert_total);
     for (const int32_t il : il_of_moe) {
@@ -12654,6 +13161,9 @@ void llama_moe_stream::vx_load_list() {
     const uint32_t N = p1.vram_experts;
     const bool auto_n = p1.vram_free > 0;   // (also with a pinned N as a cap: the whole list stays for the tail's extras)
     const std::string & path = p1.vram_experts_file;
+    // the word `model` = the list appended to the model file (--moe-stream model); a path given beside it wins by being a path
+    const bool         from_model = path == MOE_STREAM_MODEL_WORD;
+    const std::string  shown      = from_model ? model_file_path + " (its vram_experts data)" : path;
 
     if (il_of_moe.empty()) {   // e.g. the auto-fit put every MoE layer on the GPU
         vx_flags_off("no MoE layer is streamed (every one is a whole VRAM layer), nothing to hold");
@@ -12676,43 +13186,56 @@ void llama_moe_stream::vx_load_list() {
     // (a ranking, not weights - a file that cannot be used gives the id order, never a refusal)
     json j;
     try {
-        j = json::parse(read_file(path));
+        if (from_model) {
+            std::string blob;
+            if (!model_file_blob("vram_experts", blob)) {
+                throw std::runtime_error("the model file has no vram_experts data (tokenwing-tools/experts/make_model_file.py --vram-list)");
+            }
+            j = json::parse(blob);
+        } else {
+            j = json::parse(read_file(path));
+        }
     } catch (const std::exception & ex) {
-        vx_lists_by_id(format("'%s' cannot be read (%s)", path.c_str(), ex.what()).c_str());
+        vx_lists_by_id(format("'%s' cannot be read (%s)", shown.c_str(), ex.what()).c_str());
         return;
     }
     if (j.value("format", std::string()) != "tokenwing vram-experts v1") {
-        vx_lists_by_id(format("'%s' is not a \"tokenwing vram-experts v1\" file", path.c_str()).c_str());
+        vx_lists_by_id(format("'%s' is not a \"tokenwing vram-experts v1\" file", shown.c_str()).c_str());
         return;
     }
     const std::string arch = j.value("arch", std::string());
     if (arch != mplan.arch || j.value("n_expert", 0u) != n_expert_total || j.value("n_expert_used", 0u) != n_expert_used) {
-        vx_lists_by_id(format("'%s' was made for %s with %u experts (top %u), this model is %s with %u (top %u)", path.c_str(), arch.c_str(),
+        vx_lists_by_id(format("'%s' was made for %s with %u experts (top %u), this model is %s with %u (top %u)", shown.c_str(), arch.c_str(),
                 j.value("n_expert", 0u), j.value("n_expert_used", 0u), mplan.arch.c_str(), n_expert_total, n_expert_used).c_str());
         return;
     }
     if (!j.contains("layers") || !j["layers"].is_object()) {
-        vx_lists_by_id(format("'%s' has no \"layers\" object", path.c_str()).c_str());
+        vx_lists_by_id(format("'%s' has no \"layers\" object", shown.c_str()).c_str());
         return;
     }
 
     vx_file_layers.clear();
+    vx_file_scores.clear();
+    vx_non_uniform = j.value("counted", std::string()).find("non-uniform") != std::string::npos;
     int64_t n_short = 0, n_bad_all = 0;   // the layers filled in id order, the entries left out
     for (const int32_t il : il_of_moe) {
         const std::string key = std::to_string(il);
         std::vector<int32_t> lst;
+        std::vector<int64_t> sc_lst;
         std::vector<uint8_t> seen(n_expert_total, 0);
         int64_t n_bad = 0;
         if (j["layers"].contains(key)) {
             for (const auto & ent : j["layers"][key]) {
-                const int64_t e = ent.is_array() ? ent.at(0).get<int64_t>() : ent.get<int64_t>();
+                const int64_t e  = ent.is_array() ? ent.at(0).get<int64_t>() : ent.get<int64_t>();
+                const int64_t sc = (ent.is_array() && ent.size() >= 2 && ent.at(1).is_number_integer()) ? ent.at(1).get<int64_t>() : 0;
                 if (e < 0 || e >= (int64_t) n_expert_total || seen[e]) {
                     n_bad += 1;   // (an expert out of range or listed twice is left out)
                     continue;
                 }
                 seen[e] = 1;
                 lst.push_back((int32_t) e);
-                if (!auto_n && lst.size() == N) {
+                sc_lst.push_back(sc);
+                if (!auto_n && !vx_non_uniform && lst.size() == N) {
                     break;
                 }
             }
@@ -12726,15 +13249,17 @@ void llama_moe_stream::vx_load_list() {
                 if (!seen[e]) {
                     seen[e] = 1;
                     lst.push_back((int32_t) e);
+                    sc_lst.push_back(0);
                 }
             }
         }
         vx_list_min = vx_file_layers.empty() ? (uint32_t) lst.size() : std::min<uint32_t>(vx_list_min, (uint32_t) lst.size());
         vx_file_layers[il] = lst;
+        vx_file_scores[il] = sc_lst;
     }
     if (n_short > 0 || n_bad_all > 0) {
         fprintf(stderr, "llama_moe_stream: --moe-stream-vram-experts-file '%s': %lld streamed layers missing or short of %u - the rest of their "
-                "lists in expert-id order%s\n", path.c_str(), (long long) n_short, N, n_bad_all > 0 ? format("; %lld entries out of range or "
+                "lists in expert-id order%s\n", shown.c_str(), (long long) n_short, N, n_bad_all > 0 ? format("; %lld entries out of range or "
                 "listed twice left out", (long long) n_bad_all).c_str() : "");
     }
 }
@@ -12852,11 +13377,57 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     // the list of layer il is cut to its places: N, or N + 1 in the first vx_extra layers of the group
     // (rebuilt from the whole list file every time: the loop may also GROW a layer's list again, and a resize of a cut list would pad it with zeros)
     const auto cut_lists = [&](uint32_t N_now) {
+        if (vx_non_uniform && !test_uniform) {
+            for (size_t gi = 0; gi < vx_groups.size(); gi++) {
+                const auto & G = vx_groups[gi];
+                const size_t total_places = (size_t) N_now * G.layers.size() + (gi == 0 ? (size_t) vx_extra : 0u);
+                std::map<int32_t, size_t> cnt_per_il;
+                std::vector<std::tuple<int64_t, int32_t, int32_t>> cands;   // (score, -rank, il)
+                for (const int32_t il : G.layers) {
+                    const auto & full = vx_rank_lists.at(il);
+                    const auto & scs  = vx_file_scores.at(il);
+                    cnt_per_il[il] = full.empty() ? 0u : 1u;   // guarantee at least 1 place per layer
+                    for (size_t r = 1; r < full.size(); r++) {
+                        const int64_t sc = r < scs.size() ? scs[r] : 0;
+                        cands.emplace_back(sc, -(int32_t) r, -il);
+                    }
+                }
+                std::sort(cands.begin(), cands.end(), std::greater<>());
+                size_t used = G.layers.size();
+                for (const auto & c : cands) {
+                    if (used >= total_places) {
+                        break;
+                    }
+                    cnt_per_il[-std::get<2>(c)]++;
+                    used++;
+                }
+                for (const int32_t il : G.layers) {
+                    const auto & full = vx_rank_lists.at(il);
+                    const size_t n    = std::min<size_t>(full.size(), cnt_per_il[il]);
+                    vx_file_layers[il].assign(full.begin(), full.begin() + n);
+                }
+            }
+            return;
+        }
         for (auto & kv : vx_file_layers) {
             const auto & slc  = *layers[kv.first];
             const auto & full = vx_rank_lists.at(kv.first);
             const size_t n    = std::min<size_t>(full.size(), N_now + ((uint32_t) slc.vx_li < vx_extra ? 1u : 0u));
             kv.second.assign(full.begin(), full.begin() + n);
+        }
+    };
+    // The whole list stays for the tail's extras and for the fill's tie-break (the lists are cut to N below)
+    const auto keep_whole_lists = [&]() {
+        vx_rank_lists = vx_file_layers;
+        vx_rank_of.assign(layers.size(), {});
+        for (const auto & kv : vx_rank_lists) {
+            if (kv.first >= 0 && (size_t) kv.first < vx_rank_of.size()) {
+                auto & rk = vx_rank_of[(size_t) kv.first];
+                rk.assign(n_expert_total, -1);
+                for (size_t i = 0; i < kv.second.size(); i++) {
+                    rk[(size_t) kv.second[i]] = (int16_t) std::min<size_t>(i, 32767);
+                }
+            }
         }
     };
 
@@ -12904,18 +13475,11 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         }
         N = (uint32_t) n_use;
         p1.vram_experts = N;   // from here on the run has N places per layer, as if it had been pinned
-        // The whole list stays for the tail's extras and for the fill's tie-break (the lists are cut to N below)
-        vx_rank_lists = vx_file_layers;
-        vx_rank_of.assign(layers.size(), {});
-        for (const auto & kv : vx_rank_lists) {
-            if (kv.first >= 0 && (size_t) kv.first < vx_rank_of.size()) {
-                auto & rk = vx_rank_of[(size_t) kv.first];
-                rk.assign(n_expert_total, -1);
-                for (size_t i = 0; i < kv.second.size(); i++) {
-                    rk[(size_t) kv.second[i]] = (int16_t) std::min<size_t>(i, 32767);
-                }
-            }
-        }
+        keep_whole_lists();
+        cut_lists(N);
+    } else if (vx_non_uniform) {
+        // a pinned N with a score-allocated list: N places per layer on average, split by the scores (a uniform list keeps its first N, cut at load)
+        keep_whole_lists();
         cut_lists(N);
     }
 
@@ -13121,9 +13685,13 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 p1.vram_experts_margin/1073741824.0, (long long) n_fit);
         N = (uint32_t) n_fit;
         p1.vram_experts = N;
-        for (auto & kv : vx_file_layers) {   // (a pinned N keeps no whole lists - vx_rank_lists is the auto fit's: cut these)
-            if (kv.second.size() > N) {
-                kv.second.resize(N);
+        if (vx_non_uniform) {
+            cut_lists(N);
+        } else {
+            for (auto & kv : vx_file_layers) {   // (a pinned N keeps no whole lists - vx_rank_lists is the auto fit's: cut these)
+                if (kv.second.size() > N) {
+                    kv.second.resize(N);
+                }
             }
         }
         vx_list_min = std::min<uint32_t>(vx_list_min, N);
@@ -13380,6 +13948,8 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     lend_slot[(size_t) rk[j][1]][(size_t) rk[j][0]] = G.p0 + (int32_t) j;
                 }
             }
+            const bool score_split = vx_non_uniform && !test_uniform;
+            int32_t next_base = G.p0;                                                             // (after the tail; score-allocated lists)
             for (size_t li = 0; li < G.layers.size(); li++) {
                 llama_moe_stream_layer & sl = *layers[G.layers[li]];
                 const auto & lst = vx_file_layers.at(sl.il);
@@ -13387,15 +13957,14 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 GGML_ASSERT(sl.weights[0].size == nb_g && sl.weights[1].size == nb_g && sl.weights[2].size == nb_d);
                 sl.vx_slot.assign(n_expert_total, -1);
                 sl.vx_list = lst;
-                const uint32_t n_li = (uint32_t) lst.size();                                      // N, or N + 1 in the first vx_extra layers
-                const int32_t  base = G.p0 + (int32_t) (li*N + std::min<size_t>(li, vx_extra));   // (after the tail)
+                const uint32_t n_li = (uint32_t) lst.size();                                      // N, or N + 1 in the first vx_extra layers; a score-allocated list has its own count
+                const int32_t  base = score_split ? next_base : G.p0 + (int32_t) (li*N + std::min<size_t>(li, vx_extra));   // (after the tail)
                 for (uint32_t s = 0; s < n_li; s++) {
                     const int32_t e    = lst[s];
                     const int32_t slot = lend_slot.empty() ? base + (int32_t) s : lend_slot[li][s];
-                    const off_t   off  = (off_t) (sl.base_offset + (size_t) e*sl.block_bytes);
                     ssize_t r;
                     do {
-                        r = pread(file.file_id(), stage, sl.block_bytes, off);
+                        r = moe_stream_pread_block(file.file_id(), sl, e, stage);
                     } while (r < 0 && errno == EINTR);
                     if (r != (ssize_t) sl.block_bytes) {
                         moe_stream_fail("--moe-stream-vram-experts: reading expert %d of layer %d from the sidecar failed (%s)",
@@ -13407,6 +13976,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     sl.vx_slot[e] = slot;
                     n_filled++;
                 }
+                next_base += (int32_t) n_li;
             }
         }
         // The tail's places hold the next experts of the file's ranking, one layer after the other (layer 0's N+1st, layer 1's N+1st,
@@ -13435,10 +14005,9 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     const int32_t e    = lst[next[li]++];
                     const int32_t slot = tail_first + k;
                     uint8_t * stage = moe_stream_scratch(verify_buf2, sl.block_bytes);
-                    const off_t off = (off_t) (sl.base_offset + (size_t) e*sl.block_bytes);
                     ssize_t r;
                     do {
-                        r = pread(file.file_id(), stage, sl.block_bytes, off);
+                        r = moe_stream_pread_block(file.file_id(), sl, e, stage);
                     } while (r < 0 && errno == EINTR);
                     if (r != (ssize_t) sl.block_bytes) {
                         moe_stream_fail("--moe-stream-vram-experts: reading expert %d of layer %d from the sidecar failed (%s)",
@@ -13729,6 +14298,13 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             (long long) n_filled, vx_fill_s, (long long) n_checked,
             vx_test_empty ? " (MOE_STREAM_VRAM_TEST_EMPTY: none held)" : "",
             p1.gpu_skip_zero ? ", gpu-skip-zero on" : "");
+    if (vx_non_uniform && !test_uniform) {   // the places each layer got from the score split
+        std::string per;
+        for (const int32_t il : il_of_moe) {
+            per += format("%s%d:%zu", per.empty() ? "" : " ", il, vx_file_layers.at(il).size());
+        }
+        fprintf(stderr, "%s: the list is non-uniform: places per layer (layer:count) %s\n", __func__, per.c_str());
+    }
     return true;
 }
 
@@ -14283,10 +14859,9 @@ void llama_moe_stream::vf_place_check_queue(const std::vector<vf_job_t *> & made
     const size_t nb_d = ggml_row_size(G.t_down, G.ne_down[0])*G.ne_down[1];
     const size_t o_g  = (size_t) j.place*2*nb_g, o_d = (size_t) j.place*nb_d;
     std::vector<uint8_t> blk(B.block_bytes);
-    const off_t off = (off_t) (B.base_offset + (size_t) j.leave_e*B.block_bytes);
     ssize_t r;
     do {
-        r = pread(file.file_id(), blk.data(), B.block_bytes, off);
+        r = moe_stream_pread_block(file.file_id(), B, j.leave_e, blk.data());
     } while (r < 0 && errno == EINTR);
     if (r != (ssize_t) B.block_bytes) {
         moe_stream_fail("VRAM follow place check: reading expert %d of layer %d from the sidecar failed", j.leave_e, B.il);
@@ -16913,10 +17488,9 @@ void llama_moe_stream::vf_copy_sync(std::unique_lock<std::mutex> & lock, vf_job_
         vf_src_ram += 1;
     } else {
         uint8_t * stage = moe_stream_scratch(vf_stage, A.block_bytes);
-        const off_t off = (off_t) (A.base_offset + (size_t) j.e*A.block_bytes);
         ssize_t r;
         do {
-            r = pread(file.file_id(), stage, A.block_bytes, off);
+            r = moe_stream_pread_block(file.file_id(), A, j.e, stage);
         } while (r < 0 && errno == EINTR);
         if (r != (ssize_t) A.block_bytes) {
             moe_stream_fail("VRAM follow: reading expert %d of layer %d from the sidecar failed (%s)", j.e, A.il, r < 0 ? strerror(errno) : "short read");

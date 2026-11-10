@@ -207,6 +207,9 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    // bytes of the context's memory (the KV cache and the recurrent state), all buffer types; fixed once the context exists
+    int64_t memory_bytes() const;
+
     //
     // training
     //

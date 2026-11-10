@@ -59,7 +59,7 @@ static std::string fmt(const char * f, ...) {
     return b;
 }
 
-std::string llama_moe_corr_file_check(const std::string & path, llama_moe_corr_header & h, bool verify_payload) {
+std::string llama_moe_corr_file_check(const std::string & path, llama_moe_corr_header & h, bool verify_payload, uint64_t base, uint64_t size) {
     FILE * f = llama_moe_os_fopen_utf8(path.c_str(), "rb");
     if (f == nullptr) {
         return fmt("cannot open %s", path.c_str());
@@ -68,12 +68,22 @@ std::string llama_moe_corr_file_check(const std::string & path, llama_moe_corr_h
     if (CORR_FSEEK(f, 0, SEEK_END) != 0) {
         return "cannot seek in the file";
     }
-    const uint64_t sz = CORR_FTELL(f);
+    uint64_t sz = CORR_FTELL(f);
+    if (size > 0) {   // the file is a part of a bigger one
+        if (base > sz || size > sz - base) {
+            return fmt("the data at %" PRIu64 " of %" PRIu64 " bytes is not inside %s (%" PRIu64 " bytes)", base, size, path.c_str(), sz);
+        }
+        sz = size;
+    } else if (base > sz) {
+        return "the start of the data is after the end of the file";
+    } else {
+        sz -= base;
+    }
     if (sz < 64) {
         return fmt("file is %" PRIu64 " bytes: shorter than the 64-byte preamble", sz);
     }
     unsigned char pre[64];
-    CORR_FSEEK(f, 0, SEEK_SET);
+    CORR_FSEEK(f, base, SEEK_SET);
     if (fread(pre, 1, 64, f) != 64) {
         return "short read of the preamble";
     }
@@ -173,7 +183,7 @@ std::string llama_moe_corr_file_check(const std::string & path, llama_moe_corr_h
         sha256_t st;
         sha256_init(&st);
         std::vector<unsigned char> buf(1 << 22);
-        CORR_FSEEK(f, ps, SEEK_SET);
+        CORR_FSEEK(f, base + ps, SEEK_SET);
         uint64_t left = sz - ps;
         while (left > 0) {
             const size_t n = (size_t) std::min<uint64_t>(left, buf.size());
@@ -192,7 +202,7 @@ std::string llama_moe_corr_file_check(const std::string & path, llama_moe_corr_h
 }
 
 std::string llama_moe_corr_file_stream(const std::string & path, const llama_moe_corr_header & h, const std::vector<size_t> & want,
-                                       const std::function<void(size_t, const void *)> & on_pair) {
+                                       const std::function<void(size_t, const void *)> & on_pair, uint64_t base) {
     FILE * f = llama_moe_os_fopen_utf8(path.c_str(), "rb");
     if (f == nullptr) {
         return fmt("cannot open %s", path.c_str());
@@ -203,7 +213,7 @@ std::string llama_moe_corr_file_stream(const std::string & path, const llama_moe
     sha256_t st;
     sha256_init(&st);
     std::vector<unsigned char> buf(1 << 22), pbuf;
-    if (CORR_FSEEK(f, h.payload_start, SEEK_SET) != 0) {
+    if (CORR_FSEEK(f, base + h.payload_start, SEEK_SET) != 0) {
         return "cannot seek to the payload";
     }
     uint64_t pos = h.payload_start;

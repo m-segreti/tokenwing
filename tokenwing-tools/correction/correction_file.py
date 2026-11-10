@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The correction file: the trained ridge correction of the router-trick guess, one matrix per (target layer, lead).
-Built for Ling 3.0 Flash: the model's shape (NE, ND below) is built in.  This module is the reference WRITER and the reference LOADER (what the engine must do at load).
+The model's shape (n_expert, n_embd) is read from the model.  This module is the reference WRITER and the reference LOADER (what the engine must do at load).
 
     write_correction(path, model_info, pairs, extra)   pairs: {(target, lead): Bt float32 [n_expert, n_embd]} plus per-pair meta
     load_correction(path, gguf_path)                   -> (header dict, {(target, lead): Bt memmap}); raises CorrectionFileError
@@ -18,7 +18,6 @@ import numpy as np
 MAGIC = b"TWCORR01"
 FORMAT = 1
 ALIGN = 4096
-NE, ND = 512, 2560
 
 
 class CorrectionFileError(Exception):
@@ -45,7 +44,7 @@ def _field(rd, key, default=None):
 
 def model_info(gguf_path, layers):
     """The identity of a model for the file: architecture, sizes, and a sha256 over the router tensors of `layers` (ffn_gate_inp.weight,
-    exp_probs_b.bias, ffn_norm.weight, as stored, in this order, for X in `layers`).  All three must be F32."""
+    optional exp_probs_b.bias, ffn_norm.weight, as stored, in this order, for X in `layers`)."""
     rd = _gguf(gguf_path)
     tn = {t.name: t for t in rd.tensors}
     arch = _field(rd, "general.architecture", "?")
@@ -54,28 +53,32 @@ def model_info(gguf_path, layers):
     for X in layers:
         for nm in ("blk.%d.ffn_gate_inp.weight" % X, "blk.%d.exp_probs_b.bias" % X, "blk.%d.ffn_norm.weight" % X):
             if nm not in tn:
+                if nm.endswith("exp_probs_b.bias") and arch != "bailingmoe3":
+                    continue   # hashed whenever the model has it (as the engine does), required only for bailingmoe3
                 raise CorrectionFileError("model has no tensor %s" % nm)
             t = tn[nm]
-            if t.tensor_type.name != "F32":
-                raise CorrectionFileError("tensor %s is %s, not F32" % (nm, t.tensor_type.name))
+            allowed = ("F32", "BF16", "F16") if nm.endswith("ffn_gate_inp.weight") else ("F32",)
+            if t.tensor_type.name not in allowed:
+                raise CorrectionFileError("tensor %s is %s, not %s" % (nm, t.tensor_type.name, "/".join(allowed)))
             h.update(np.ascontiguousarray(np.asarray(t.data)).tobytes())
             if nm.endswith("ffn_gate_inp.weight"):
                 shape = [int(x) for x in t.shape][::-1]            # [n_expert, n_embd]
     return {"arch": arch, "name": _field(rd, "general.name", ""), "n_layer": _field(rd, "%s.block_count" % arch),
             "n_expert": shape[0], "n_embd": shape[1], "layers": list(layers), "router_sha256": h.hexdigest(),
-            "hash_of": "sha256 over, for X in layers: blk.X.ffn_gate_inp.weight, blk.X.exp_probs_b.bias, blk.X.ffn_norm.weight (raw F32 bytes)"}
+            "hash_of": "sha256 over, for X in layers: blk.X.ffn_gate_inp.weight, optional blk.X.exp_probs_b.bias, blk.X.ffn_norm.weight (raw bytes)"}
 
 
 def write_correction(path, minfo, pairs, extra):
-    """pairs: {(target, lead): (Bt float32 [NE, ND], meta dict)}.  Writes atomically (tmp + rename)."""
+    """pairs: {(target, lead): (Bt float32 [n_expert, n_embd], meta dict)}.  Writes atomically (tmp + rename)."""
     keys = sorted(pairs)
-    nbytes = NE * ND * 4
+    ne, nd = int(minfo["n_expert"]), int(minfo["n_embd"])
+    nbytes = ne * nd * 4
     # header first with provisional offsets to learn its size; the JSON length is fixed by padding the offsets to a constant width
     def build(payload_start):
         off = payload_start
         plist = []
         for (X, d) in keys:
-            plist.append({"target": X, "lead": d, "source": X - d, "offset": off, "nbytes": nbytes, "shape": [NE, ND], "dtype": "f32", **pairs[(X, d)][1]})
+            plist.append({"target": X, "lead": d, "source": X - d, "offset": off, "nbytes": nbytes, "shape": [ne, nd], "dtype": "f32", **pairs[(X, d)][1]})
             off += nbytes
         return plist, off
     payload_start = ALIGN * 16
@@ -106,7 +109,7 @@ def write_correction(path, minfo, pairs, extra):
 def load_correction(path, gguf_path, verify_payload=True):
     """The loader contract.  Refuses (CorrectionFileError, message says why): short file, wrong magic, size differs from the header's
     (truncated / extended), header hash, unknown format, another model (arch, sizes, router hash), a pair table that does not fit the file
-    or the model, payload hash.  Returns (header, {(target, lead): memmap [NE, ND] float32 read-only})."""
+    or the model, payload hash.  Returns (header, {(target, lead): memmap [n_expert, n_embd] float32 read-only})."""
     sz = os.path.getsize(path)
     if sz < 64:
         raise CorrectionFileError("file is %d bytes: shorter than the 64-byte preamble" % sz)
@@ -137,10 +140,11 @@ def load_correction(path, gguf_path, verify_payload=True):
     if real["router_sha256"] != mi["router_sha256"]:
         raise CorrectionFileError("another model or quant: the router tensors' sha256 differs (file %s.., model %s..)" % (mi["router_sha256"][:12], real["router_sha256"][:12]))
     seen = []
-    nb = NE * ND * 4
+    ne, nd = int(mi["n_expert"]), int(mi["n_embd"])
+    nb = ne * nd * 4
     for p in hdr["pairs"]:
         X, d, off = p["target"], p["lead"], p["offset"]
-        if p["shape"] != [mi["n_expert"], mi["n_embd"]] or p["nbytes"] != nb or p["dtype"] != "f32":
+        if p["shape"] != [ne, nd] or p["nbytes"] != nb or p["dtype"] != "f32":
             raise CorrectionFileError("pair (%s, %s): shape %s / %s bytes do not fit the model" % (X, d, p["shape"], p["nbytes"]))
         if off < ps or off % ALIGN or off + nb > sz:
             raise CorrectionFileError("pair (%s, %s): offset %d outside the payload" % (X, d, off))
@@ -164,7 +168,7 @@ def load_correction(path, gguf_path, verify_payload=True):
             raise CorrectionFileError("payload hash mismatch (matrix bytes changed)")
     out = {}
     for p in hdr["pairs"]:
-        out[(p["target"], p["lead"])] = np.memmap(path, dtype="<f4", mode="r", offset=p["offset"], shape=(NE, ND))
+        out[(p["target"], p["lead"])] = np.memmap(path, dtype="<f4", mode="r", offset=p["offset"], shape=(ne, nd))
     return hdr, out
 
 

@@ -1604,6 +1604,33 @@ static int64_t llama_moe_stream_srv_extra(const llama_moe_stream_srv_terms & t, 
 // headroom: the record of this run's own needs (KV cache and host compute buffers as the run measured them, the rest of the process in its replies)
 // + the growth allowance + the server's snapshot terms in full (a computed reserve has no headroom) + --cache-ram. No record for these settings:
 // the fixed reserve's numbers. The same function for the load and the plan
+// --moe-stream-correction FILE: where the correction file is. The word `model` is the correction appended to the model file (a TokenWing
+// model file made with a correction); a model file without one gives an empty path (no correction) and, when `say`, one line.
+struct llama_moe_corr_ref {
+    std::string path;
+    uint64_t    base = 0, size = 0;
+};
+
+static llama_moe_corr_ref llama_moe_correction_ref(const char * value, const std::string & model_path, bool say) {
+    llama_moe_corr_ref ref;
+
+    ref.path = value ? value : "";
+
+    if (ref.path == MOE_STREAM_MODEL_WORD) {
+        if (llama_moe_model_file_blob(model_path, "correction", ref.base, ref.size)) {
+            ref.path = model_path;
+        } else {
+            ref.path.clear();
+            if (say) {
+                fprintf(stderr, "llama_moe_correction: NOT used (the plain guess runs): --moe-stream-correction model, but '%s' has no "
+                        "correction data (add one with tokenwing-tools/experts/make_model_file.py --correction)\n", model_path.c_str());
+            }
+        }
+    }
+
+    return ref;
+}
+
 static int64_t llama_moe_stream_np_bytes(const llama_moe_stream_nonpool & np, const char * sidecar, int64_t srv_need, int64_t srv_extra, const char * func) {
     const llama_moe_np_entry e = llama_moe_np_read(sidecar, np.key);
     const double M = 1024.0*1024.0;
@@ -1854,7 +1881,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (params.moe_stream_correction && params.moe_stream_correction[0] && params.moe_stream_pred_shared == 1 && params.moe_stream_prefetch != 0 &&
                     params.moe_stream_prefetch_lead < 2 && !(params.moe_stream_chance_model && params.moe_stream_chance_model[0])) {
                 llama_moe_correction_plan_in cin;
-                cin.path = params.moe_stream_correction;  cin.arch = arch_name();
+                const llama_moe_corr_ref cref = llama_moe_correction_ref(params.moe_stream_correction, ml.file_paths[0], /* say = */ false);
+                cin.path = cref.path;  cin.base = cref.base;  cin.size = cref.size;  cin.arch = arch_name();
                 cin.n_embd = hparams.n_embd;  cin.n_expert = hparams.n_expert;
                 cin.n_layer_all = n_layer_all;  cin.n_layer_dense = hparams.n_layer_dense_lead;  cin.n_layer_nextn = hparams.n_layer_nextn;
                 cin.lookahead = params.moe_stream_lookahead;
@@ -1889,7 +1917,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 np_srv_need = llama_moe_stream_srv_compute(hparams, *params.moe_stream_srv).need;
             }
             if (params.moe_stream_nonpool) {   // from the record, or the fixed reserve without one
-                np_planned = llama_moe_stream_np_bytes(*params.moe_stream_nonpool, params.moe_stream, np_srv_need, srv_bytes, __func__);
+                np_planned = llama_moe_stream_np_bytes(*params.moe_stream_nonpool, llama_moe_stream_sidecar_arg(params.moe_stream, ml.file_paths[0]).c_str(),
+                        np_srv_need, srv_bytes, __func__);
                 np_delta   = np_planned - (llama_moe_stream_other_reserve() + srv_bytes);
                 other_bytes += np_delta;
             }
@@ -2084,7 +2113,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_free           = params.moe_stream_vram_free > 0 ? params.moe_stream_vram_free : 0;
         p1.vram_scratch        = params.moe_stream_vram_scratch;   // -1 = derived
         p1.vram_growth         = params.moe_stream_vram_growth > 0 ? params.moe_stream_vram_growth : 0;  // 0 = derived
-        p1.correction_file     = params.moe_stream_correction ? params.moe_stream_correction : "";
+        {
+            const llama_moe_corr_ref cref = llama_moe_correction_ref(params.moe_stream_correction, ml.file_paths[0], /* say = */ true);
+            p1.correction_file     = cref.path;
+            p1.correction_base     = cref.base;
+            p1.correction_size     = cref.size;
+        }
         p1.idle_load           = params.moe_stream_idle_load == 1;
         p1.usage_file          = params.moe_stream_usage_file ? params.moe_stream_usage_file : "";
         p1.idle_pause_ms       = params.moe_stream_idle_pause_ms > 0 ? params.moe_stream_idle_pause_ms : 500;
@@ -2139,6 +2173,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.copy_ahead           = params.moe_stream_copy_ahead;   // copy-ahead for GPU prompts (0 / 1 / 2)
         p1.vram_lend_prompt     = params.moe_stream_vram_lend_prompt != 0;
         p1.vram_lend_short      = std::max(1, params.moe_stream_vram_lend_short);
+        p1.timing               = params.moe_stream_timing == 1;
         p1.nonpool              = params.moe_stream_nonpool != nullptr;
         pimpl->moe_stream = std::make_unique<llama_moe_stream>(
                 params.moe_stream,
@@ -2188,7 +2223,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (params.moe_stream_nonpool) {
             auto & ms    = *pimpl->moe_stream;
             ms.np_key     = params.moe_stream_nonpool->key;
-            ms.np_sidecar = params.moe_stream;
+            ms.np_sidecar = llama_moe_stream_sidecar_arg(params.moe_stream, ml.file_paths[0]);
             ms.np_planned = np_planned;
             ms.np_known   = np_known;
             ms.np_growth  = params.moe_stream_nonpool->growth;
@@ -2607,7 +2642,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // --moe-stream-correction FILE: the corrected guess matrices, before the combined step's stacks (their gain rows
         // are ones for a corrected pair)
         if (!pimpl->moe_stream->p1.correction_file.empty()) {
-            pimpl->moe_stream->corr.load(*this, *pimpl->moe_stream, pimpl->moe_stream->p1.correction_file);
+            pimpl->moe_stream->corr.load(*this, *pimpl->moe_stream, pimpl->moe_stream->p1.correction_file,
+                    pimpl->moe_stream->p1.correction_base, pimpl->moe_stream->p1.correction_size);
         }
         if (pimpl->moe_stream->la_comb) {
             llama_moe_stream & ms = *pimpl->moe_stream;
@@ -3323,7 +3359,7 @@ bool llama_moe_stream_get_plan(
             plan_srv_bytes = llama_moe_stream_srv_extra(llama_moe_stream_srv_compute(mb->hparams, *srv), *srv, __func__);
             plan_srv_need  = llama_moe_stream_srv_compute(mb->hparams, *srv).need;
         }
-        const int64_t plan_np_bytes = nonpool ? llama_moe_stream_np_bytes(*nonpool, sidecar_json, plan_srv_need, plan_srv_bytes, __func__)
+        const int64_t plan_np_bytes = nonpool ? llama_moe_stream_np_bytes(*nonpool, llama_moe_stream_sidecar_arg(sidecar_json, model_path).c_str(), plan_srv_need, plan_srv_bytes, __func__)
                                               : llama_moe_stream_other_reserve() + plan_srv_bytes;
 
         // --moe-stream-record's RAM (record_words > 0), so that the plan gate sees what the run will hold
@@ -3353,7 +3389,9 @@ bool llama_moe_stream_get_plan(
             }
             if (!plan_has_gpu) {
                 llama_moe_correction_plan_in cin;
-                cin.path = correction;  cin.arch = arch;  cin.n_embd = (int64_t) mi.n_embd;  cin.n_expert = (int64_t) mi.n_expert;
+                const llama_moe_corr_ref cref = llama_moe_correction_ref(correction, model_path, /* say = */ false);   // (the word `model`: the data in the model file, as the load reads it)
+                cin.path = cref.path;  cin.base = cref.base;  cin.size = cref.size;
+                cin.arch = arch;  cin.n_embd = (int64_t) mi.n_embd;  cin.n_expert = (int64_t) mi.n_expert;
                 cin.n_layer_all = mi.n_layer_all;  cin.n_layer_dense = mi.n_layer_dense;  cin.n_layer_nextn = mi.n_layer_nextn;
                 cin.lookahead = lookahead > 1 ? lookahead : 1;
                 for (const auto & [x, b] : llama_moe_correction_plan(cin)) {
@@ -4179,6 +4217,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_copy_ahead    =*/ 0,         // off (no copy ahead; one-wave prompts take the scheduler's pool copy)
         /*.moe_stream_vram_lend_prompt =*/ 0,      // off (the prompt's GPU tensors in the compute buffer)
         /*.moe_stream_vram_lend_short  =*/ 64,     // prompt calls of <= 64 tokens in the real compute buffer
+        /*.moe_stream_timing           =*/ 0,      // no timing work
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

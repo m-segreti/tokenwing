@@ -3351,7 +3351,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-stream"}, "PATH",
         "stream the routed MoE experts from the repacked sidecar described by PATH (the "
         "\"<sidecar>.json\" of tokenwing-tools/experts/expert_repack.py) into per-layer slot pools in RAM instead of "
-        "reading them from the model file",
+        "reading them from the model file. The word `model` streams from the model file itself, which then has to be a "
+        "TokenWing model file (tokenwing-tools/experts/make_model_file.py: the same GGUF with every tensor on a 4096-byte "
+        "boundary, checksums of sample experts, and optional data appended after the last tensor), so one file is all there is; "
+        "any other file is refused with one line. A read of an expert is then one request per projection (gate, up, down), "
+        "each at its own place in the file",
         [](common_params & params, const std::string & value) {
             params.moe_stream = value;
         }
@@ -3434,7 +3438,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "that stock itself pays for putting the routed experts on the host instead of the GPU (tiny, "
         "measured) - both orders are rounding of the same weights, not a change of the model. "
         "'hot' uses Ling-3.0-flash's layer ranking (43 blocks); for another model it falls back to "
-        "shallowest-first and says so on stderr",
+        "shallowest-first and says so on stderr. With --moe-stream model the order is the file <model>.gguf.layer-order.json "
+        "next to the model file, else the layer order appended to the model file",
         [](common_params & params, const std::string & value) {
             params.moe_stream_gpu_layers_mode = value;
         }
@@ -3549,7 +3554,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-chunk"}, "KiB",
         "split every demand read of an expert into chunks of this many bytes, so that the I/O "
-        "threads serve one read in parallel (default: 0 = one read per expert)",
+        "threads serve one read in parallel. With --moe-stream model a chunk is a piece of one projection (gate, up or down) and "
+        "never crosses into the next, and 0 still means one request per projection (default: 0 = one read per expert)",
         [](common_params & params, int value) {
             // 1024*value in int32 overflows above 2 MiB and a negative chunk became "off", so
             // the product is computed in 64 bits and a chunk is at most one expert block (2 GiB)
@@ -4028,7 +4034,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-vram-experts-file"}, "FNAME",
         "the ranked expert list per MoE layer for --moe-stream-vram-experts (JSON, format \"tokenwing vram-experts v1\", made by "
-        "tokenwing-tools/experts/make_vram_list.py) (default: none)",
+        "tokenwing-tools/experts/make_vram_list.py). The word `model` takes the list appended to a TokenWing model file "
+        "(make_model_file.py --vram-list) (default: none)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_vram_experts_file = value;
         }
@@ -4079,7 +4086,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "For each (layer, lead) pair in the file the guess is made with W' = W_X*g_X + Bt instead of W_X (same product, same cost); "
         "the matrices are allocated on the routers' own devices at model load, so a later --moe-stream-vram-free sees them as used "
         "VRAM. Needs --moe-stream-pred-shared 1. A damaged file, another model or quant, or a setting it does not fit = the plain guess "
-        "and one line saying why, never an abort (default: unset = the plain guess)",
+        "and one line saying why, never an abort. The word `model` takes the correction appended to a TokenWing model file "
+        "(make_model_file.py --correction); a model file without one gives the plain guess and one line "
+        "(default: unset = the plain guess)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_correction = value;
         }
@@ -4103,7 +4112,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-usage-file"}, "FNAME",
         "the usage table of --moe-stream-idle-load (\"tokenwing usage v1\"; default: next to the sidecar, <sidecar>.usage.json; "
-        "its seed is the same name with -seed before .json). Keep it on the internal drive the model streams from",
+        "its seed is the same name with -seed before .json; with --moe-stream model the default is <model>.gguf.usage.json next to the model file, "
+        "and with no seed file the usage seed appended to the model file is the seed). Keep it on the internal drive the model streams from",
         [](common_params & params, const std::string & value) {
             params.moe_stream_usage_file = value;
         }
@@ -4555,8 +4565,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-nonpool-measured"}, "0|1",
         "1 = the memory held back outside the expert pools comes from this run's own needs: the KV cache, the host compute buffers and the "
-        "rest of the process are measured in the run and kept in a record next to the sidecar (<sidecar>.nonpool.txt, one line per set of "
-        "settings); the next start with the same settings sizes the pools from it. Without a record: the fixed reserve. "
+        "rest of the process are measured in the run and kept in a record next to the sidecar (<sidecar>.nonpool.txt, or <model>.gguf.nonpool.txt next to the model file with "
+        "--moe-stream model; one line per set of settings); the next start with the same settings sizes the pools from it. Without a record: the fixed reserve. "
         "A start that needs more than planned gives back slots, one line (default: 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {
@@ -4910,6 +4920,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-stream-timing"}, "0|1",
+        "1 = with --moe-stream: measure where the time of every call goes - the host backend's compute, the device's kernels "
+        "(CUDA events), the copies between backends and the waits for them - and report it per reply word next to the SSD wait: "
+        "in llama-server's GET /moe-stream/stats and in timings.moe_stream of a response. "
+        "It reads the clock around work that runs anyway and records two CUDA events per graph; no copy, wait or order is added. "
+        "0 = off, the engine does no timing work (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-timing must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_timing = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-cpu-repack"}, "BOOL",
         "keep the expert pools in llama.cpp's repacked CPU layout, which lets the expert MUL_MAT_ID "
         "use the repacked kernels: measured 2.2x on the expert matmul (0.187 -> 0.084 ms for 8 experts "
@@ -4927,7 +4953,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "byte-compare one filled expert slot of every streamed layer, and one expert of a whole layer "
         "kept in VRAM, against the model file at the first token; a mismatch ends the run "
         "with the layer, the projection and the byte. 0 = off, 1 (the default) = every layer, N = the "
-        "first N layers. It costs one expert read and one memcmp per layer",
+        "first N layers. It costs one expert read and one memcmp per layer. With --moe-stream model the "
+        "slot is compared with the model file once its last piece has landed, and the first, the middle and the last expert of each "
+        "checked layer (gate, up and down) are also read from the model file and their FNV-1a 64-bit sums compared with the ones stored "
+        "in the file; the run ends naming the layer, the expert and the projection",
         [](common_params & params, int value) {
             params.moe_stream_verify = value;
         }

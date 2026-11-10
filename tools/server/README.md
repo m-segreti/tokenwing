@@ -350,9 +350,11 @@ With `--cache-disk DIR` the server keeps conversation states on disk, also with 
     saved prefix state already contains is not saved again, and saved prefix states it contains are deleted.
   - File names are always hashes, never text from a request.
   - A prompt with media (images, audio) is not saved; text prompts are, also when a multimodal projector is loaded.
-- **Size limit:** `--cache-disk-gb` (default 8). The entry written longest ago is deleted first, whatever its kind, once the new
-  file is fully written (so a failed write deletes nothing; during a save the directory can briefly hold the limit plus that
-  one state, the temp file). A temp file is named `<entry>.<pid>.<random>.tmp`, so a crashed writer's leftover never blocks a
+- **Size limit:** `--cache-disk-gb` (default 8). When a save does not fit, entries are deleted - the one written longest ago
+  first, whatever its kind - once the new file is fully written (so a failed write deletes nothing; during a save the
+  directory can briefly hold the limit plus that one state, the temp file). Entries of chats that are not pinned (saved states,
+  snapshots, and entries with no chat id) go first; entries of pinned chats only when no other entry is left (see "Pinned
+  chats" below). A temp file is named `<entry>.<pid>.<random>.tmp`, so a crashed writer's leftover never blocks a
   save; it is removed at the next start-up when its writer is gone. A state larger than the limit is not written. A failed write is logged and never changes a reply.
 - **When it restores:** at a request's start.
   - **With a chat id:** that chat's file, when it shares more of the request than the slot holds and at least 25 % of the
@@ -403,6 +405,47 @@ With `--cache-disk DIR` the server keeps conversation states on disk, also with 
     (erase, clear, the size limit evicting the chat file). A damaged or foreign snapshot file is refused with a log line and
     the request re-reads from the best other state.
   - **Cost:** one snapshot per message (on Ling-3.0-flash 75 MB) written at the reply's end.
+- **Pinned chats:** `POST /cache-disk/pins` with the body `{"pinned": ["<chat id>", ...]}` replaces the whole set of pinned
+  chats (the ids sent in `X-Conversation-Id`; an empty list unpins all). The size limit deletes the entries of pinned chats
+  last: a pinned chat's saved state and its snapshots are kept while any entry of a chat that is not pinned, or with no chat id,
+  can be deleted instead; only when none is left does the oldest entry of a pinned chat go. The directory stays within
+  `--cache-disk-gb` either way. The set is kept in memory only, so a client sends it after each start of the server and on every
+  change. Answer: `{"pinned": N}` (the number of different chats). A body that is not `{"pinned": [strings]}` is refused with
+  400. It answers at once, also while the server sleeps, and has the same origin rule and router-mode form as erase / clear below.
+- **Branching a chat:** `POST /cache-disk/fork` with the body `{"from": "<chat id>", "to": "<chat id>"}` (the ids sent in
+  `X-Conversation-Id`) makes every saved entry of chat `from` - its saved state and its "start of message" snapshots - also an
+  entry of chat `to`, so that the next request with `X-Conversation-Id: <to>` resumes from the nearest usable one. It is for a
+  conversation that branches: when an older message is edited and the new version continues under a new chat id, the branch
+  starts from the parent's snapshot instead of reading the whole conversation again. Other keys in the body are ignored.
+  - **Copies, not links:** a file holds its chat id in its header and a snapshot's name is checked against it, so a second
+    name for the same file would not be another chat's entry. Each copy is its own file with the new chat id and write time
+    in its header and the rest of the bytes as they are (same checksum rules, 0600). It needs the disk space of the entries
+    it copies. `from` is not changed.
+  - **What is copied:** the usable entries of `from` that are on the disk now (a reply still being written is not in them):
+    the saved state first, then the snapshots, the newest first, at most `--cache-disk-checkpoints` of them. An entry that
+    cannot be copied is left out and counted in `skipped`.
+  - **Size limit and pins:** every copy counts in `--cache-disk-gb` as an entry written now. To make room the server deletes
+    other chats' entries in the order above (chats that are not pinned first, the entry written longest ago first; pinned
+    chats only when nothing else is left); it never deletes `from`'s entries or the copies it just made. An entry that still
+    does not fit is not copied (`skipped`), so the directory stays within the limit.
+  - **`to` is replaced:** its saved state and snapshots are deleted first, its RAM prompt cache states, the content of an
+    idle slot that holds it and its resumable-stream buffer are dropped, and a request of it that arrived before does not save
+    over the copy (as after an erase). Nothing of `to` is touched when `from` has no saved entry or nothing can be copied.
+  - **Answer:** `{"state_copied": true, "snapshots": N, "file_bytes": N, "skipped": N, "replaced_bytes": N, "ram_states": N,
+    "slots": N, "slots_answering": N, "stream_sessions": N}`. A body that is not `{"from": "<id>", "to": "<id>"}` with two
+    different chat ids that are not empty is refused with 400, and so is a `from` that has no saved entry on the disk (never
+    saved, erased, or deleted by the size limit; the message says which); it changes nothing. 500 when nothing could be copied.
+    Like erase / clear it needs the API key when the server has one, refuses a web page's `Origin` that is not allowed
+    (403), answers while the server sleeps (`"asleep": true`, files only) and, in router mode, is passed to a model's server
+    with `{"model": "<name>"}` in the body.
+- **Evaluating a prompt ahead of time:** a request with `"n_predict": 0` evaluates its prompt into the slot's cache and generates
+  nothing (an empty answer, stop type `limit`). A client that knows where an edited conversation will diverge can send the
+  conversation up to that point this way, with the chat's `X-Conversation-Id` header, before the user sends the edit: the later
+  request that shares the prefix does not read the shared part again (`timings.cache_n` counts it). The request can be cancelled
+  while its prompt is processed, like any other (`DELETE /v1/stream?conv_id=<id>` with a chat id, or closing the connection
+  without one). Add `"cache_disk_save": false` so that the request leaves the chat's files as they were - it writes no saved
+  state or snapshot, replaces none, and deletes no snapshot made for another history - so that cancelling the edit costs the
+  chat nothing.
 - **Log lines:** saves, restores, deletions and refusals print a `cache-disk:` line, with the time (ms) and size (MB).
 - **Deleting saved states** (both need the API key when the server has one; they delete the engine's states only, never the
   chat text, which is the app's). Both run at once - after a save in progress, never waiting for a slot that is answering: a
@@ -685,6 +728,8 @@ These words will not be included in the completion, so make sure to add them to 
 
 `cache_prompt`: Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests. Because (depending on the backend) the logits are **not** guaranteed to be bit-for-bit identical for different batch sizes (prompt processing vs. token generation) enabling this option can cause nondeterministic results. Default: `true`
 
+`cache_disk_save`: With `--cache-disk`: when `false`, the request does not write, replace or delete the chat's saved state or snapshots on the disk (see "Chat states on disk"). Default: `true`
+
 `return_tokens`: Return the raw generated token ids in the `tokens` field. Otherwise `tokens` remains empty. Default: `false`
 
 `samplers`: The order the samplers should be applied in. An array of strings representing sampler type names. If a sampler is not set, it will not be used. If a sampler is specified more than once, it will be applied multiple times. Default: `["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]` - these are all the available values.
@@ -767,7 +812,7 @@ These words will not be included in the completion, so make sure to add them to 
   - `limit`: Stopped because `n_predict` tokens were generated before stop words or EOS was encountered
   - `word`: Stopped due to encountering a stopping word from `stop` JSON array provided
 - `stopping_word`: The stopping word encountered which stopped the generation (or "" if not stopped due to a stopping word)
-- `timings`: Hash of timing information about the completion such as the number of tokens `predicted_per_second`
+- `timings`: Hash of timing information about the completion such as the number of tokens `predicted_per_second`. With `--moe-stream` it also holds the expert-streaming figures of the request in `moe_stream` (see "Timings and context usage" under `/v1/chat/completions`)
 - `tokens_cached`: Number of tokens from the prompt which could be re-used from previous completion
 - `tokens_evaluated`: Number of tokens evaluated in total from the prompt
 - `truncated`: Boolean indicating if the context size was exceeded during generation, i.e. the number of tokens provided in the prompt (`tokens_evaluated`) plus tokens generated (`tokens predicted`) exceeded the context size (`n_ctx`)
@@ -1244,6 +1289,34 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 | `llamacpp:spec_decode_num_drafts_total` | Counter | Total speculative decoding verification steps (0 when spec-decode is off). |
 | `llamacpp:spec_decode_num_accepted_tokens_per_pos_total` | Counter | Accepted tokens per draft position (labeled `position="N"`; absent when spec-decode is off or before the first completed speculative request). |
 
+### GET `/moe-stream/stats`: The expert-streaming engine's figures now
+
+Only with `--moe-stream`; without it the answer is an error (`not_supported_error`, code 501). It reads the engine's counters and
+takes no lock against the compute, so it can be polled while a request runs (about once a second costs nothing measurable) and it does
+not wake a sleeping server (that gets 503 `unavailable_error`). In router mode it is forwarded to the model like `/slots`.
+
+```js
+{
+  "moe_stream": true,
+  "timing": false,                // --moe-stream-timing
+  "request": { ... } | null,      // the request running now so far ("active": true), else the last one that ended ("active": false)
+  "total":   { ... },             // since the engine started
+  "layout": {
+    "layers": 24, "streamed_layers": 23, "streamed_layer_ids": [1, 2, ...], "whole_gpu_layers": [],
+    "experts_per_layer": 128, "experts_per_word": 8, "expert_mib": 2.7,
+    "ram_slots_per_layer": [51, ...], "ram_slots_total": 1173,
+    "vram_experts_per_layer": [0, ...], "vram_experts_total": 0, "vram_follow": false,
+    "ram_pool_mib": 3312.0, "vram_pool_mib": 0.0, "kv_cache_mib": 12.0
+  }
+}
+```
+
+`request` and `total` have the shape of `timings.moe_stream` (see "Timings and context usage" under `/v1/chat/completions`): tokens,
+RAM / VRAM hit rate, misses, MiB read, SSD wait, the guess counts, VRAM follow swaps and copy-backs, `per_layer`, and
+`time_per_word` with `--moe-stream-timing 1`. The figures grow while a reply is written; `per_layer` is read just after the totals, so while a reply runs its sums can differ from them
+by the work done in between. The counters belong to the engine, so with several requests running at once their figures overlap. `ram_slots_per_layer` and `vram_experts_per_layer` are the actual counts now
+(they differ between layers when the engine gives memory back or the VRAM set follows the replies).
+
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
 *Options:*
@@ -1540,6 +1613,51 @@ The response contains a `timings` object, for example:
 ```
 
 This provides information on the performance of the server. It also allows calculating the current context usage.
+
+With `--moe-stream` the final response's `timings` (the last chunk when streaming) also holds a `moe_stream` object with the
+expert-streaming engine's figures for the request - the same ones the server logs after each request. It is absent when
+`--moe-stream` is off. It is read once, when the request ends, so it costs nothing per token.
+
+```js
+"moe_stream": {
+  "layers": 23,              // MoE layers whose experts are streamed
+  "slots": 51,               // expert slots per layer in RAM
+  "hit_rate_percent": 92.1,  // RAM hits over RAM hits + loads, over the whole request
+  "prompt": { ... },         // the prompt's share
+  "reply": { ... },          // the generated tokens' share
+  "prompt_tokens": 44, "words": 48,
+  "expert_uses": 8832,       // experts the layers needed: RAM hits + loads + uses the VRAM pool served
+  "ram_hit_percent": 85.0, "vram_hit_percent": 7.1, "miss_percent": 7.9,   // of expert_uses; they add up to 100
+  "misses": 698, "mib_read": 2186.3, "ssd_wait_ms": 412.5,
+  "guesses": { ... },        // prompt and reply together (see below)
+  "vram": { "follow_swaps": 0, "follow_copies": 0, "copybacks": 0, "copyback_late": 0, "copyback_wait_ms": 0.0 },
+  "per_layer": [ ... ],      // one entry per streamed layer
+  "time_per_word": { ... }   // only with --moe-stream-timing 1
+}
+```
+
+`prompt` and `reply` hold the same fields: `tokens` (tokens that went through the model in that phase), `hit_rate_percent`,
+`misses` (experts that had to be read from the drive), `mib_read`, `stall_ms` (time spent waiting for the drive), and per
+token `misses_per_token`, `mib_per_token` and `stall_ms_per_token` (0 when `tokens` is 0), then `expert_uses`,
+`ram_hit_percent`, `vram_hit_percent`, `miss_percent` and `guesses`. The counters belong to the
+engine, not to a slot, so with several requests running at once their figures overlap.
+
+`guesses` counts the reads the engine started ahead of time for experts a layer was expected to need: `issued`; `in_time` (landed
+before the layer asked); `late` (the layer asked while the read was in flight, so it waited; `late_wait_ms` is that wait, reply words
+only, null in `prompt`); `missed` (the layer needed an expert no guess had brought, so it was read on demand; in `reply`,
+`missed_by_cause` splits it into `no_guess`, `not_named` and `named_not_read`); `wasted` (read, then left RAM unused); `cancelled`
+(a read stopped before it ran). `expert_uses` also holds the experts that were already in RAM for another reason (used before), which
+no guess counts, so `in_time + late + missed` is smaller than `expert_uses`.
+
+`per_layer` has, for every streamed layer: `layer` (its index in the model), `hits`, `misses`, `vram_hits`, `stall_ms`, `ram_slots` and
+`vram_experts` (what the layer holds now), and `reply` with the same `hits`, `misses`, `vram_hits`, `stall_ms` for the reply words only.
+The sums over the layers are the totals above.
+
+With `--moe-stream-timing 1`, `time_per_word` says where the reply words' time went, per word in milliseconds (`total_ms` has the
+same split in total): `ms_per_word` (the wall time of the reply calls divided by the words), `ssd_wait_ms` (waiting for the drive),
+`cpu_ms` (the CPU's compute, without that wait), `gpu_ms` (the device's kernel time; it runs beside the CPU's work, so it is not
+a share of the word), `handoff_ms` (copies and waits between the CPU and the GPU; `handoff_copies_ms`, `handoff_syncs_ms`) and
+`rest_ms` (everything else on the host: graph set-up, sampling). `ssd_wait_ms + cpu_ms + handoff_ms + rest_ms` is `ms_per_word`.
 
 The total number of tokens in context is equal to `prompt_n + cache_n + predicted_n`
 

@@ -76,10 +76,15 @@ struct moe_stream_block {
     // The sidecar stores this layer's experts in llama.cpp's repacked CPU layout, so a read of
     // them is a copy into the slot and not a conversion
     bool   repacked = false;
+    // The experts are read from the model file itself (--moe-stream model): the three projections of an expert are in
+    // three places, so a block is virtual (gate | up | down, as the slot holds them) and each projection says where its
+    // expert 0 is in the file (file_off). base_offset is not used then.
+    bool   by_proj = false;
 
     struct projection {
         size_t      offs  = 0;  // offset inside the block
         size_t      size  = 0;  // bytes of one expert slice
+        size_t      file_off = 0;  // by_proj: file offset of expert 0 of this projection, expert e is at file_off + e*size
         std::string name;      // name of the GGUF tensor it was cut from
         // Where that tensor is in the model, so the engine can read the same bytes again
         // and compare a streamed slot against the file the sidecar claims to come from. Expert e of it
@@ -166,6 +171,7 @@ struct llama_moe_stream_p1 {
     int64_t     vram_scratch = -1;  // --moe-stream-vram-scratch: the op scratch pool mapped before the check, bytes; -1 = derived by llama_context, 0 = not mapped
     int64_t     vram_growth = 0;    // --moe-stream-vram-growth: the fit's reserve for lazy allocations; 0 = derived
     std::string correction_file;   // --moe-stream-correction FILE: the trained correction of the router-trick guess, "" = off
+    uint64_t    correction_base = 0, correction_size = 0;   // the file is the `size` bytes at `base` of correction_file (the word `model`: data appended to the model file); 0 = the whole file
     bool        idle_load      = false;   // --moe-stream-idle-load 1 (idle-time loading)
     std::string usage_file;               // --moe-stream-usage-file, "" = <sidecar>.usage.json
     int32_t     idle_pause_ms  = 500;     // --moe-stream-idle-pause
@@ -232,6 +238,7 @@ struct llama_moe_stream_p1 {
     uint32_t    layer_major_batch = 0; // --moe-stream-layer-major-batch (the cap of llama_context's n_batch raise; 0 = n_ctx)
     bool        vram_lend_prompt  = false; // --moe-stream-vram-lend-prompt 1
     int32_t     vram_lend_short   = 64;    // --moe-stream-vram-lend-short N (prompt calls of <= N tokens in the real buffer)
+    bool        timing            = false; // --moe-stream-timing 1 (where a call's time goes; see llama_moe_stream::tm_us)
     int32_t     copy_ahead        = 0;     // --moe-stream-copy-ahead 0|1|2|3 (1: two copy sets when a set costs <= 1/4 of the pool's room, else one; 2: one set; 3: two)
     int32_t     vram_end_fill     = 0; // --moe-stream-vram-end-fill 0|1|2 (the GPU tail refilled at a prompt-end call's end
                                        //   with the prompt-end weights; 2 = also one tick for the per-layer places; 0 = off)
@@ -266,6 +273,8 @@ struct llama_moe_stream_layer {
     size_t base_offset = 0;  // sidecar offset of expert 0 of this layer
     size_t block_bytes = 0;  // sidecar bytes per expert of this layer
     bool   repacked   = false;  // the sidecar stores this layer's experts already repacked
+    bool   by_proj    = false;  // the experts are read from the model file: each projection has its own place (file_off)
+    size_t file_off[3] = { 0, 0, 0 };  // by_proj: file offset of expert 0 of gate, up, down; expert e is at file_off[p] + e*weights[p].size
 
     std::vector<llama_moe_stream_weight> weights;  // gate, up, down
 
@@ -1076,6 +1085,8 @@ struct llama_moe_stream {
     };
     std::vector<vx_group_t> vx_groups;
     std::map<int32_t, std::vector<int32_t>> vx_file_layers;   // the list file, by model layer
+    std::map<int32_t, std::vector<int64_t>> vx_file_scores;   // optional per-expert priority scores from the list file
+    bool                                    vx_non_uniform = false;
     bool        vx_ready     = false;   // the pool is allocated (and filled): the graphs carry the device pass
     bool     (* vx_zero_unreg)(const void * pool) = nullptr;   // --moe-stream-gpu-skip-zero: the CUDA table's unregister
     bool        vx_test_empty = false;  // MOE_STREAM_VRAM_TEST_EMPTY=1: pool and device pass, but no expert held
@@ -2659,6 +2670,21 @@ struct llama_moe_stream {
 
     llama_file file;  // the sidecar, opened with O_DIRECT
 
+    // --moe-stream model: the experts are read from the model file itself, which carries what the experts file would
+    // (tokenwing-tools/experts/make_model_file.py)
+    bool        model_file = false;
+    std::string model_file_path;   // the model's GGUF (where its appended data is)
+    std::vector<std::array<uint64_t, 9>> mf_sums;       // [n_layer] FNV-1a 64 of the first, middle, last expert's gate, up, down
+    std::vector<uint8_t>                 mf_has_sums;   // [n_layer]
+    std::map<std::string, std::pair<uint64_t, uint64_t>> mf_blobs;   // appended data: name -> offset, size
+    // the named data appended to the model file as a string; false when the model file is not a TokenWing model file or has no such data
+    bool model_file_blob(const char * name, std::string & out) const;
+    // the checksum check of one layer's sample experts against the file's metadata (stops the run on a mismatch)
+    void verify_model_file_layer(llama_moe_stream_layer & sl);
+    // The read-back check's read of a model file is several pieces on several threads: for the read that carries the check, the pieces
+    // still to land per (layer, slot). The thread that lands the last one runs the check. Guarded by verify_mtx.
+    std::map<std::pair<int32_t, int32_t>, int32_t> mf_left;
+
     std::vector<ggml_context *>    ctxs;  // one per pool tensor
     std::vector<ggml_backend_buffer_t> bufs;
     std::vector<void *>                  pool_mem;  // page-aligned allocations owned by us
@@ -3006,6 +3032,19 @@ struct llama_moe_stream {
     // The tokens of each phase, counted once per batch by set_decode(), not once per layer
     int64_t n_tok_outer_pre = 0;
     int64_t n_tok_outer     = 0;
+    // --moe-stream-timing 1: for [0] prompt calls and [1] decode calls, the calls and where their time went - wall time,
+    // host backend compute, device kernels, cross-backend copies, backend syncs (microseconds). Added once per call, when it ends
+    // (llama_context::decode); atomic because the server reads them from its HTTP thread while a request runs
+    std::atomic<int64_t> tm_us[2][6] = {};
+    void timing_add(int kind, int64_t wall, int64_t host, int64_t dev, int64_t copy, int64_t sync) {
+        std::atomic<int64_t> * t = tm_us[kind];
+        t[0].fetch_add(1,    std::memory_order_relaxed);
+        t[1].fetch_add(wall, std::memory_order_relaxed);
+        t[2].fetch_add(host, std::memory_order_relaxed);
+        t[3].fetch_add(dev,  std::memory_order_relaxed);
+        t[4].fetch_add(copy, std::memory_order_relaxed);
+        t[5].fetch_add(sync, std::memory_order_relaxed);
+    }
     int64_t b0_prompt_seq   = 0;   // prompt calls so far (the evictions of the last one are counted apart)
     // The position a speculative draft of a few tokens would continue from
     int32_t  decode_next_pos = 0;
@@ -3223,6 +3262,17 @@ void llama_moe_stream_verify_gpu_tier(struct llama_context * ctx);
 // The bytes of a model file, or the sum of the shards of a split one (the sidecar records that
 // sum, and the fingerprint check compares against it)
 size_t llama_moe_stream_model_bytes(const char * model_path);
+
+// --moe-stream model: the experts are read from the model file itself. The word `model` is also what the path flags
+// of the data that such a file can carry (--moe-stream-correction, --moe-stream-vram-experts-file) take to say "the copy in the model file".
+#define MOE_STREAM_MODEL_WORD "model"
+
+// the path the engine's own files are named after: the model file for --moe-stream model, else the experts file's metadata path as given
+std::string llama_moe_stream_sidecar_arg(const std::string & moe_stream, const std::string & model_path);
+
+// where the named data appended to a TokenWing model file is (correction, vram_experts, usage_seed, layer_order); false
+// when the file is not one or has no such data
+bool llama_moe_model_file_blob(const std::string & model_path, const char * name, uint64_t & offset, uint64_t & size);
 
 // the plan of --moe-stream for a model and a sidecar, without loading or allocating anything
 bool llama_moe_stream_print_plan(

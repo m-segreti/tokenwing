@@ -464,6 +464,9 @@ struct server_slot_stats {
         return t_ms > 0.0 ? 1e3 / t_ms * n_gen_steps() : 0.0;
     }
 
+    // The streaming engine's counters for the request, set on the final response only; null = none (--moe-stream is off)
+    json moe_stream;
+
     // false if the slot never started, i.e. the task result carries no stats
     bool is_set() const {
         return t_start > 0;

@@ -27,6 +27,7 @@ struct llama_moe_stream;
 // unreadable header). The caller applies the settings the load refuses for (pred-shared 0, prefetch 0, the chance table, prefetch lead 2).
 struct llama_moe_correction_plan_in {
     std::string path;
+    uint64_t    base = 0, size = 0;   // the correction file is the `size` bytes at `base` of `path` (appended to a model file); 0 = the whole file
     std::string arch;
     int64_t     n_embd = 0, n_expert = 0;
     uint32_t    n_layer_all = 0, n_layer_dense = 0, n_layer_nextn = 0;
@@ -55,7 +56,8 @@ struct llama_moe_correction {
 
     // Reads the file and builds the tensors. Never throws on a refusal: it prints one line ("NOT used (the plain guess runs): <why>") and
     // leaves everything as it was. Must run after the model's tensors are loaded and before the combined-guess stacks are built.
-    void load(const llama_model & model, const llama_moe_stream & ms, const std::string & path);
+    // `base` / `size`: the file is the `size` bytes at `base` of `path` (data appended to the model file), size 0 = the whole file
+    void load(const llama_model & model, const llama_moe_stream & ms, const std::string & path, uint64_t base = 0, uint64_t size = 0);
 
     size_t bytes() const { return n_bytes; }
 

@@ -553,6 +553,8 @@ extern "C" {
                                                 //      buffer shrinks, the pool grows); 0 = off (default)
         int32_t      moe_stream_vram_lend_short;  // prompt calls of at most this many tokens run in the real compute buffer (sized
                                                 //      at start for one at the full context); longer ones lend (default 64)
+        int32_t      moe_stream_timing;         // 1 = measure where a call's time goes (host compute, device kernels, copies, syncs) and
+                                                //      report it per word; costs a few clock reads and two CUDA events per graph
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -2084,6 +2086,11 @@ extern "C" {
             // Picks' waits on a copy-back from the VRAM pool in flight (not in t_stall_us), and the old booking of
             // the stall (SSD + copy-back together)
             int64_t t_cb_wait_us, t_wait_all_us;
+            // Copy-backs from the VRAM expert pool started, and picks that found one still in flight
+            int64_t n_copyback, n_cb_late;
+            // With --moe-stream-timing 1: calls of this kind (prompt or decode), their wall time and where it went - host backend compute (it
+            // includes the engine's wait for reads), device kernels (CUDA events), cross-backend copies, backend syncs (microseconds)
+            int64_t n_tm_calls, t_tm_wall_us, t_tm_host_us, t_tm_dev_us, t_tm_copy_us, t_tm_sync_us;
         } pre, dec;
         int64_t n_wave_ubatches; // ubatches that did not fit into one wave per layer
         int64_t n_wave_experts;  // distinct experts those ubatches needed, summed over the layers
@@ -2141,6 +2148,43 @@ extern "C" {
 
     // fill out with the MoE expert streaming statistics; returns false when streaming is off
     LLAMA_API bool llama_moe_stream_get_stats(const struct llama_context * ctx, struct llama_moe_stream_stats * out);
+
+    // The counters of one streamed layer, for prompt and for decode calls (llama_moe_stream_get_layer_stats)
+    struct llama_moe_stream_layer_stats {
+        int32_t il;            // the model's layer index
+        int32_t ram_slots;     // RAM slots in use now
+        int32_t vram_experts;  // experts the VRAM expert pool holds for this layer now
+        struct {
+            int64_t n_hit, n_miss, n_vram_hit;   // RAM hits, loads, uses the VRAM pool served
+            int64_t t_stall_us, bytes_read;      // the time the layer waited for reads, bytes read for it
+        } pre, dec;
+    };
+
+    // fill out[0 .. n) with the streamed layers in layer order (n <= n_max); returns the number of streamed layers (more than n_max
+    // means the rest did not fit), 0 when streaming is off. Safe to call while a request runs: it only reads
+    LLAMA_API int32_t llama_moe_stream_get_layer_stats(const struct llama_context * ctx, struct llama_moe_stream_layer_stats * out, int32_t n_max);
+
+    // Where the experts live now
+    #define LLAMA_MOE_STREAM_MAX_GPU_LAYERS 256
+    struct llama_moe_stream_layout {
+        int32_t n_layer;                // layers of the model
+        int32_t n_streamed;             // MoE layers streamed from the SSD
+        int32_t n_expert;               // experts per layer
+        int32_t n_expert_used;          // experts picked per word and layer
+        int32_t ram_slots;              // the RAM slots every streamed layer started with
+        int32_t vram_experts;           // the VRAM expert pool's setting (experts per layer), 0 = no pool
+        int32_t vram_follow;            // 1 = the pool's set moves while a reply is written
+        int32_t n_gpu_layers;           // MoE layers kept whole on the GPU
+        int32_t gpu_layers[LLAMA_MOE_STREAM_MAX_GPU_LAYERS];   // which ones (the first min(n_gpu_layers, MAX) of them)
+        int64_t ram_pool_bytes;         // the RAM pools at the start
+        int64_t vram_pool_bytes;        // the VRAM expert pool
+        int64_t block_bytes;            // bytes of one expert (the first streamed layer's; layers may differ)
+        int64_t kv_bytes;               // the KV cache (and the recurrent state) of the context
+        int32_t timing;                 // --moe-stream-timing
+    };
+
+    // fill out; returns false when streaming is off
+    LLAMA_API bool llama_moe_stream_get_layout(const struct llama_context * ctx, struct llama_moe_stream_layout * out);
 
     // For the --cache-disk header: the K / V rotation matrix sizes of the context's attention cache
     // (0 = no rotation) and the sizes the rule gives with the rotation switches left on; false (all 0) when the context's

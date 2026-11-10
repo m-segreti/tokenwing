@@ -5148,12 +5148,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 // wait for the device any earlier than it already does; the few still in flight when the run is
 // synchronised are collected there.
 static bool ggml_cuda_prof_on(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char * e = getenv("GGML_PROFILE");
-        on = e && atoi(e) ? 1 : 0;
-    }
-    return on == 1;
+    return ggml_prof_enabled();   // ggml-base decides: GGML_PROFILE, or ggml_prof_enable()
 }
 
 #define GGML_CUDA_PROF_RING 16

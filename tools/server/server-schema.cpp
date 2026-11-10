@@ -33,6 +33,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
 
+    add((new field_bool("cache_disk_save", params.cache_disk_save))
+        ->set_desc("With --cache-disk: when false, the request does not write, replace or delete the chat's saved state or snapshots on the disk (e.g. a request that only evaluates a prompt ahead of time)"));
+
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));
 

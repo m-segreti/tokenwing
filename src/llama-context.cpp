@@ -1117,7 +1117,11 @@ void llama_context::synchronize() {
     const int64_t t_ho = g_llama_handoff ? ggml_time_us() : 0;
     auto * ms_tt = model.moe_stream() && model.moe_stream()->vf_test_tick_timers ? model.moe_stream() : nullptr;   // TEST ONLY
     const int64_t t_tt = ms_tt ? ggml_time_us() : 0;
+    const int64_t t_prof = ggml_prof_enabled() ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
+    if (t_prof) {   // --moe-stream-timing: the host's block on the device's last work
+        ggml_prof_add(GGML_PROF_SYNC, ggml_time_us() - t_prof);
+    }
     if (ms_tt) {
         ms_tt->vf_tt_sync_us += ggml_time_us() - t_tt;   // MOE_STREAM_TEST_VF_TICK_TIMERS: the caller's GPU wait
     }
@@ -2716,6 +2720,32 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                      0, 0, this };
     prof_timer.n_tok = (int64_t) batch_inp.tokens.size();
 
+    // --moe-stream-timing 1: this call's wall time and what the profiler's timers booked during it (host backend compute, device
+    // kernels, cross-backend copies, backend syncs), added to the engine's totals of the call's kind (prompt or decode) when the call ends on any
+    // path. Nothing runs unless the setting is on.
+    struct timing_call {
+        llama_moe_stream * ms = nullptr;
+        int     kind = -1;    // 0 prompt, 1 decode: set where the call is classified; a call that never gets there is not booked
+        int64_t t0 = 0;
+        int64_t p0[GGML_PROF_N_SLOTS] = {};
+        ~timing_call() {
+            if (ms && kind >= 0) {
+                ms->timing_add(kind, ggml_time_us() - t0,
+                        ggml_prof_get(GGML_PROF_CPU_COMPUTE) - p0[GGML_PROF_CPU_COMPUTE],
+                        ggml_prof_get(GGML_PROF_GPU_COMPUTE) - p0[GGML_PROF_GPU_COMPUTE],
+                        ggml_prof_get(GGML_PROF_COPY)        - p0[GGML_PROF_COPY],
+                        ggml_prof_get(GGML_PROF_SYNC)        - p0[GGML_PROF_SYNC]);
+            }
+        }
+    } tm_call;
+    if (auto * mstream_tm = model.moe_stream(); mstream_tm && mstream_tm->p1.timing) {
+        tm_call.ms = mstream_tm;
+        tm_call.t0 = ggml_time_us();
+        for (int i = 0; i < GGML_PROF_N_SLOTS; i++) {
+            tm_call.p0[i] = ggml_prof_get(i);
+        }
+    }
+
     // A one-token call is a word, any other call is prompt work; the end is booked on every return path
     struct handoff_call {
         int64_t t0 = 0;
@@ -2988,6 +3018,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         const bool cont = b.pos[0] > 0;
         const bool dec  = cont && (n_tokens_all == 1 ||
                         (n_tokens_all <= 8 && b.pos[0] >= mstream->decode_next_pos && n_outputs_all == n_tokens_all));
+        tm_call.kind = dec ? 1 : 0;   // (the call's timing goes where the engine's counters of prompt and decode go)
 
         mstream->vf_word_ctx = cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;   // VRAM follow's reply words
         if (mstream->vp) {   // the id-table rows of this call start go on this context's GPU stream
@@ -5953,6 +5984,16 @@ void llama_context::perf_reset() {
     // note: the reallocation counters are not reset - they track the lifetime totals for this context
 }
 
+int64_t llama_context::memory_bytes() const {
+    int64_t n = 0;
+    if (memory) {
+        for (const auto & kv : memory->memory_breakdown()) {
+            n += (int64_t) kv.second;
+        }
+    }
+    return n;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -6951,6 +6992,81 @@ bool llama_get_kv_rot(const llama_context * ctx, uint32_t * n_rot_k, uint32_t * 
     return true;
 }
 
+// The experts of a layer the VRAM expert pool holds now (counted from the live table; while a swap is made it can be one off)
+static int32_t llama_moe_stream_vram_held(const llama_moe_stream_layer & sl) {
+    int32_t n = 0;
+    for (const int32_t s : sl.vx_slot) {
+        n += s >= 0 ? 1 : 0;
+    }
+    return n;
+}
+
+int32_t llama_moe_stream_get_layer_stats(const llama_context * ctx, llama_moe_stream_layer_stats * out, int32_t n_max) {
+    const auto * mstream = ctx ? ctx->get_model().moe_stream() : nullptr;
+
+    if (!mstream) {
+        return 0;
+    }
+
+    int32_t n = 0;
+    for (const auto & slp : mstream->layers) {
+        if (!slp) {
+            continue;
+        }
+        if (out && n < n_max) {
+            llama_moe_stream_layer_stats & o = out[n];
+            o = {};
+            o.il           = slp->il;
+            o.ram_slots    = (int32_t) slp->share;
+            o.vram_experts = llama_moe_stream_vram_held(*slp);
+            for (int kind = 0; kind < 2; kind++) {
+                const auto & c = kind == 0 ? slp->pre : slp->dec;
+                auto &       d = kind == 0 ? o.pre    : o.dec;
+                d.n_hit      = c.n_hit;
+                d.n_miss     = c.n_miss;
+                d.n_vram_hit = c.n_vram_hit;
+                d.t_stall_us = c.t_stall_us;
+                d.bytes_read = c.bytes_read;
+            }
+        }
+        n++;
+    }
+    return n;
+}
+
+bool llama_moe_stream_get_layout(const llama_context * ctx, llama_moe_stream_layout * out) {
+    const auto * mstream = ctx ? ctx->get_model().moe_stream() : nullptr;
+
+    if (!mstream || !out) {
+        return false;
+    }
+
+    *out = {};
+    out->n_layer       = (int32_t) mstream->layers.size();
+    out->n_expert      = (int32_t) mstream->n_expert_total;
+    out->n_expert_used = (int32_t) mstream->n_expert_used;
+    out->ram_slots     = (int32_t) mstream->n_slots;
+    out->vram_experts  = mstream->vx_ready ? (int32_t) mstream->p1.vram_experts : 0;
+    out->vram_follow   = mstream->vf_word_end_fn != nullptr ? 1 : 0;
+    out->n_gpu_layers  = (int32_t) mstream->gpu_layers.size();
+    for (size_t i = 0; i < mstream->gpu_layers.size() && i < LLAMA_MOE_STREAM_MAX_GPU_LAYERS; i++) {
+        out->gpu_layers[i] = mstream->gpu_layers[i];
+    }
+    out->ram_pool_bytes  = mstream->plan().pool_bytes;
+    out->vram_pool_bytes = mstream->vx_ready ? mstream->vx_bytes : 0;
+    out->kv_bytes        = ctx->memory_bytes();
+    out->timing          = mstream->p1.timing ? 1 : 0;
+    for (const auto & slp : mstream->layers) {
+        if (slp) {
+            out->n_streamed++;
+            if (out->block_bytes == 0) {
+                out->block_bytes = (int64_t) slp->block_bytes;
+            }
+        }
+    }
+    return true;
+}
+
 bool llama_moe_stream_get_stats(const llama_context * ctx, llama_moe_stream_stats * out) {
     const auto * mstream = ctx ? ctx->get_model().moe_stream() : nullptr;
 
@@ -7006,6 +7122,8 @@ bool llama_moe_stream_get_stats(const llama_context * ctx, llama_moe_stream_stat
             d->t_stall_us   += c.t_stall_us;
             d->t_cb_wait_us  += c.t_cb_wait_us;
             d->t_wait_all_us += c.t_wait_all_us;
+            d->n_copyback   += c.n_copyback;
+            d->n_cb_late    += c.n_cb_late;
             d->t_op_us      += c.t_op_us;
             d->bytes_read   += c.bytes_read;
             d->t_read_us    += c.t_read_us;
@@ -7163,6 +7281,18 @@ bool llama_moe_stream_get_stats(const llama_context * ctx, llama_moe_stream_stat
     // real tokens of that phase - the divisor of every per-token figure the tool prints
     res.pre.n_tokens = mstream->n_tok_outer_pre;
     res.dec.n_tokens = mstream->n_tok_outer;
+    if (mstream->p1.timing) {   // --moe-stream-timing: the totals of the prompt calls and of the decode calls (engine-wide)
+        for (int kind = 0; kind < 2; kind++) {
+            auto * d = kind == 0 ? &res.pre : &res.dec;
+            const std::atomic<int64_t> * t = mstream->tm_us[kind];
+            d->n_tm_calls   = t[0].load(std::memory_order_relaxed);
+            d->t_tm_wall_us = t[1].load(std::memory_order_relaxed);
+            d->t_tm_host_us = t[2].load(std::memory_order_relaxed);
+            d->t_tm_dev_us  = t[3].load(std::memory_order_relaxed);
+            d->t_tm_copy_us = t[4].load(std::memory_order_relaxed);
+            d->t_tm_sync_us = t[5].load(std::memory_order_relaxed);
+        }
+    }
     res.dec.n_ne_drain_calls = mstream->n_ne_drain_calls;   // engine-wide
     res.n_rd_split     = mstream->n_rd_split;       // engine-wide (decode calls only)
     res.n_rd_ready     = mstream->n_rd_ready;

@@ -95,3 +95,5 @@ Engine code does not call the system directly for these. Each goes through one s
 | The process's own memory use | `/proc/self/statm` | `K32GetProcessMemoryInfo` (working set) |
 | Threads on given cores | `pthread_setaffinity_np`, set with `-C`, `--cpu-range`, `--cpu-strict` | `SetThreadAffinityMask`, same options |
 | Small files written whole (usage table, measured non-expert memory) | Temp file, `fsync`, `rename` | `_commit`, `MoveFileExW` |
+| An expert read from the model file itself (`--moe-stream model`): one request per projection, each at its own file offset | The same `O_DIRECT` read as above, issued once per projection | The same unbuffered read as above, once per projection |
+| A byte range of a file (the data appended to a model file) | `fseeko` and `fread` | `_fseeki64` and `fread` |

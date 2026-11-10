@@ -2072,7 +2072,9 @@ void cd_put_header(cd_writer & w, const cd_header & h) {
     w.put(h.cfg.state_ver);
     w.put(h.chat_hash); w.put(h.chat_check); w.put(h.lora_hash); w.put(h.t_write); w.put(h.n_tokens); w.put(h.total);
     w.put(h.cfg.kv_unified); w.put(h.cfg.swa_full); w.put(h.cfg.n_ubatch);   // format 5
-    w.put(h.cfg.rot_k); w.put(h.cfg.rot_v); w.put(h.cfg.rot_k_dft); w.put(h.cfg.rot_v_dft);   // format 6
+    if (h.version >= 6) {
+        w.put(h.cfg.rot_k); w.put(h.cfg.rot_v); w.put(h.cfg.rot_k_dft); w.put(h.cfg.rot_v_dft);   // format 6
+    }
 }
 
 // false = not a file of this tier (bad magic or a truncated header); the version is checked by the caller
@@ -2577,6 +2579,34 @@ uint64_t server_cache_disk::total_bytes(const std::string & except) const {
     return s;
 }
 
+size_t server_cache_disk_pins::set(const std::vector<std::string> & chat_ids) {
+    std::unordered_set<uint64_t> h;
+    for (const auto & id : chat_ids) {
+        h.insert(server_cache_disk::fnv1a(id.data(), id.size()));
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    hashes = std::move(h);
+    return hashes.size();
+}
+
+bool server_cache_disk_pins::has(uint64_t chat_hash) const {
+    std::lock_guard<std::mutex> lock(mtx);
+    return hashes.count(chat_hash) > 0;
+}
+
+bool server_cache_disk::is_pinned(const entry & e) const {
+    return pins && e.chat_hash != 0 && pins->has(e.chat_hash);   // an entry with no chat id has hash 0
+}
+
+// The order the size limit deletes in: the entries of chats that are not pinned first (a chat's state, its snapshots, and the
+// entries with no chat id), the pinned chats' entries only when none of those is left; the one written longest ago first
+// within each group
+bool server_cache_disk::evicts_before(const entry & a, const entry & b) const {
+    const bool pa = is_pinned(a);
+    const bool pb = is_pinned(b);
+    return pa != pb ? pb : a.t_write < b.t_write;
+}
+
 bool server_cache_disk::remove_entry(size_t i, const char * reason) {
     std::error_code ec;
     const auto path = std::filesystem::path(dir) / index[i].name;
@@ -2795,8 +2825,9 @@ bool server_cache_disk::save(const server_prompt & prompt, llama_context * ctx_t
         return false;
     }
 
-    // 2. room under the limit: the entries written longest ago go first, whatever their kind (not the file this save
-    //    replaces, not the prefix entries it contains - they go after the rename); an entry that cannot be deleted stays
+    // 2. room under the limit: the entries of chats that are not pinned go first, then the pinned ones - the one written
+    //    longest ago first in each group, whatever its kind (not the file this save replaces, not the prefix entries it
+    //    contains - they go after the rename); an entry that cannot be deleted stays
     const auto counted = [&]() {
         uint64_t s = 0;
         for (const auto & e : index) {
@@ -2817,7 +2848,7 @@ bool server_cache_disk::save(const server_prompt & prompt, llama_context * ctx_t
                 (is_chat && e.is_snap && e.chat_hash == h.chat_hash)) {   // This chat's own snapshots (listed, not stored)
                 continue;
             }
-            if (oldest == SIZE_MAX || e.t_write < index[oldest].t_write) {
+            if (oldest == SIZE_MAX || evicts_before(e, index[oldest])) {
                 oldest = i;
             }
         }
@@ -2827,7 +2858,8 @@ bool server_cache_disk::save(const server_prompt & prompt, llama_context * ctx_t
         const std::string oname = index[oldest].name;
         const bool     ochat = index[oldest].is_chat;
         const uint64_t ohash = index[oldest].chat_hash;
-        if (!remove_entry(oldest, "size limit, written longest ago")) {
+        if (!remove_entry(oldest, is_pinned(index[oldest]) ? "size limit, a pinned chat's entry written longest ago (no other is left)" :
+                                                              "size limit, written longest ago")) {
             undeletable.push_back(oname);
         } else if (ochat && oname != name) {
             remove_snaps_of(ohash, -1, "its chat left by the size limit");   // a chat's snapshots go with it
@@ -3147,16 +3179,16 @@ server_cache_disk::restore_result server_cache_disk::restore(const pick & pk, se
     return RESTORE_DONE;
 }
 
-int64_t server_cache_disk::erase_chat(const std::string & conv_id) {
+int64_t server_cache_disk::erase_chat(const std::string & conv_id, const char * why) {
     namespace fs = std::filesystem;
     const std::string cname = chat_name(conv_id);
     // The chat's snapshot files first (counted in the bytes deleted)
     uint64_t snap_bytes = 0;
-    remove_snaps_of(fnv1a(conv_id.data(), conv_id.size()), -1, "erased by POST /cache-disk/erase", &snap_bytes);
+    remove_snaps_of(fnv1a(conv_id.data(), conv_id.size()), -1, why, &snap_bytes);
     for (size_t i = 0; i < index.size(); i++) {
         if (index[i].name == cname) {
             const int64_t size = (int64_t) index[i].file_size;
-            return remove_entry(i, "erased by POST /cache-disk/erase") ? size + (int64_t) snap_bytes : -1;
+            return remove_entry(i, why) ? size + (int64_t) snap_bytes : -1;
         }
     }
     if (snap_bytes > 0) {
@@ -3180,7 +3212,7 @@ int64_t server_cache_disk::erase_chat(const std::string & conv_id) {
             SRV_WRN("cache-disk: could not delete %s: %s\n", cname.c_str(), ec.message().c_str());
             return -1;
         }
-        SRV_INF("cache-disk: deleted %s (%.1f MB, erased by POST /cache-disk/erase; not in this server's index)\n", cname.c_str(), size/1e6);
+        SRV_INF("cache-disk: deleted %s (%.1f MB, %s; not in this server's index)\n", cname.c_str(), size/1e6, why);
         return (int64_t) size;
     }
     return 0;
@@ -3232,6 +3264,230 @@ std::pair<size_t, uint64_t> server_cache_disk::clear() {
     }), index.end());
     SRV_INF("cache-disk: cleared: %zu files, %.1f MB deleted; %zu entries left in the index\n", n_files, n_bytes/1e6, index.size());
     return { n_files, n_bytes };
+}
+
+// Writes `tmp` as a copy of the entry file `src` for another chat: the header with the new chat id and write time, then the rest
+// of the file as it is (the checksum covers only what follows the header, and nothing there holds a chat id). 0 = written (and
+// flushed to the disk), else an errno; the temp file is removed on a failure
+static int cd_copy_for_chat(const std::string & src, const std::string & tmp, uint64_t chat_hash, uint64_t chat_check,
+                            int64_t t_write, uint64_t size) {
+    FILE * in = fopen(src.c_str(), "rb");
+    if (!in) {
+        return errno ? errno : EIO;
+    }
+    int err = 0;
+    bool created = false;
+    cd_reader r { in, size };
+    cd_header h;
+    if (!cd_get_header(r, h) || !cd_version_ok(h.version) || h.total != size) {
+        err = EINVAL;   // not a file of this tier, or not the size the index knows
+    } else {
+        FILE * out = cd_create(tmp);
+        if (!out) {
+            err = errno ? errno : EIO;
+        } else {
+            created = true;
+            h.chat_hash  = chat_hash;
+            h.chat_check = chat_check;
+            h.t_write    = t_write;
+            cd_writer w { out, true };
+            cd_put_header(w, h);
+            if (!w.ok) {
+                err = errno ? errno : EIO;
+            } else if (w.n != r.pos) {
+                err = EINVAL;   // the header would change its size
+            }
+            std::vector<char> buf(4u << 20);
+            while (!err && r.left() > 0) {
+                const size_t want = (size_t) std::min<uint64_t>(buf.size(), r.left());
+                const size_t got  = fread(buf.data(), 1, want, in);
+                if (got == 0) {
+                    err = EIO;   // the file is shorter than its size
+                } else if (fwrite(buf.data(), 1, got, out) != got) {
+                    err = errno ? errno : EIO;
+                }
+                r.pos += got;
+            }
+            if (!err && fflush(out) != 0) {
+                err = errno ? errno : EIO;
+            }
+#ifndef _WIN32
+            if (!err && fsync(fileno(out)) != 0) {
+                err = errno ? errno : EIO;
+            }
+#endif
+            if (fclose(out) != 0 && !err) {
+                err = errno ? errno : EIO;
+            }
+        }
+    }
+    fclose(in);
+    if (err && created) {
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+    }
+    return err;
+}
+
+server_cache_disk::fork_result server_cache_disk::fork_chat(const std::string & from, const std::string & to) {
+    namespace fs = std::filesystem;
+    fork_result res;
+    const uint64_t hash_from  = fnv1a(from.data(), from.size());
+    const uint64_t check_from = chat_check_of(from);
+    const uint64_t hash_to    = fnv1a(to.data(), to.size());
+    const uint64_t check_to   = chat_check_of(to);
+    const std::string to_state = chat_name(to);
+    const std::string lf = cd_hex(hash_from), lt = cd_hex(hash_to);   // the log names chats by their hash, never by their id
+
+    // what there is to copy: the chat's state first, then its snapshots, the newest first, at most --cache-disk-checkpoints
+    std::vector<entry> src;
+    for (const auto & e : index) {
+        if (e.usable && (e.is_chat || e.is_snap) && e.chat_hash == hash_from && e.chat_check == check_from) {
+            src.push_back(e);
+        }
+    }
+    if (src.empty()) {
+        return res;
+    }
+    res.found = true;
+    if (hash_from == hash_to) {
+        SRV_WRN("cache-disk: fork %s -> %s: both ids have the same hash; nothing copied\n", lf.c_str(), lt.c_str());
+        res.failed = true;
+        return res;
+    }
+    std::sort(src.begin(), src.end(), [](const entry & a, const entry & b) {
+        return a.is_chat != b.is_chat ? a.is_chat : a.snap_n_tokens > b.snap_n_tokens;
+    });
+    std::vector<entry> todo;
+    size_t n_snaps = 0;
+    for (auto & e : src) {
+        if (e.is_snap && ++n_snaps > (size_t) std::max(max_snaps, 0)) {
+            res.skipped++;
+            continue;
+        }
+        todo.push_back(std::move(e));
+    }
+
+    const auto is_to   = [&](const entry & e) { return e.chat_hash == hash_to || e.name == to_state; };   // replaced
+    const auto is_from = [&](const entry & e) { return e.chat_hash == hash_from; };                       // never deleted here
+    const auto counted = [&]() {   // the entries that stay when `to`'s own are replaced
+        uint64_t s = 0;
+        for (const auto & e : index) {
+            if (!is_to(e)) {
+                s += e.file_size;
+            }
+        }
+        return s;
+    };
+
+    // 1. each copy is written to a temp file, then room is made under the size limit as a save does it (the oldest entry of a
+    //    chat that is not pinned first, then of a pinned chat; never `from`'s, never `to`'s); `to` is not touched yet
+    struct staged {
+        entry       e;
+        std::string tmp;
+        std::string path;
+    };
+    std::vector<staged> st;
+    uint64_t staged_bytes = 0;
+    std::vector<std::string> undeletable;
+    std::error_code ec;
+    for (auto & s : todo) {
+        if (staged_bytes + s.file_size > limit_bytes) {
+            SRV_WRN("cache-disk: fork %s -> %s: %s (%.1f MB) not copied: it does not fit under the %.3f GB limit\n", lf.c_str(), lt.c_str(),
+                    s.name.c_str(), s.file_size/1e6, limit_bytes/1e9);
+            res.skipped++;
+            continue;
+        }
+        const std::string name = s.is_chat ? to_state : snap_name(to, s.snap_n_tokens);
+        const std::string path = (fs::path(dir) / name).string();
+        const std::string tmp  = path + cd_tmp_suffix();
+        const int64_t t_write  = cd_now_us();
+        const int err = cd_copy_for_chat((fs::path(dir) / s.name).string(), tmp, hash_to, check_to, t_write, s.file_size);
+        if (err) {
+            SRV_WRN("cache-disk: fork %s -> %s: %s not copied (%s)\n", lf.c_str(), lt.c_str(), s.name.c_str(), strerror(err));
+            res.skipped++;
+            continue;
+        }
+        while (counted() + staged_bytes + s.file_size > limit_bytes) {
+            size_t oldest = SIZE_MAX;
+            for (size_t i = 0; i < index.size(); i++) {
+                const auto & e = index[i];
+                if (is_to(e) || is_from(e) || std::find(undeletable.begin(), undeletable.end(), e.name) != undeletable.end()) {
+                    continue;
+                }
+                if (oldest == SIZE_MAX || evicts_before(e, index[oldest])) {
+                    oldest = i;
+                }
+            }
+            if (oldest == SIZE_MAX) {
+                break;
+            }
+            const std::string oname = index[oldest].name;
+            const bool     ochat = index[oldest].is_chat;
+            const uint64_t ohash = index[oldest].chat_hash;
+            if (!remove_entry(oldest, is_pinned(index[oldest]) ? "size limit, a pinned chat's entry written longest ago (no other is left)" :
+                                                                  "size limit, written longest ago")) {
+                undeletable.push_back(oname);
+            } else if (ochat) {
+                remove_snaps_of(ohash, -1, "its chat left by the size limit");
+            }
+        }
+        if (counted() + staged_bytes + s.file_size > limit_bytes) {
+            fs::remove(tmp, ec);
+            SRV_WRN("cache-disk: fork %s -> %s: %s (%.1f MB) not copied: no room under the %.3f GB limit (the rest cannot be deleted)\n",
+                    lf.c_str(), lt.c_str(), s.name.c_str(), s.file_size/1e6, limit_bytes/1e9);
+            res.skipped++;
+            continue;
+        }
+        staged_bytes += s.file_size;
+        s.name = name;
+        s.chat_hash  = hash_to;
+        s.chat_check = check_to;
+        s.t_write    = t_write;
+        st.push_back({ std::move(s), tmp, path });
+    }
+    if (st.empty()) {
+        res.failed = true;
+        return res;
+    }
+
+    // 2. `to`'s own files go (replaced, not merged), then the copies are renamed into place
+    const int64_t n_old = erase_chat(to, "replaced by POST /cache-disk/fork");
+    if (n_old < 0) {
+        for (const auto & s : st) {
+            fs::remove(s.tmp, ec);
+        }
+        res.failed = true;
+        res.replace_failed = true;
+        return res;
+    }
+    res.replaced_bytes = (uint64_t) n_old;
+    for (auto & s : st) {
+        fs::rename(s.tmp, s.path, ec);
+        if (ec) {
+            SRV_ERR("cache-disk: fork %s -> %s: the rename of %s failed (%s); not copied\n", lf.c_str(), lt.c_str(), s.e.name.c_str(), ec.message().c_str());
+            fs::remove(s.tmp, ec);
+            res.skipped++;
+            continue;
+        }
+        index.erase(std::remove_if(index.begin(), index.end(), [&](const entry & x) { return x.name == s.e.name; }), index.end());
+        res.bytes += s.e.file_size;
+        if (s.e.is_chat) {
+            res.state = true;
+        } else {
+            res.snapshots++;
+        }
+        index.push_back(std::move(s.e));
+    }
+    cd_fsync_dir(dir);
+    if (res.bytes == 0) {
+        res.failed = true;
+        return res;
+    }
+    SRV_INF("cache-disk: fork %s -> %s: %s%zu snapshots, %.1f MB copied, %zu not copied, %.1f MB of the target's files replaced; %zu entries, %.3f of %.3f GB\n",
+            lf.c_str(), lt.c_str(), res.state ? "state + " : "", res.snapshots, res.bytes/1e6, res.skipped, res.replaced_bytes/1e6,
+            index.size(), total_bytes("")/1e9, limit_bytes/1e9);
+    return res;
 }
 
 //
@@ -3388,7 +3644,7 @@ bool server_cache_disk::write_snapshot(const common_prompt_checkpoint & c, const
         SRV_ERR("cache-disk: the snapshot %s was not written (%s)\n", name.c_str(), strerror(!f ? err_open : err_write));
         return false;
     }
-    // room under the limit, as a state file: the entries written longest ago (not this chat's file, not this name)
+    // room under the limit, as a state file: the same order (not this chat's file, not this name)
     const std::string cname = chat_name(conv_id);
     std::vector<std::string> undeletable;
     while (total_bytes(name) + total > limit_bytes) {
@@ -3398,7 +3654,7 @@ bool server_cache_disk::write_snapshot(const common_prompt_checkpoint & c, const
             if (e.name == name || e.name == cname || std::find(undeletable.begin(), undeletable.end(), e.name) != undeletable.end()) {
                 continue;
             }
-            if (oldest == SIZE_MAX || e.t_write < index[oldest].t_write) {
+            if (oldest == SIZE_MAX || evicts_before(e, index[oldest])) {
                 oldest = i;
             }
         }
@@ -3408,7 +3664,8 @@ bool server_cache_disk::write_snapshot(const common_prompt_checkpoint & c, const
         const std::string oname = index[oldest].name;
         const bool     ochat = index[oldest].is_chat;
         const uint64_t ohash = index[oldest].chat_hash;
-        if (!remove_entry(oldest, "size limit, written longest ago")) {
+        if (!remove_entry(oldest, is_pinned(index[oldest]) ? "size limit, a pinned chat's entry written longest ago (no other is left)" :
+                                                              "size limit, written longest ago")) {
             undeletable.push_back(oname);
         } else if (ochat) {
             remove_snaps_of(ohash, -1, "its chat left by the size limit");

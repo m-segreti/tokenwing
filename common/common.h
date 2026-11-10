@@ -916,6 +916,7 @@ struct common_params {
     int32_t     moe_stream_copy_ahead        = 0; // GPU prompts copy the next layer's experts ahead (0 = off, 1)
     int32_t     moe_stream_vram_lend_prompt  = 0; // a prompt's big GPU tensors in lent VRAM pool places (0 = off, 1)
     int32_t     moe_stream_vram_lend_short   = 64; // prompt calls of at most N tokens in the real compute buffer
+    int32_t     moe_stream_timing            = 0; // 1 = measure where a call's time goes (host, device, copies, syncs), report it per word
     int32_t     moe_stream_vram_follow_tick = 8;
     int32_t     moe_stream_vram_follow_swaps = 64;
     int32_t     moe_stream_vram_follow_recent = 256;

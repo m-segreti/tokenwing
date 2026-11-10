@@ -376,6 +376,188 @@ static server_cache_disk::config server_cache_disk_config(const common_params & 
     return c;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The streaming engine's figures as JSON: a request's timings (timings.moe_stream) and GET /moe-stream/stats
+
+using moe_layers_t = std::vector<llama_moe_stream_layer_stats>;
+
+// the counters of every streamed layer, in layer order
+static moe_layers_t moe_stream_layers_now(const llama_context * ctx) {
+    const int32_t n = llama_moe_stream_get_layer_stats(ctx, nullptr, 0);
+    moe_layers_t v((size_t) std::max<int32_t>(n, 0));
+    if (n > 0) {
+        llama_moe_stream_get_layer_stats(ctx, v.data(), n);
+    }
+    return v;
+}
+
+static double moe_pct(int64_t a, int64_t b) {
+    return b > 0 ? 100.0*(double) a/(double) b : 0.0;
+}
+
+// The figures of one stretch of work: the engine's counters `ms` minus `b`, the ones at its start (all zero = since the model
+// was loaded), per layer `ln` minus `lb`. `timing` = --moe-stream-timing.
+static json moe_stream_figures_json(const llama_moe_stream_stats & ms, const llama_moe_stream_stats & b,
+        const moe_layers_t & ln, const moe_layers_t & lb, bool timing) {
+    // the figures of the prompt or of the reply
+    const auto part = [](const auto & now, const auto & base, bool reply) {
+        const int64_t n_tok  = now.n_tokens   - base.n_tokens;
+        const int64_t n_hit  = now.n_hit      - base.n_hit;
+        const int64_t n_miss = now.n_miss     - base.n_miss;
+        const int64_t n_vram = now.n_vram_hit - base.n_vram_hit;
+        const int64_t n_use  = n_hit + n_miss + n_vram;
+        const double  mib    = (double) (now.bytes_read  - base.bytes_read)/1024.0/1024.0;
+        const double  stall  = (double) (now.t_stall_us  - base.t_stall_us)/1000.0;
+        // The guesses: reads started for experts a layer was expected to need. In time = landed before the layer asked, late = the
+        // layer asked while the read was in flight (it waited), wasted = left RAM unused, cancelled = stopped before they ran. A
+        // missed expert is one the layer needed that no guess had brought: it is read on demand
+        const int64_t n_cov    = now.n_hit_pref  - base.n_hit_pref;
+        const int64_t n_late   = now.n_pref_late - base.n_pref_late;
+        const int64_t n_cancel = (now.n_pref_cancel - base.n_pref_cancel) + (now.n_pl_stale_cancel - base.n_pl_stale_cancel);
+        json guesses = {
+            { "issued",        now.n_pref - base.n_pref },
+            { "in_time",       n_cov - n_late },
+            { "late",          n_late },
+            { "late_wait_ms",  reply ? json((double) (now.t_cause_us[0] - base.t_cause_us[0])/1000.0) : json() },
+            { "missed",        n_miss },
+            { "wasted",        now.n_pref_waste - base.n_pref_waste },
+            { "cancelled",     n_cancel },
+        };
+        if (reply) {   // the engine tells why a reply word's expert was read on demand
+            guesses["missed_by_cause"] = {
+                { "no_guess",       now.n_cause[1] - base.n_cause[1] },
+                { "not_named",      now.n_cause[3] - base.n_cause[3] },
+                { "named_not_read", now.n_cause[2] - base.n_cause[2] },
+            };
+        }
+        return json {
+            { "tokens",             n_tok },
+            { "hit_rate_percent",   n_hit + n_miss > 0 ? 100.0*(double) n_hit/(double) (n_hit + n_miss) : 0.0 },
+            { "misses",             n_miss },
+            { "mib_read",           mib },
+            { "stall_ms",           stall },
+            { "misses_per_token",   n_tok > 0 ? (double) n_miss/(double) n_tok : 0.0 },
+            { "mib_per_token",      n_tok > 0 ? mib/(double) n_tok : 0.0 },
+            { "stall_ms_per_token", n_tok > 0 ? stall/(double) n_tok : 0.0 },
+            { "expert_uses",        n_use },
+            { "ram_hit_percent",    moe_pct(n_hit,  n_use) },
+            { "vram_hit_percent",   moe_pct(n_vram, n_use) },
+            { "miss_percent",       moe_pct(n_miss, n_use) },
+            { "guesses",            guesses },
+        };
+    };
+
+    const int64_t n_hit  = ms.n_hit  - b.n_hit;
+    const int64_t n_miss = ms.n_miss - b.n_miss;
+    const int64_t n_vram = ms.n_vram_hit - b.n_vram_hit;
+    const int64_t n_use  = n_hit + n_miss + n_vram;
+    const int64_t n_cov    = ms.n_hit_pref  - b.n_hit_pref;
+    const int64_t n_late   = ms.n_pref_late - b.n_pref_late;
+    const int64_t n_cancel = (ms.pre.n_pref_cancel - b.pre.n_pref_cancel) + (ms.dec.n_pref_cancel - b.dec.n_pref_cancel) +
+                             (ms.pre.n_pl_stale_cancel - b.pre.n_pl_stale_cancel) + (ms.dec.n_pl_stale_cancel - b.dec.n_pl_stale_cancel);
+
+    json out = {
+        { "layers",           ms.n_layers },
+        { "slots",            ms.n_slots },
+        { "hit_rate_percent", n_hit + n_miss > 0 ? 100.0*(double) n_hit/(double) (n_hit + n_miss) : 0.0 },
+        { "prompt",           part(ms.pre, b.pre, false) },
+        { "reply",            part(ms.dec, b.dec, true) },
+        { "prompt_tokens",    ms.pre.n_tokens - b.pre.n_tokens },
+        { "words",            ms.dec.n_tokens - b.dec.n_tokens },
+        { "expert_uses",      n_use },
+        { "ram_hit_percent",  moe_pct(n_hit,  n_use) },
+        { "vram_hit_percent", moe_pct(n_vram, n_use) },
+        { "miss_percent",     moe_pct(n_miss, n_use) },
+        { "misses",           n_miss },
+        { "mib_read",         (double) (ms.bytes_read - b.bytes_read)/1024.0/1024.0 },
+        { "ssd_wait_ms",      (double) (ms.t_stall_us - b.t_stall_us)/1000.0 },
+        // prompt and reply together; prompt and reply each have their own (prompt.guesses, reply.guesses)
+        { "guesses", {
+            { "issued",       ms.n_pref - b.n_pref },
+            { "in_time",      n_cov - n_late },
+            { "late",         n_late },
+            { "late_wait_ms", (double) (ms.dec.t_cause_us[0] - b.dec.t_cause_us[0])/1000.0 },   // reply words only
+            { "missed",       n_miss },
+            { "wasted",       ms.n_pref_waste - b.n_pref_waste },
+            { "cancelled",    n_cancel },
+        } },
+        { "vram", {
+            { "follow_swaps",     ms.n_vf_swaps  - b.n_vf_swaps },
+            { "follow_copies",    ms.n_vf_copies - b.n_vf_copies },
+            { "copybacks",        (ms.pre.n_copyback - b.pre.n_copyback) + (ms.dec.n_copyback - b.dec.n_copyback) },
+            { "copyback_late",    (ms.pre.n_cb_late  - b.pre.n_cb_late)  + (ms.dec.n_cb_late  - b.dec.n_cb_late) },
+            { "copyback_wait_ms", (double) ((ms.pre.t_cb_wait_us - b.pre.t_cb_wait_us) + (ms.dec.t_cb_wait_us - b.dec.t_cb_wait_us))/1000.0 },
+        } },
+    };
+
+    // per streamed layer
+    json per_layer = json::array();
+    for (size_t i = 0; i < ln.size(); i++) {
+        const llama_moe_stream_layer_stats & n = ln[i];
+        const llama_moe_stream_layer_stats * p = i < lb.size() && lb[i].il == n.il ? &lb[i] : nullptr;
+        const auto d = [&](auto get) -> int64_t { return get(n) - (p ? get(*p) : 0); };
+        const int64_t h  = d([](const auto & s) -> int64_t { return s.pre.n_hit      + s.dec.n_hit; });
+        const int64_t m  = d([](const auto & s) -> int64_t { return s.pre.n_miss     + s.dec.n_miss; });
+        const int64_t v  = d([](const auto & s) -> int64_t { return s.pre.n_vram_hit + s.dec.n_vram_hit; });
+        const int64_t st = d([](const auto & s) -> int64_t { return s.pre.t_stall_us + s.dec.t_stall_us; });
+        per_layer.push_back({
+            { "layer",        n.il },
+            { "hits",         h },
+            { "misses",       m },
+            { "vram_hits",    v },
+            { "stall_ms",     (double) st/1000.0 },
+            { "ram_slots",    n.ram_slots },
+            { "vram_experts", n.vram_experts },
+            { "reply", {
+                { "hits",      d([](const auto & s) -> int64_t { return s.dec.n_hit; }) },
+                { "misses",    d([](const auto & s) -> int64_t { return s.dec.n_miss; }) },
+                { "vram_hits", d([](const auto & s) -> int64_t { return s.dec.n_vram_hit; }) },
+                { "stall_ms",  (double) d([](const auto & s) -> int64_t { return s.dec.t_stall_us; })/1000.0 },
+            } },
+        });
+    }
+    out["per_layer"] = per_layer;
+
+    // where the time of a reply word goes (--moe-stream-timing 1)
+    if (timing) {
+        const int64_t words = ms.dec.n_tokens - b.dec.n_tokens;
+        const int64_t calls = ms.dec.n_tm_calls - b.dec.n_tm_calls;
+        const double  wall  = (double) (ms.dec.t_tm_wall_us - b.dec.t_tm_wall_us)/1000.0;
+        const double  host  = (double) (ms.dec.t_tm_host_us - b.dec.t_tm_host_us)/1000.0;
+        const double  dev   = (double) (ms.dec.t_tm_dev_us  - b.dec.t_tm_dev_us)/1000.0;
+        const double  copy  = (double) (ms.dec.t_tm_copy_us - b.dec.t_tm_copy_us)/1000.0;
+        const double  sync  = (double) (ms.dec.t_tm_sync_us - b.dec.t_tm_sync_us)/1000.0;
+        const double  ssd   = (double) (ms.dec.t_stall_us   - b.dec.t_stall_us)/1000.0;
+        // The host backend's compute includes the time the engine waits for reads (its remap op runs there), so the CPU work is the
+        // rest of it. The device's kernels run beside the host's work: gpu_ms is device busy time, not time added to the word
+        const double  cpu   = std::max(0.0, host - ssd);
+        const double  rest  = wall - host - copy - sync;
+        const double  w     = words > 0 ? (double) words : 0.0;
+        const auto    pw    = [w](double ms_total) { return w > 0.0 ? ms_total/w : 0.0; };
+        out["time_per_word"] = {
+            { "words",       words },
+            { "calls",       calls },
+            { "ms_per_word", pw(wall) },
+            { "ssd_wait_ms", pw(ssd) },
+            { "cpu_ms",      pw(cpu) },
+            { "gpu_ms",      pw(dev) },
+            { "handoff_ms",  pw(copy + sync) },
+            { "rest_ms",     pw(rest) },
+            { "total_ms", {
+                { "all",     wall },
+                { "ssd_wait", ssd },
+                { "cpu",     cpu },
+                { "gpu",     dev },
+                { "handoff", copy + sync },
+                { "rest",    rest },
+            } },
+            { "handoff_copies_ms", pw(copy) },
+            { "handoff_syncs_ms",  pw(sync) },
+        };
+    }
+    return out;
+}
+
 struct server_slot {
     int id;
 
@@ -512,6 +694,8 @@ struct server_slot {
     // The streaming engine's counters when the request that is running now started, so the
     // per-request line is a difference and not everything since the model was loaded
     llama_moe_stream_stats moe_base{};
+    std::vector<llama_moe_stream_layer_stats> moe_base_layers;   // the same, per streamed layer
+    bool moe_timing = false;   // --moe-stream-timing: the time-per-word figures are in the request's timings
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
@@ -808,6 +992,16 @@ struct server_slot {
 
         SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
                 (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
+    }
+
+    // The streaming engine's counters for this request (the figures print_timings() logs, prompt and reply apart), for the
+    // timings of the final response; null when --moe-stream is off. Read once, when the request ends.
+    json moe_stream_json() const {
+        llama_moe_stream_stats ms;
+        if (!llama_moe_stream_get_stats(ctx_tgt, &ms)) {
+            return json();
+        }
+        return moe_stream_figures_json(ms, moe_base, moe_stream_layers_now(ctx_tgt), moe_base_layers, moe_timing);
     }
 
     void print_timings() const {
@@ -1388,6 +1582,85 @@ public:
         return cache_disk.get();
     }
 
+    // The chats pinned for the disk tier's size limit; thread-safe, and kept while the server sleeps
+    server_cache_disk_pins & cache_disk_pinned() {
+        return cd_pins;
+    }
+
+    // The streaming engine's figures for GET /moe-stream/stats, read from the HTTP thread while a request runs: the engine's counters
+    // are only read (never locked against the compute), the request each slot is running is remembered under moe_stats_mtx, and so
+    // is the context pointer, which destroy() takes away under the same lock before the context is freed.
+    // status: 0 = answered, 1 = the model does not stream, 2 = no model loaded now (the server sleeps)
+    json moe_stats_json(int & status) {
+        std::lock_guard<std::mutex> lock(moe_stats_mtx);
+        status = 2;
+        if (ctx_tgt == nullptr) {
+            return json();
+        }
+        llama_moe_stream_stats now;
+        llama_moe_stream_layout lay;
+        if (!llama_moe_stream_get_stats(ctx_tgt, &now) || !llama_moe_stream_get_layout(ctx_tgt, &lay)) {
+            status = 1;
+            return json();
+        }
+        status = 0;
+        const bool         timing = lay.timing != 0;
+        const moe_layers_t ln     = moe_stream_layers_now(ctx_tgt);
+
+        // the request that started last and has not ended, else the one that ended last
+        const moe_stats_req * cur = nullptr;
+        for (const auto & r : moe_reqs) {
+            if (r.active && (cur == nullptr || r.seq > cur->seq)) {
+                cur = &r;
+            }
+        }
+        json request;
+        if (cur != nullptr) {
+            request = moe_stream_figures_json(now, cur->base, ln, cur->base_layers, timing);
+            request["active"] = true;
+        } else if (!moe_last.is_null()) {
+            request = moe_last;
+        }
+
+        json ram_slots = json::array(), vram_experts = json::array(), layer_ids = json::array();
+        int64_t n_ram = 0, n_vram = 0;
+        for (const auto & l : ln) {
+            layer_ids.push_back(l.il);
+            ram_slots.push_back(l.ram_slots);
+            vram_experts.push_back(l.vram_experts);
+            n_ram  += l.ram_slots;
+            n_vram += l.vram_experts;
+        }
+        json gpu_layers = json::array();
+        for (int i = 0; i < lay.n_gpu_layers && i < LLAMA_MOE_STREAM_MAX_GPU_LAYERS; i++) {
+            gpu_layers.push_back(lay.gpu_layers[i]);
+        }
+        const double mib = 1.0/1048576.0;
+        return json {
+            { "moe_stream", true },
+            { "timing",     timing },
+            { "request",    request },
+            { "total",      moe_stream_figures_json(now, llama_moe_stream_stats{}, ln, moe_layers_t{}, timing) },
+            { "layout", {
+                { "layers",                 lay.n_layer },
+                { "streamed_layers",        lay.n_streamed },
+                { "streamed_layer_ids",     layer_ids },
+                { "whole_gpu_layers",       gpu_layers },
+                { "experts_per_layer",      lay.n_expert },
+                { "experts_per_word",       lay.n_expert_used },
+                { "expert_mib",             (double) lay.block_bytes*mib },
+                { "ram_slots_per_layer",    ram_slots },
+                { "ram_slots_total",        n_ram },
+                { "vram_experts_per_layer", vram_experts },
+                { "vram_experts_total",     n_vram },
+                { "vram_follow",            lay.vram_follow != 0 },
+                { "ram_pool_mib",           (double) lay.ram_pool_bytes*mib },
+                { "vram_pool_mib",          (double) lay.vram_pool_bytes*mib },
+                { "kv_cache_mib",           (double) lay.kv_bytes*mib },
+            } },
+        };
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1435,6 +1708,44 @@ private:
 
     // The chat states on disk (--cache-disk), null = off
     std::unique_ptr<server_cache_disk> cache_disk;
+    server_cache_disk_pins cd_pins;   // POST /cache-disk/pins
+
+    // GET /moe-stream/stats: what each slot's running request started from, and the figures of the last request that ended
+    struct moe_stats_req {
+        bool                   active = false;
+        int64_t                seq    = 0;
+        llama_moe_stream_stats base{};
+        moe_layers_t           base_layers;
+    };
+    std::mutex                 moe_stats_mtx;   // guards ctx_tgt's lifetime for the route, moe_reqs, moe_last
+    std::vector<moe_stats_req> moe_reqs;        // per slot
+    int64_t                    moe_req_seq = 0;
+    json                       moe_last;
+
+    // a request starts / ends on a slot (the main loop's thread)
+    void moe_stats_request_start(const server_slot & slot) {
+        std::lock_guard<std::mutex> lock(moe_stats_mtx);
+        if (moe_reqs.size() <= (size_t) slot.id) {
+            moe_reqs.resize((size_t) slot.id + 1);
+        }
+        moe_stats_req & r = moe_reqs[(size_t) slot.id];
+        r.active      = true;
+        r.seq         = ++moe_req_seq;
+        r.base        = slot.moe_base;
+        r.base_layers = slot.moe_base_layers;
+    }
+
+    void moe_stats_request_end(const server_slot & slot) {
+        std::lock_guard<std::mutex> lock(moe_stats_mtx);
+        if ((size_t) slot.id < moe_reqs.size() && moe_reqs[(size_t) slot.id].active) {
+            moe_reqs[(size_t) slot.id].active = false;
+            json last = slot.moe_stream_json();   // the figures the request ended with
+            if (!last.is_null()) {
+                last["active"] = false;
+                moe_last = std::move(last);
+            }
+        }
+    }
 
     // POST /cache-disk/erase and /clear never wait; a request that arrived before one of them (a lower task id:
     // ids grow in arrival order) - answering now, or still deferred - does not save its state at its reply's end, and its
@@ -1468,6 +1779,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        std::lock_guard<std::mutex> moe_lock(moe_stats_mtx);   // GET /moe-stream/stats never sees a freed context
         spec.reset();
         spec_init.reset();
 
@@ -1876,7 +2188,9 @@ private:
 
             // Every way a request ends (a reply, a cancel, an error, an embedding / rerank) runs the erase /
             // clear check, so a slot answering when its chat was erased never keeps that chat's state
+            slot.moe_timing = params_base.moe_stream_timing == 1;
             slot.callback_on_end = [this](server_slot & slot) {
+                moe_stats_request_end(slot);
                 cache_disk_covered(slot);
                 cd_prune_marks();
             };
@@ -1966,6 +2280,7 @@ private:
                         "the model's memory can all be cut back, so a request goes back without them");
             }
             cache_disk->n_swa     = n_swa;
+            cache_disk->pins      = &cd_pins;
             if (!cache_disk->init(params_base.cache_disk_dir, params_base.cache_disk_gb,
                                   server_cache_disk_config(params_base, ctx_tgt, slots.empty() ? nullptr : slots[0].ctx_dft))) {
                 cache_disk.reset();
@@ -2329,7 +2644,7 @@ private:
 
     // After a reply (its final response is sent), the slot's state to --cache-disk, finished before the next
     // request is taken; not for child tasks of a multi-completion request (the parent's state is the one kept)
-    // (and not when the request asked for no prompt cache: cache_prompt false)
+    // (and not when the request asked for no prompt cache: cache_prompt false, or for the disk to be left as it is: cache_disk_save false)
     // True when an erase / clear that arrived after this slot's request covers it; the slot's content is then
     // cleared (it is that chat's state). Called by cache_disk_save at a reply's end and on every release (callback_on_end)
     bool cache_disk_covered(server_slot & slot) {
@@ -2377,7 +2692,8 @@ private:
         if (cache_disk_covered(slot)) {
             return;
         }
-        if (slot.task->is_child() || slot.task->type != SERVER_TASK_TYPE_COMPLETION || !slot.task->params.cache_prompt) {
+        if (slot.task->is_child() || slot.task->type != SERVER_TASK_TYPE_COMPLETION || !slot.task->params.cache_prompt ||
+                !slot.task->params.cache_disk_save) {
             return;
         }
         // The "start of message" snapshot of the request just answered (made at its last user message's
@@ -2592,6 +2908,10 @@ private:
         // here, where the request starts, and it is used in print_timings().
         if (!llama_moe_stream_get_stats(ctx_tgt, &slot.moe_base)) {
             slot.moe_base = llama_moe_stream_stats{};
+            slot.moe_base_layers.clear();
+        } else {
+            slot.moe_base_layers = moe_stream_layers_now(ctx_tgt);
+            moe_stats_request_start(slot);
         }
 
         slot.state = slot.task->is_child()
@@ -2881,6 +3201,7 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
+        res->stats.moe_stream = slot.moe_stream_json();
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
@@ -3982,6 +4303,57 @@ private:
                     res->data = std::move(data);
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_CACHE_DISK_FORK:
+                {
+                    // The app's "new branch": the saved files of chat conv_id_from are copied to chat conv_id, replacing that
+                    // chat's own. Runs at once on this loop, like erase: after any save in progress, taking no slot's turn
+                    const std::string & to = task.conv_id;
+                    if (!cache_disk) {
+                        send_error(task, "the disk tier is off (its directory could not be used after waking)", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    const server_cache_disk::fork_result fr = cache_disk->fork_chat(task.conv_id_from, to);
+                    if (!fr.ok()) {
+                        send_error(task, fr.error_text(), fr.found ? ERROR_TYPE_SERVER : ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    // the new chat's earlier states are gone, as after an erase of it: a request of it that arrived before
+                    // does not save over the copy, and the RAM states and idle slots that hold it are dropped
+                    cd_mark & m = cd_erased_before[to];
+                    m.id   = std::max(m.id, task.id);
+                    m.t_us = ggml_time_us();
+                    size_t n_ram   = 0;
+                    size_t n_slots = 0;
+                    size_t n_busy  = 0;
+                    if (prompt_cache) {
+                        auto & st = prompt_cache->states;
+                        const size_t n0 = st.size();
+                        st.remove_if([&](const server_prompt_cache_state & x) { return x.conv_id == to; });
+                        n_ram = n0 - st.size();
+                    }
+                    for (auto & slot : slots) {
+                        if (slot.chat_id != to) {
+                            continue;
+                        }
+                        if (slot.is_processing()) {
+                            n_busy++;
+                        } else if (slot.prompt.n_tokens() > 0) {
+                            slot.prompt_clear();
+                            n_slots++;
+                        }
+                    }
+                    cd_prune_marks();
+                    const size_t n_streams = server_stream_drop_session(to);
+                    json data = fr.to_json();
+                    data["ram_states"]      = n_ram;
+                    data["slots"]           = n_slots;
+                    data["slots_answering"] = n_busy;
+                    data["stream_sessions"] = n_streams;
+                    auto res = std::make_unique<server_task_result_cache_disk>();
+                    res->id   = task.id;
+                    res->data = std::move(data);
+                    queue_results.send(std::move(res));
+                } break;
         }
 
         return true;
@@ -4792,7 +5164,7 @@ private:
                                     slot.prompt.checkpoints.pop_front();
                                 }
                                 // The chat's disk snapshots past this point that were made for another history
-                                if (cache_disk && cache_disk->max_snaps > 0 && !slot.chat_id.empty()) {
+                                if (cache_disk && cache_disk->max_snaps > 0 && !slot.chat_id.empty() && slot.task->params.cache_disk_save) {
                                     cache_disk->drop_snapshots_after(slot.chat_id, n_past, slot.task->tokens);
                                 }
                             }
@@ -5356,6 +5728,22 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // n_predict 0: the prompt is evaluated into the cache and nothing is generated
+                if (slot.n_predict_max == 0) {
+                    slot.stats.update_prompt_last();
+                    slot.stop           = STOP_TYPE_LIMIT;
+                    slot.has_next_token = false;
+                    slot.i_batch        = -1;
+                    slot.print_timings();
+                    send_final_response(slot);
+                    cache_disk_save(slot);
+                    slot.release();
+                    if (std::none_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); })) {
+                        llama_moe_stream_idle(ctx_tgt);   // a reply's end and no other reply running (elastic RAM's take-back)
+                    }
+                    return;
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
@@ -6353,6 +6741,24 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // GET /moe-stream/stats: the streaming engine's figures now, readable at any time (also while a request runs, and it does not wake
+    // a sleeping server)
+    this->get_moe_stream_stats = [this](const server_http_req &) {
+        auto res = create_response(true);
+        int status = 2;
+        json data = ctx_server.moe_stats_json(status);
+        if (status == 1) {
+            res->error(format_error_response("This server does not stream experts from the SSD. Start it with `--moe-stream`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        if (status == 2) {
+            res->error(format_error_response("No model is loaded right now (the server is asleep)", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        res->ok(data);
+        return res;
+    };
+
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
         if (params.slot_save_path.empty()) {
@@ -6386,13 +6792,21 @@ void server_routes::init_routes() {
         return res;
     };
 
-    // POST /cache-disk/erase (the chat in X-Conversation-Id) and POST /cache-disk/clear
+    // POST /cache-disk/erase (the chat in X-Conversation-Id), POST /cache-disk/clear, POST /cache-disk/pins and POST /cache-disk/fork
     this->post_cache_disk_erase = [this](const server_http_req & req) {
         return handle_cache_disk(req, true);
     };
 
     this->post_cache_disk_clear = [this](const server_http_req & req) {
         return handle_cache_disk(req, false);
+    };
+
+    this->post_cache_disk_pins = [this](const server_http_req & req) {
+        return handle_cache_disk_pins(req);
+    };
+
+    this->post_cache_disk_fork = [this](const server_http_req & req) {
+        return handle_cache_disk_fork(req);
     };
 
     this->get_props = [this](const server_http_req &) {
@@ -7081,6 +7495,19 @@ static bool cd_origin_allowed(const std::string & origin, const std::string & co
     return false;
 }
 
+// the Origin header of a request ("" = none)
+static std::string cd_request_origin(const server_http_req & req) {
+    std::string origin;
+    for (const auto & [k, v] : req.headers) {
+        std::string kl = k;
+        std::transform(kl.begin(), kl.end(), kl.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        if (kl == "origin") {
+            origin = v;
+        }
+    }
+    return origin;
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_cache_disk(const server_http_req & req, bool erase) {
     // never wakes a sleeping model (--sleep-idle-seconds): "not supported" and a missing chat id are answered at once, and
     // while the server sleeps the files are deleted here, under the task queue's lock (the slots and the RAM prompt cache are
@@ -7095,14 +7522,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_cache_disk(const ser
     // one the user listed in --cors-origins - is refused; a request without an Origin (the app's backend, curl) and a
     // localhost page work. With --api-key the key protects them
     if (params.api_keys.empty()) {
-        std::string origin;
-        for (const auto & [k, v] : req.headers) {
-            std::string kl = k;
-            std::transform(kl.begin(), kl.end(), kl.begin(), [](unsigned char c) { return (char) std::tolower(c); });
-            if (kl == "origin") {
-                origin = v;
-            }
-        }
+        const std::string origin = cd_request_origin(req);
         if (!origin.empty() && !cd_origin_allowed(origin, params.cors_origins)) {
             SRV_WRN("cache-disk: refused POST /cache-disk/%s from origin '%s' (not localhost, not listed in --cors-origins, and the "
                     "server has no --api-key)\n", erase ? "erase" : "clear", origin.c_str());
@@ -7155,6 +7575,145 @@ std::unique_ptr<server_res_generator> server_routes::handle_cache_disk(const ser
     {
         server_task task(erase ? SERVER_TASK_TYPE_CACHE_DISK_ERASE : SERVER_TASK_TYPE_CACHE_DISK_CLEAR);
         task.conv_id = chat;
+        task.id = rd.get_new_id();
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_cache_disk*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+// POST /cache-disk/pins {"pinned": ["<chat id>", ...]}: replaces the set of chats whose saved states the size limit deletes last.
+// Answered at once, also while the server sleeps (the set is kept by the server, not the disk tier)
+std::unique_ptr<server_res_generator> server_routes::handle_cache_disk_pins(const server_http_req & req) {
+    auto res = create_response(true);
+    if (params.cache_disk_dir.empty()) {
+        res->error(format_error_response("This server does not keep chat states on disk. Start it with `--cache-disk DIR`", ERROR_TYPE_NOT_SUPPORTED));
+        return res;
+    }
+    if (params.api_keys.empty()) {   // as for erase / clear: a web page that is not on localhost is refused
+        const std::string origin = cd_request_origin(req);
+        if (!origin.empty() && !cd_origin_allowed(origin, params.cors_origins)) {
+            SRV_WRN("cache-disk: refused POST /cache-disk/pins from origin '%s' (not localhost, not listed in --cors-origins, and the "
+                    "server has no --api-key)\n", origin.c_str());
+            res->error(format_error_response("POST /cache-disk/pins is refused from a web page that is not on localhost "
+                    "or listed in --cors-origins when the server has no --api-key", ERROR_TYPE_PERMISSION));
+            return res;
+        }
+    }
+    std::vector<std::string> ids;
+    try {
+        const json body = json::parse(req.body);
+        if (!body.is_object() || !body.contains("pinned") || !body.at("pinned").is_array()) {
+            throw std::runtime_error("no pinned list");
+        }
+        for (const auto & v : body.at("pinned")) {
+            if (!v.is_string()) {
+                throw std::runtime_error("a pinned chat id is not a string");
+            }
+            ids.push_back(v.get<std::string>());
+        }
+    } catch (const std::exception &) {
+        res->error(format_error_response("POST /cache-disk/pins needs a JSON body {\"pinned\": [\"<chat id>\", ...]}", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const size_t n = ctx_server.cache_disk_pinned().set(ids);
+    SRV_INF("cache-disk: %zu chats pinned (their files are deleted last by the size limit)\n", n);
+    res->ok(json { { "pinned", n } });
+    return res;
+}
+
+// POST /cache-disk/fork {"from": "<chat id>", "to": "<chat id>"}: every saved entry of chat `from` (its state and snapshots)
+// also becomes an entry of chat `to`, replacing the entries `to` had. Runs as a task on the main loop (after any save in
+// progress), or directly while the server sleeps (the model is not loaded for it)
+std::unique_ptr<server_res_generator> server_routes::handle_cache_disk_fork(const server_http_req & req) {
+    auto res = create_response(true);
+    if (params.cache_disk_dir.empty()) {
+        res->error(format_error_response("This server does not keep chat states on disk. Start it with `--cache-disk DIR`", ERROR_TYPE_NOT_SUPPORTED));
+        return res;
+    }
+    if (params.api_keys.empty()) {   // as for erase / clear: a web page that is not on localhost is refused
+        const std::string origin = cd_request_origin(req);
+        if (!origin.empty() && !cd_origin_allowed(origin, params.cors_origins)) {
+            SRV_WRN("cache-disk: refused POST /cache-disk/fork from origin '%s' (not localhost, not listed in --cors-origins, and the "
+                    "server has no --api-key)\n", origin.c_str());
+            res->error(format_error_response("POST /cache-disk/fork is refused from a web page that is not on localhost "
+                    "or listed in --cors-origins when the server has no --api-key", ERROR_TYPE_PERMISSION));
+            return res;
+        }
+    }
+    std::string from;
+    std::string to;
+    try {
+        const json body = json::parse(req.body);
+        if (!body.is_object() || !body.contains("from") || !body.at("from").is_string() || !body.contains("to") || !body.at("to").is_string()) {
+            throw std::runtime_error("no from / to");
+        }
+        from = body.at("from").get<std::string>();
+        to   = body.at("to").get<std::string>();
+        if (from.empty() || to.empty()) {
+            throw std::runtime_error("an empty chat id");
+        }
+    } catch (const std::exception &) {
+        res->error(format_error_response("POST /cache-disk/fork needs a JSON body {\"from\": \"<chat id>\", \"to\": \"<chat id>\"} "
+                "with two chat ids that are not empty", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (from == to) {
+        res->error(format_error_response("POST /cache-disk/fork: \"from\" and \"to\" are the same chat id", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    {
+        json data;
+        bool failed = false;
+        server_cache_disk::fork_result fr;
+        const bool asleep = queue_tasks.run_while_sleeping([&]() {
+            server_cache_disk * cd = ctx_server.cache_disk_while_sleeping();
+            if (!cd) {
+                failed = true;
+                return;
+            }
+            fr = cd->fork_chat(from, to);
+            if (fr.ok()) {
+                server_stream_drop_session(to);   // only after the copy is made
+                data = fr.to_json();
+                data["ram_states"] = 0;
+                data["slots"] = 0;
+                data["slots_answering"] = 0;
+                data["asleep"] = true;
+            }
+            SRV_INF("%s", "cache-disk: fork while the server sleeps (the model is not loaded for it)\n");
+        });
+        if (asleep) {
+            if (failed) {
+                res->error(format_error_response("the disk tier is off", ERROR_TYPE_SERVER));
+            } else if (!fr.ok()) {
+                res->error(format_error_response(fr.error_text(), fr.found ? ERROR_TYPE_SERVER : ERROR_TYPE_INVALID_REQUEST));
+            } else {
+                res->ok(data);
+            }
+            return res;
+        }
+    }
+    queue_tasks.wait_until_no_sleep();
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_CACHE_DISK_FORK);
+        task.conv_id      = to;
+        task.conv_id_from = from;
         task.id = rd.get_new_id();
         rd.post_task(std::move(task));
     }

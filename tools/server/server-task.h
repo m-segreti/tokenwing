@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <mutex>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -29,6 +30,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_CACHE_DISK_ERASE,   // POST /cache-disk/erase (the task's conv_id)
     SERVER_TASK_TYPE_CACHE_DISK_CLEAR,   // POST /cache-disk/clear
+    SERVER_TASK_TYPE_CACHE_DISK_FORK,    // POST /cache-disk/fork (conv_id_from -> conv_id)
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -53,6 +55,7 @@ struct task_params {
     bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+    bool cache_disk_save = true; // with --cache-disk: false = the request leaves the chat's files on the disk as they are
     bool return_tokens   = false;
     bool return_progress = false;
 
@@ -157,6 +160,9 @@ struct server_task {
 
     // The request's X-Conversation-Id header ("" = none), the key of the chat's state in --cache-disk
     std::string conv_id;
+
+    // SERVER_TASK_TYPE_CACHE_DISK_FORK only: the chat whose files are copied to conv_id
+    std::string conv_id_from;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -659,6 +665,18 @@ private:
     std::list<server_prompt_cache_state>::const_iterator find_best(const server_prompt & prompt, const server_tokens & tokens_new) const;
 };
 
+// The chats whose files --cache-disk deletes last when it is over its size limit (POST /cache-disk/pins). Kept in memory only,
+// as the hashes the entries carry; set by an HTTP thread, read by the thread that saves.
+struct server_cache_disk_pins {
+    // replaces the whole set; returns how many different chats it holds
+    size_t set(const std::vector<std::string> & chat_ids);
+    bool   has(uint64_t chat_hash) const;
+
+private:
+    mutable std::mutex mtx;
+    std::unordered_set<uint64_t> hashes;
+};
+
 // --cache-disk: the chat states on disk. One file per saved state: chat-<hash of the chat id>.state or
 // prefix-<hash of the tokens>.state (always a hash, never text from a request), owner-only (0600), written to a temp file and
 // renamed. A file holds a header (magic, format version, the model's fingerprint, the settings that change a state's bytes or
@@ -739,6 +757,7 @@ struct server_cache_disk {
     config      cfg;
     std::vector<entry> index;
     bool        warned_media = false;
+    const server_cache_disk_pins * pins = nullptr;   // the pinned chats; null = none
 
     // checks that dir can be written, reads the headers of the entries already there; false = refuse --cache-disk
     bool init(const std::string & dir, double limit_gb, const config & cfg);
@@ -758,10 +777,38 @@ struct server_cache_disk {
                            llama_context * ctx_dft, int32_t id_slot, const std::string & conv_id);
 
     // POST /cache-disk/erase: deletes the chat's file; returns its size (0 when there was none), -1 when it could not be deleted
-    int64_t erase_chat(const std::string & conv_id);
+    int64_t erase_chat(const std::string & conv_id, const char * why = "erased by POST /cache-disk/erase");   // why: for the log
 
     // POST /cache-disk/clear: deletes every file of this tier in dir (an entry name AND the magic); returns {files, bytes}
     std::pair<size_t, uint64_t> clear();
+
+    // POST /cache-disk/fork: every usable entry of chat `from` (its state, then its snapshots, newest first, up to
+    // --cache-disk-checkpoints) is copied as an entry of chat `to` - its own file, written now, counted in the size limit,
+    // after the entries of `to` it replaces. A file holds its chat id in the header and the snapshot's name is checked against
+    // it, so a link to the same file would not be this chat's entry: the copy gets a new header and the rest of the bytes as
+    // they are. `from` is never changed, and the size limit never deletes its entries or the copies.
+    struct fork_result {
+        bool     found     = false;   // `from` has usable entries; false = nothing was changed
+        bool     state     = false;   // the chat's saved state was copied
+        size_t   snapshots = 0;       // snapshots copied
+        size_t   skipped   = 0;       // entries not copied: over the snapshot count, no room under the size limit, unreadable
+        uint64_t bytes     = 0;       // the copied entries' size
+        uint64_t replaced_bytes = 0;  // the files of `to` that were deleted first
+        bool     failed    = false;   // found, but nothing could be copied (`to` is unchanged)
+        bool     replace_failed = false;  // the files of `to` could not all be deleted: the copy was not made
+
+        bool ok() const { return found && !failed; }
+        const char * error_text() const {
+            return !found ? "POST /cache-disk/fork: no saved state on disk for the chat in \"from\" (never saved, erased, or deleted by the size limit)" :
+                   replace_failed ? "the saved files of the new chat could not all be deleted (see the server log); nothing was copied" :
+                   "nothing could be copied: the entries do not fit under --cache-disk-gb or cannot be read (see the server log)";
+        }
+        json to_json() const {
+            return { { "state_copied", state }, { "snapshots", snapshots }, { "file_bytes", bytes }, { "skipped", skipped },
+                     { "replaced_bytes", replaced_bytes } };
+        }
+    };
+    fork_result fork_chat(const std::string & from, const std::string & to);
 
     // A chat's "start of message" snapshots on the disk. write_snapshot: after a reply, the snapshot made at the
     // last user message's start (its own file, the oldest of the chat beyond max_snaps deleted). find_snapshot: the newest one
@@ -796,6 +843,8 @@ private:
     bool     remove_entry(size_t i, const char * reason);   // false = the file is still there (the entry stays); a file without
                                                              // this tier's magic is never deleted, only dropped from the index
     bool     read_header(const std::string & path, entry & e, bool with_tokens) const;
+    bool     is_pinned(const entry & e) const;   // a state or snapshot of a pinned chat
+    bool     evicts_before(const entry & a, const entry & b) const;   // the size limit's order, see save()
 };
 
 struct server_task_result_cache_disk : server_task_result {

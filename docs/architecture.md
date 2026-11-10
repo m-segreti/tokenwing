@@ -69,7 +69,7 @@ Function-name prefixes in `llama-moe-stream.cpp`:
 | Member | What it owns |
 |---|---|
 | `layers` | One `llama_moe_stream_layer` per model layer; null where the layer is not streamed (`layer(il)`). |
-| `file` | The experts file, opened with `O_DIRECT` where the system has it. |
+| `file` | The experts file, or with `--moe-stream model` the model file itself, opened with `O_DIRECT` where the system has it. |
 | `q_demand`, `q_prefetch`, `q_idle`, `io_threads` | The read queues and the reader threads, all under `mtx`. |
 | `pl_list` | The waiting list of predicted experts. |
 | `ne_*` | The guess hand-over: slots, ring, helper thread. |
@@ -103,6 +103,12 @@ Expert `e` of streamed layer `il` is at `base_offset + e * block_bytes`. A block
 
 Beside the data file the engine also reads or writes `<name>.usage.json` (`tokenwing usage v1`), `<name>.layer-order.json` (`tokenwing layer order v1`) and `<name>.nonpool.txt`. The VRAM expert list is a separate file (`tokenwing vram-experts v1`, `--moe-stream-vram-experts-file`, made by `make_vram_list.py`).
 
+### The model file
+
+`--moe-stream model` needs no experts file: the model's own GGUF carries what the experts file would. `tokenwing-tools/experts/make_model_file.py` writes it (`tokenwing model v1`, key `tokenwing.format`): the same tensors in the same order with the same bytes and metadata, `general.alignment` 4096 so every tensor and every expert slice starts on a 4096-byte boundary, FNV-1a 64-bit checksums of the first, middle (`n_expert / 2`) and last expert's gate, up and down slice of every MoE layer (`tokenwing.sums.layers`, `tokenwing.sums.values`), and optional data appended after the last tensor, 4096-aligned, each named by `tokenwing.blob.<name>.offset` and `.size`: `correction`, `vram_experts`, `usage_seed`, `layer_order`. The appended bytes keep the file a valid GGUF that other programs open as before.
+
+The constructor builds the same description the experts file's JSON gives. A layer's block is virtual (gate, up, down as the slot holds them), and each projection has its own file offset, because the three tensors are in three places; expert `e` of projection `p` is at `file_off[p] + e * size[p]`. A read of an expert is one request per projection, queued like a chunk: a piece never crosses a projection, and it lands at the same place in the slot as before. `--moe-stream-verify` compares the sample experts with the file's checksums and the first filled slot of each layer with the file, once its last piece has landed. The files named after the model (`<model>.gguf.usage.json`, `<model>.gguf.layer-order.json`, `<model>.gguf.nonpool.txt`) take the place of the experts file's. A split GGUF is refused, and so is a file without the key.
+
 ### The plan
 
 `moe_stream_plan_in mplan` is filled by the constructor: layers, whole GPU layers, bytes per expert, slots per layer, RAM budget, pool bytes, `MemAvailable`, non-pool bytes. `llama_moe_stream_get_plan` builds an engine with no reader threads; the constructor returns once the plan is made. `--moe-stream-plan-only` prints that, so the plan and a real load come from the same code. Do not confuse it with the waiting list, whose flag is also called `--moe-stream-plan`.
@@ -112,7 +118,7 @@ Beside the data file the engine also reads or writes `<name>.usage.json` (`token
 | Thread | Started in | Runs | Touches |
 |---|---|---|---|
 | Graph thread (whoever calls `llama_decode`) | the tool or server | Graph build, `set_decode`, the scheduler loop, CPU splits (the remap op runs on thread 0 of the CPU pool), `end_call`, VRAM follow's tick | Takes `mtx` in the remap op, `end_call` and the call-start hooks. |
-| Readers (`--moe-stream-io-threads`, default 8) | the constructor | `io_loop_t<0\|1\|2>`: pick a job, `preadv` into the slot's three pool slices, settle. The loop version is chosen once at start-up. | `mtx` to pick and to settle. The read itself is unlocked. |
+| Readers (`--moe-stream-io-threads`, default 8) | the constructor | `io_loop_t<0\|1\|2>`: pick a job, `preadv` into the slot's pool slices (one request for an experts-file block, one per projection from a model file), settle. The loop version is chosen once at start-up. | `mtx` to pick and to settle. The read itself is unlocked. |
 | Guess helper (needed-early only) | the constructor | `ne_loop`: waits for a posted guess (`ne_wait_posted`), then `on_guess_ready` adds waiting-list entries (`la_guesses` or `prefetch_next`). | `mtx`. It waits for the GPU event unlocked. |
 | VRAM-follow uploader | `vf_setup`, inside `vx_setup` | `vf_loop`: copies experts into VRAM places on its own stream, and copy-backs from VRAM into RAM slots. | `vf_mtx`; takes `mtx` to settle a copy-back. |
 | Idle loader (`--moe-stream-idle-load` only) | `idle_arm` | `idle_loop`: after a quiet pause, reads usage-table experts into EMPTY slots at the lowest priority. | `mtx`. |
@@ -236,7 +242,7 @@ The engine side is `lm_call_begin`, `lm_layer_begin`, `lm_layer_done`, `lm_call_
 
 - **Every new behaviour is a flag, off by default.** Add the field to `llama_model_params` and its default in `llama_model_default_params`, to `common_params`, the option and its checks in `common/arg.cpp`, the copy in `common_model_params_to_llama`, a field in `llama_moe_stream_p1` filled in `load_tensors`, and a row in [Settings](settings.md). Where the flag needs another flag or hardware it lacks, switch it off with one line; do not refuse to run. Machine-dependent numbers are flags too, never constants for one model or machine.
 - **Output must not change when a feature is off.** A feature that changes what the expert matmul reads must be checked for identical text in the same run as its speed measurement (`check.py`, `compare.py` report whether the text matched). Rounding differences from a different execution path are accepted. Garbage, NaN or an empty reply are bugs.
-- **System calls go through small named functions** in `llama-moe-stream.cpp`, never inline in the engine's logic: `moe_stream_preadv`, `moe_stream_mem_available`, `moe_aligned_alloc`, `os_mem_cap_get`, `os_proc_rss`, `os_page_size`, `os_write_file_atomic`, `llama_moe_os_fopen_utf8`. Each system gets its own version of each function, and an extra that only one system has stays in that version. A new system call gets its own function next to these.
+- **System calls go through small named functions** in `llama-moe-stream.cpp`, never inline in the engine's logic: `moe_stream_preadv` (every expert read, from the experts file or the model file), `moe_stream_mem_available`, `moe_aligned_alloc`, `os_mem_cap_get`, `os_proc_rss`, `os_page_size`, `os_write_file_atomic`, `os_read_file_range` (the data appended to a model file), `llama_moe_os_fopen_utf8`. Each system gets its own version of each function, and an extra that only one system has stays in that version. A new system call gets its own function next to these.
 - **Test-only code is chosen at start-up.** Switches are `MOE_STREAM_TEST_*` environment variables, read once into a function-local `static const bool` or in the constructor, and most print a `TEST ONLY` line. Where a test changes a hot path, the choice is a template parameter or a member-function pointer fixed at start (`io_loop_t<N>`, `ne_loop<DELAY>`, `vf_fill_fn`), so the normal path has no extra test per word.
 - **Lock discipline.** A field written by a reader, the helper or the uploader is guarded by `mtx`. Do not wait on the GPU under it. Add the check that proves a new invariant (the slot check, the empty-list check) rather than a comment.
 - **A new architecture** is added to `arch_leads` in the constructor when its graph passes the next layers' routers into `build_moe_ffn`, and to `llama_arch_layer_major` when its builder takes a layer range.

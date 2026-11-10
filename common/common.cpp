@@ -1874,6 +1874,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_copy_ahead           = params.moe_stream_copy_ahead;
     mparams.moe_stream_vram_lend_prompt     = params.moe_stream_vram_lend_prompt;
     mparams.moe_stream_vram_lend_short      = params.moe_stream_vram_lend_short;
+    mparams.moe_stream_timing               = params.moe_stream_timing;
     mparams.moe_stream_vram_follow_tick     = params.moe_stream_vram_follow_tick;
     mparams.moe_stream_vram_follow_swaps    = params.moe_stream_vram_follow_swaps;
     mparams.moe_stream_vram_follow_recent   = params.moe_stream_vram_follow_recent;

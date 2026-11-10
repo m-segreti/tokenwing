@@ -246,9 +246,12 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         routes.get_lora_adapters           = models_routes->proxy_get;
         routes.post_lora_adapters          = models_routes->proxy_post;
         routes.get_slots                   = models_routes->proxy_get;
+        routes.get_moe_stream_stats        = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
         routes.post_cache_disk_erase       = models_routes->proxy_post;
         routes.post_cache_disk_clear       = models_routes->proxy_post;
+        routes.post_cache_disk_pins        = models_routes->proxy_post;
+        routes.post_cache_disk_fork        = models_routes->proxy_post;
 
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
@@ -301,10 +304,16 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
+    // the streaming engine's figures (--moe-stream): the request running now, the totals since start, where the experts live
+    ctx_http.get ("/moe-stream/stats",         ex_wrapper(routes.get_moe_stream_stats));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     // --cache-disk: delete one chat's saved state / all saved states (the engine's states, never the chat text)
     ctx_http.post("/cache-disk/erase",         ex_wrapper(routes.post_cache_disk_erase));
     ctx_http.post("/cache-disk/clear",         ex_wrapper(routes.post_cache_disk_clear));
+    // --cache-disk: the chats whose saved states the size limit deletes last
+    ctx_http.post("/cache-disk/pins",          ex_wrapper(routes.post_cache_disk_pins));
+    // --cache-disk: a chat's saved states also become another chat's (a new branch of the conversation)
+    ctx_http.post("/cache-disk/fork",          ex_wrapper(routes.post_cache_disk_fork));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

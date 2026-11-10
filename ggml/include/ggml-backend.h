@@ -418,6 +418,9 @@ extern "C" {
         GGML_PROF_N_CUDA_DISABLED_P2, GGML_PROF_N_CUDA_DISABLED_P3,
         GGML_PROF_N_COUNTS,
     };
+    // Turns the timers on (or off) at run time; GGML_PROFILE sets the start value. Call it before the first graph is computed
+    GGML_API void                 ggml_prof_enable(int on);
+    GGML_API bool                 ggml_prof_enabled(void);
     GGML_API void                 ggml_prof_add(int slot, int64_t us);
     GGML_API void                 ggml_prof_count(int what, int64_t n);
     // a CUDA graph was captured (kind 0), replayed (kind 1) or not used (kind 2, with a reason 0..3:

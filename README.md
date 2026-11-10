@@ -160,6 +160,7 @@ Thanks to these projects. Each does something exceptionally well, and parts of t
 | An unused prefetched expert leaves first, and checking output token by token against a reference | MoE-Direct |
 | CPU-GPU hand-off timers, and the weighted sum as one CPU op | [hikarioyama](https://github.com/hikarioyama/llama.cpp-glm52) |
 | One timeline trace of the I/O threads and compute | [PowerInfer](https://github.com/SJTU-IPADS/PowerInfer) |
+| Correction files for models with BF16 or F16 routers, and VRAM places split between layers by score | [grawnchtoader](https://github.com/grawnchtoader) |
 
 ## License
 
