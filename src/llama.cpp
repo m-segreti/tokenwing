@@ -442,10 +442,31 @@ static struct llama_model * llama_model_load_from_file_impl(
         // (a GPU buffer's failure only: a RAM buffer that cannot be made is not helped by fewer whole GPU layers - they move to RAM)
         const bool can_retry = status == -1 && params.moe_stream != nullptr && metadata == nullptr && file == nullptr &&
                                llama_last_load_error.find("unable to allocate") != std::string::npos && !llama_model_last_alloc_failed_on_host();
-        if (can_retry && !gl_list.empty()) {
-            const size_t c = gl_list.rfind(',');
-            const std::string dropped = c == std::string::npos ? gl_list : gl_list.substr(c + 1);
-            gl_list = c == std::string::npos ? "" : gl_list.substr(0, c);
+        // the layer given up: the last picked on the device whose buffer failed (with several GPUs maybe not the list's last); none there =
+        // fewer whole layers cannot help, no retry
+        const int32_t drop_il = llama_model_last_alloc_drop_layer();
+        if (can_retry && !gl_list.empty() && drop_il == -1) {
+            fprintf(stderr, "%s: --moe-stream: the weights did not fit (%s) on a GPU that holds none of the whole GPU MoE layers %s - fewer "
+                    "whole layers cannot help there\n", __func__, llama_last_load_error.c_str(), gl_list.c_str());
+        }
+        if (can_retry && !gl_list.empty() && drop_il != -1) {
+            std::string dropped, kept;
+            size_t p = 0;
+            std::vector<std::string> items;
+            for (size_t q; (q = gl_list.find(',', p)) != std::string::npos; p = q + 1) {
+                items.push_back(gl_list.substr(p, q - p));
+            }
+            items.push_back(gl_list.substr(p));
+            size_t k = items.size() - 1;   // the list's last when the device is not known
+            for (size_t i = 0; drop_il >= 0 && i < items.size(); i++) {
+                if (atoi(items[i].c_str()) == drop_il) {
+                    k = i;
+                }
+            }
+            for (size_t i = 0; i < items.size(); i++) {
+                (i == k ? dropped : kept) += (i == k || kept.empty() ? "" : ",") + items[i];
+            }
+            gl_list = kept;
             fprintf(stderr, "%s: --moe-stream: the weights did not fit (%s) - again with whole GPU MoE layers %s (layer %s streamed; replies "
                     "slower; the RAM plan is made again with it streamed)\n", __func__, llama_last_load_error.c_str(),
                     gl_list.empty() ? "none" : gl_list.c_str(), dropped.c_str());

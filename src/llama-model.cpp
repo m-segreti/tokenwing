@@ -37,6 +37,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1301,8 +1302,12 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 
 static thread_local bool llama_model_alloc_host = false;   // the last weight-buffer failure was a host buffer's
 bool llama_model_last_alloc_failed_on_host() { return llama_model_alloc_host; }
+// the whole GPU MoE layer that load would give up: the last picked on the device whose buffer failed; -1 = none there, -2 = not known
+static thread_local int32_t llama_model_alloc_drop = -2;
+int32_t llama_model_last_alloc_drop_layer() { return llama_model_alloc_drop; }
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    llama_model_alloc_drop = -2;   // (a failure of this load says which whole layer to give up)
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1580,6 +1585,40 @@ static llama_moe_stream_srv_terms llama_moe_stream_srv_compute(const llama_hpara
     return t;
 }
 
+// One layer's KV cache rows or recurrent state for the context the model is loaded for (llama_model_params' moe_stream_ctx*), at
+// the sizes llama_kv_cache, llama_kv_cache_iswa and llama_memory_recurrent allocate for the plain, SWA and hybrid layouts; the
+// whole-layer VRAM check charges it to the layer's device. Caches of their own (an indexer's keys, a compressor's state) are not counted
+static int64_t llama_moe_stream_layer_ctx_bytes(const llama_hparams & hp, llm_arch arch, uint32_t il, const llama_model_params & p) {
+    const bool     unified   = (p.moe_stream_ctx_flags & 1) != 0;
+    const bool     swa_full  = (p.moe_stream_ctx_flags & 2) != 0;
+    const uint32_t n_seq     = std::max(1u, p.moe_stream_ctx_seq);
+    const uint32_t n_ubatch  = p.moe_stream_ubatch > 0 ? (uint32_t) p.moe_stream_ubatch : 512u;
+    const uint32_t n_ctx     = GGML_PAD(p.moe_stream_ctx > 0 ? p.moe_stream_ctx : hp.n_ctx_train, 256);   // (llama_context pads it so)
+    const uint32_t n_ctx_seq = unified ? n_ctx : GGML_PAD(n_ctx/n_seq, 256);
+    const uint32_t n_stream  = unified ? 1 : n_seq;
+    const bool     hybrid    = llm_arch_is_hybrid(arch);
+    if (llm_arch_is_recurrent(arch) || (hybrid && hp.is_recr(il))) {
+        // the recurrent memory keeps its states in F32, max(1, n_seq) x (1 + the rollback rows) rows per layer
+        const uint32_t rs_seq = llm_arch_supports_rs_rollback(arch) ? p.moe_stream_ctx_rs_seq : 0;
+        int64_t row = (int64_t) ggml_row_size(GGML_TYPE_F32, hp.n_embd_r()) + (int64_t) ggml_row_size(GGML_TYPE_F32, hp.n_embd_s());
+        if (hp.ple_conv_state() > 0 && hp.is_ple(il)) {
+            row += (int64_t) ggml_row_size(GGML_TYPE_F32, hp.ple_conv_state());
+        }
+        return row*(int64_t) n_seq*(1 + rs_seq);
+    }
+    if (!hp.has_kv(il)) {
+        return 0;
+    }
+    if (!hybrid && hp.n_layer_nextn > 0 && hp.n_layer() > 0 && hp.router_layer < 0 && il >= hp.n_layer()) {
+        return 0;   // the MTP block's cache belongs to the draft context
+    }
+    const bool     swa     = hp.swa_type != LLAMA_SWA_TYPE_NONE && hp.is_swa(il) && !swa_full;
+    const uint32_t kv_size = swa ? GGML_PAD(std::min(n_ctx_seq, hp.n_swa*(unified ? n_seq : 1) + n_ubatch), 256) : n_ctx_seq;
+    const int64_t  k = (int64_t) ggml_row_size((ggml_type) p.moe_stream_ctx_type_k, hp.n_embd_k_gqa(il));
+    const int64_t  v = hp.is_mla() ? 0 : (int64_t) ggml_row_size((ggml_type) p.moe_stream_ctx_type_v, hp.n_embd_v_gqa(il));   // (MLA: V is a view of K)
+    return (k + v)*(int64_t) kv_size*(int64_t) n_stream;
+}
+
 // the bytes to add to the non-pool memory for it (0 when it fits in the reserve's headroom), and the start-up line
 static int64_t llama_moe_stream_srv_extra(const llama_moe_stream_srv_terms & t, const llama_moe_stream_srv & srv, const char * func) {
     const int64_t rest     = srv.other_rest > 0 ? srv.other_rest : MOE_STREAM_OTHER_REST;   // A8
@@ -1797,6 +1836,99 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_WARN("%s: -ot/--cpu-moe overrides do not apply to streamed expert tensors\n", __func__);
         }
 
+        // More than one GPU: the device names of --moe-stream-vram-device and --moe-stream-gpu-layers-device, resolved against this
+        // model's GPUs (--device decides which and in what order). A name that is not one of them falls back, with one line each
+        std::string gpu_names;
+        ggml_backend_dev_t first_gpu = nullptr;
+        int n_gpu_devs = 0;
+        for (const auto & dv : devices) {
+            const auto t = ggml_backend_dev_type(dv.dev);
+            if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                gpu_names += format("%s%s", gpu_names.empty() ? "" : ",", ggml_backend_dev_name(dv.dev));
+                n_gpu_devs++;
+                first_gpu = first_gpu == nullptr && t == GGML_BACKEND_DEVICE_TYPE_GPU ? dv.dev : first_gpu;
+            }
+        }
+        const auto gpu_by_name = [&](const std::string & n, bool igpu_ok) -> ggml_backend_dev_t {
+            for (const auto & dv : devices) {
+                const auto t = ggml_backend_dev_type(dv.dev);
+                if ((t == GGML_BACKEND_DEVICE_TYPE_GPU || (igpu_ok && t == GGML_BACKEND_DEVICE_TYPE_IGPU)) && n == ggml_backend_dev_name(dv.dev)) {
+                    return dv.dev;
+                }
+            }
+            return nullptr;
+        };
+        ggml_backend_dev_t ms_pool_dev = first_gpu;
+        bool ms_pool_dev_set = false;
+        if (params.moe_stream_vram_device && params.moe_stream_vram_device[0]) {
+            if (ggml_backend_dev_t d = gpu_by_name(params.moe_stream_vram_device, /* igpu_ok = */ false)) {
+                ms_pool_dev     = d;
+                ms_pool_dev_set = true;
+            } else {
+                fprintf(stderr, "%s: --moe-stream-vram-device %s is not a GPU of this model (its GPUs: %s) - %s\n", __func__,
+                        params.moe_stream_vram_device, gpu_names.empty() ? "none" : gpu_names.c_str(),
+                        first_gpu ? format("the VRAM pool stays on %s", ggml_backend_dev_name(first_gpu)).c_str() : "not used");
+            }
+        }
+        // --moe-stream-gpu-layers-device: the device of each named layer's experts. The layers themselves are the list (common fills it with
+        // the named layers; a reload with one layer fewer shortens the list, not this); a layer named for a device that is not a GPU of the
+        // model leaves the list (it is streamed)
+        const auto split_by = [](const std::string & str, char c) {
+            std::vector<std::string> out;
+            size_t p = 0;
+            for (size_t q; (q = str.find(c, p)) != std::string::npos; p = q + 1) {
+                out.push_back(str.substr(p, q - p));
+            }
+            out.push_back(str.substr(p));
+            return out;
+        };
+        const bool wl_spec = params.moe_stream_gpu_layers_device && params.moe_stream_gpu_layers_device[0];
+        std::vector<ggml_backend_dev_t> whole_dev_flag(n_layer_all, nullptr);
+        std::string gl_list_eff = params.moe_stream_gpu_layers_list ? params.moe_stream_gpu_layers_list : "";
+        if (wl_spec) {
+            std::set<int32_t> bad;
+            std::string bad_say;
+            for (const std::string & part : split_by(params.moe_stream_gpu_layers_device, ';')) {
+                const size_t eq = part.find('=');
+                if (eq == std::string::npos) {
+                    continue;   // (common checked the syntax; an API caller's empty part is skipped)
+                }
+                const std::string dname = part.substr(0, eq);
+                ggml_backend_dev_t d = gpu_by_name(dname, /* igpu_ok = */ true);
+                std::string bl;
+                for (const std::string & item : split_by(part.substr(eq + 1), ',')) {
+                    int a = -1, b = -1;
+                    if (sscanf(item.c_str(), "%d-%d", &a, &b) < 2) {
+                        b = a;
+                    }
+                    for (int il = std::max(a, 0); il <= b && il < 4096; il++) {
+                        if (d != nullptr && il < n_layer_all) {
+                            whole_dev_flag[il] = d;
+                        } else if (d == nullptr) {
+                            bad.insert(il);
+                            bl += format("%s%d", bl.empty() ? "" : ",", il);
+                        }
+                    }
+                }
+                if (d == nullptr) {
+                    bad_say += format("%s%s (layers %s)", bad_say.empty() ? "" : "; ", dname.c_str(), bl.c_str());
+                }
+            }
+            if (!bad.empty()) {
+                std::string kept;
+                for (const std::string & item : split_by(gl_list_eff, ',')) {
+                    if (!item.empty() && bad.count(atoi(item.c_str())) == 0) {
+                        kept += (kept.empty() ? "" : ",") + item;
+                    }
+                }
+                gl_list_eff = kept;
+                fprintf(stderr, "%s: --moe-stream-gpu-layers-device: %s - not a GPU of this model (its GPUs: %s): those layers are streamed "
+                        "instead\n", __func__, bad_say.c_str(), gpu_names.empty() ? "none" : gpu_names.c_str());
+            }
+        }
+        // the whole-layer count the engine is given: none when the device list was given and nothing of it is left (not the auto-fit)
+        const int32_t gpu_layers_n = wl_spec && gl_list_eff.empty() ? 0 : params.moe_stream_gpu_layers;
+
         // What this process will need in RAM besides the expert pools: the weights of the layers
         // that stay on the host, and the tensors outside the layers (token embeddings, output). Walked
         // from the model file, so it is a measurement of this model and this offload split, not a guess.
@@ -1806,6 +1938,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         int64_t other_bytes = 0;
         int64_t np_known = 0, np_planned = 0, np_srv_need = 0, np_delta = 0;   // the non-pool bytes known exactly (weights in RAM), the plan's own part
         int64_t gpu_weight_bytes = 0;
+        std::map<ggml_backend_dev_t, int64_t> gpu_weight_dev;   // the same per GPU device (the whole-layer check)
         {
             // Walk the loader's weights map, not ml.metadata - the metadata lists only
             // the FIRST shard's tensors, so a split GGUF was under-counted
@@ -1849,12 +1982,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 // device, output/output_norm on the output device. The old test (dev_output AND dev_input not
                 // CPU) was never true, so output.weight (0.40 GiB on Flash, on the GPU) was counted as RAM.
                 bool on_gpu;
+                ggml_backend_dev_t tn_dev;
                 if (il >= 0) {
                     on_gpu = il < (int) pimpl->dev_layer.size() && pimpl->dev_layer[il].dev != cpu_dev;
+                    tn_dev = on_gpu ? pimpl->dev_layer[il].dev : cpu_dev;
                 } else if (strncmp(tn_name, "token_embd", 10) == 0) {
                     on_gpu = pimpl->dev_input.dev != cpu_dev;
+                    tn_dev = pimpl->dev_input.dev;
                 } else {
                     on_gpu = pimpl->dev_output.dev != cpu_dev;
+                    tn_dev = pimpl->dev_output.dev;
                 }
 
                 // With --moe-stream-guess-combined 1 (and lookahead N > 1) the combined guess step stacks
@@ -1871,6 +2008,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
                 if (on_gpu) {
                     gpu_weight_bytes += tn_bytes + stack_bytes;
+                    gpu_weight_dev[tn_dev] += tn_bytes + stack_bytes;
                 } else {
                     other_bytes += tn_bytes + stack_bytes;
                 }
@@ -1888,7 +2026,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 cin.lookahead = params.moe_stream_lookahead;
                 int64_t corr_gpu = 0, corr_ram = 0;
                 for (const auto & [x, b] : llama_moe_correction_plan(cin)) {
-                    (x < (int) pimpl->dev_layer.size() && pimpl->dev_layer[x].dev != cpu_dev ? corr_gpu : corr_ram) += b;
+                    const bool x_gpu = x < (int) pimpl->dev_layer.size() && pimpl->dev_layer[x].dev != cpu_dev;
+                    (x_gpu ? corr_gpu : corr_ram) += b;
+                    if (x_gpu) {
+                        gpu_weight_dev[pimpl->dev_layer[x].dev] += b;
+                    }
                 }
                 gpu_weight_bytes += corr_gpu;
                 other_bytes      += corr_ram;
@@ -1998,8 +2140,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         // Only when the auto-fit decides - a --moe-stream-gpu-layers-list places the layers itself, and
         // this line then printed a plan nobody followed (the placement is printed after the context is built)
-        const bool gpu_list = params.moe_stream_gpu_layers_list && params.moe_stream_gpu_layers_list[0];
-        if (params.moe_stream_gpu_layers < 0 && !gpu_list && !devices.empty()) {
+        const bool gpu_list = !gl_list_eff.empty();
+        // the compute buffers' margin per token of the physical batch (the auto-fit's, and the whole-layer check's estimate)
+        static const double fit_mib_per_token = getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")
+            ? atof(getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")) : 0.5;
+        if (gpu_layers_n < 0 && !gpu_list && !devices.empty()) {
             size_t vram_free = 0;
             size_t vram_total = 0;
             ggml_backend_dev_memory(devices[0].dev, &vram_free, &vram_total);
@@ -2010,9 +2155,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // A constant margin therefore over-fills VRAM at a large -ub and cublasCreate fails there
             // (on the IQ4_XS file). So the margin grows with the physical batch: MOE_STREAM_FIT_MIB_PER_TOKEN
             // MiB per token on top of the user's reserve, 0 restores the constant.
-            static const double fit_mib_per_token = getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")
-                ? atof(getenv("MOE_STREAM_FIT_MIB_PER_TOKEN")) : 0.5;
-
             const int64_t ubatch_margin = (int64_t) (fit_mib_per_token*1024*1024) *
                 (int64_t) (params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512);
             const int64_t vram_reserve_total = params.moe_stream_vram_reserve + ubatch_margin;
@@ -2029,6 +2171,76 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     (double) ubatch_margin/1024.0/1024.0/1024.0, fit_mib_per_token,   // this argument was missing
                     (int) (params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512),
                     (double) vram_reserve/1024.0/1024.0/1024.0);
+        }
+
+        // An explicit list or count: what each GPU device holds besides the whole layers, for the engine's check before the weights
+        // load (the layers that do not fit stay streamed). Charged to each GPU device that holds layers: the other weights there, the
+        // KV cache and recurrent state of its layers, the compute buffers' estimate (the per-token margin above x -ub + the attention
+        // masks, F16 [KV cells x -ub]), the backend's cuBLAS handle + workspace (98 MiB measured on CUDA) and its op scratch pool (the
+        // engine's own size, ubatch x hidden size x 8 bytes). The VRAM pool's minimum and the growth go to the first GPU device (the
+        // pool's) in the engine, which knows the streamed layers. A device that reports no memory is not checked
+        std::vector<llama_moe_stream_p1::wl_dev> wl_devs;
+        std::vector<int32_t>                     wl_dev_of;
+        // (with more than one GPU the auto-fit's picks are checked per device too: it counts the first GPU only)
+        if ((gpu_list || gpu_layers_n > 0 || (gpu_layers_n < 0 && n_gpu_devs > 1)) && !devices.empty()) {
+            const int64_t ub = params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512;
+            const uint32_t n_seq_c   = std::max(1u, params.moe_stream_ctx_seq);
+            const uint32_t n_ctx_c   = GGML_PAD(params.moe_stream_ctx > 0 ? params.moe_stream_ctx : hparams.n_ctx_train, 256);
+            const uint32_t n_ctx_seq = (params.moe_stream_ctx_flags & 1) ? n_ctx_c : GGML_PAD(n_ctx_c/n_seq_c, 256);
+            const bool offload_kv = (params.moe_stream_ctx_flags & 4) != 0;
+            const int64_t kv_full = (int64_t) n_ctx_seq;
+            const int64_t kv_swa  = hparams.swa_type != LLAMA_SWA_TYPE_NONE ? std::min<int64_t>(kv_full,
+                    GGML_PAD((int64_t) hparams.n_swa*((params.moe_stream_ctx_flags & 1) ? n_seq_c : 1) + ub, 256)) : 0;
+            bool any_full = false, any_swa = false;
+            for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+                if (!hparams.is_recr(il) && hparams.has_kv(il)) {
+                    (hparams.swa_type != LLAMA_SWA_TYPE_NONE && hparams.is_swa(il) && !(params.moe_stream_ctx_flags & 2) ? any_swa : any_full) = true;
+                }
+            }
+            const int64_t compute = (int64_t) (fit_mib_per_token*1048576.0)*ub +
+                                    (any_full ? kv_full*ub*2 : 0) + (any_swa ? kv_swa*ub*2 : 0);
+            const int64_t prewarm = ((int64_t) 98 << 20) +
+                                    (params.moe_stream_vram_scratch >= 0 ? params.moe_stream_vram_scratch
+                                                                         : std::min<int64_t>(n_ctx_c, ub)*(int64_t) hparams.n_embd*8);
+            wl_dev_of.assign(n_layer_all, -1);
+            const bool pool_on = params.moe_stream_vram_experts > 0 || params.moe_stream_vram_free > 0;
+            for (const auto & dv : devices) {
+                const auto t = ggml_backend_dev_type(dv.dev);
+                if (t != GGML_BACKEND_DEVICE_TYPE_GPU && t != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    continue;
+                }
+                size_t f = 0, tot = 0;
+                ggml_backend_dev_memory(dv.dev, &f, &tot);
+                if (f == 0 && tot == 0) {
+                    continue;
+                }
+                llama_moe_stream_p1::wl_dev w;
+                w.name    = ggml_backend_dev_name(dv.dev);
+                w.free    = (int64_t) f;
+                w.weights = gpu_weight_dev.count(dv.dev) ? gpu_weight_dev.at(dv.dev) : 0;
+                w.pool    = dv.dev == ms_pool_dev;   // (the first GPU unless --moe-stream-vram-device names another)
+                // a device that runs a layer, holds a whole layer's experts (--moe-stream-gpu-layers-device: maybe not its layer's device)
+                // or holds the VRAM pool (its device pass and the prompt matmuls) gets the compute and cuBLAS terms
+                bool has_layer = w.pool && pool_on;
+                for (int il = 0; il < n_layer_all; il++) {
+                    const bool here = il < (int) pimpl->dev_layer.size() && pimpl->dev_layer[il].dev == dv.dev;
+                    if (here) {
+                        has_layer = true;
+                        if (offload_kv) {
+                            w.ctx += llama_moe_stream_layer_ctx_bytes(hparams, arch, (uint32_t) il, params);
+                        }
+                    }
+                    if (whole_dev_flag[il] != nullptr ? whole_dev_flag[il] == dv.dev : here) {
+                        wl_dev_of[il] = (int32_t) wl_devs.size();
+                        has_layer = true;
+                    }
+                }
+                if (has_layer) {
+                    w.compute = compute;
+                    w.prewarm = prewarm;
+                }
+                wl_devs.push_back(w);
+            }
         }
 
         // A split GGUF is several files (llama.cpp loads them all); the sidecar recorded the sum
@@ -2119,7 +2331,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             p1.correction_base     = cref.base;
             p1.correction_size     = cref.size;
         }
-        p1.idle_load           = params.moe_stream_idle_load == 1;
+        p1.idle_load           = params.moe_stream_idle_load >= 1;
+        p1.fill_start          = params.moe_stream_idle_load == 2;
         p1.usage_file          = params.moe_stream_usage_file ? params.moe_stream_usage_file : "";
         p1.idle_pause_ms       = params.moe_stream_idle_pause_ms > 0 ? params.moe_stream_idle_pause_ms : 500;
         p1.read_ahead          = params.moe_stream_read_ahead == 1;
@@ -2175,6 +2388,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_lend_short      = std::max(1, params.moe_stream_vram_lend_short);
         p1.timing               = params.moe_stream_timing == 1;
         p1.nonpool              = params.moe_stream_nonpool != nullptr;
+        p1.wl_devs              = std::move(wl_devs);
+        p1.wl_dev_of            = std::move(wl_dev_of);
+        p1.wl_ubatch            = params.moe_stream_ubatch > 0 ? params.moe_stream_ubatch : 512;
+        p1.wl_by_device         = wl_spec;
         pimpl->moe_stream = std::make_unique<llama_moe_stream>(
                 params.moe_stream,
                 params.moe_stream_log ? params.moe_stream_log : "",
@@ -2192,9 +2409,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 params.moe_stream_chunk > 0 ? (uint32_t) params.moe_stream_chunk : 0,
                 params.moe_stream_chunk_prefetch > 0 ? (uint32_t) params.moe_stream_chunk_prefetch : 0,
                 params.moe_stream_gpu_waves > 0 ? (uint32_t) params.moe_stream_gpu_waves : 0,
-                params.moe_stream_gpu_layers > 0 ? (uint32_t) params.moe_stream_gpu_layers : 0,
-                params.moe_stream_gpu_layers_list ? params.moe_stream_gpu_layers_list : "",
-                /* gpu_layers_auto = */ params.moe_stream_gpu_layers < 0,
+                gpu_layers_n > 0 ? (uint32_t) gpu_layers_n : 0,
+                gl_list_eff,
+                /* gpu_layers_auto = */ gpu_layers_n < 0,
                 vram_reserve,
                 params.moe_stream_gpu_layers_mode ? params.moe_stream_gpu_layers_mode : "hot",
                 llama_moe_stream_start_ram_free(params.moe_stream_elastic, params.moe_stream_slots, params.moe_stream_ram_free,
@@ -2220,6 +2437,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 params.moe_stream_record ? params.moe_stream_record : "",
                 params.moe_stream_record_words,
                 p1);
+        {   // the GPUs of the pool and of the whole layers' experts (set before the weights are created: create_tensor reads whole_dev)
+            auto & ms = *pimpl->moe_stream;
+            ms.pool_dev     = ms_pool_dev;
+            ms.pool_dev_set = ms_pool_dev_set;
+            ms.whole_dev.assign(n_layer_all, nullptr);
+            for (const int32_t il : ms.gpu_layers) {
+                if (il >= 0 && il < n_layer_all) {
+                    ms.whole_dev[il] = whole_dev_flag[il] != nullptr ? whole_dev_flag[il] : pimpl->dev_layer[il].dev;
+                }
+            }
+            // MOE_STREAM_TEST_WHOLE_OTHER_CARD=L1,L2,.. (test only): these whole layers count as being on another GPU for the choice of the
+            // layer a reload gives up (their weights stay where they are)
+            if (const char * e = getenv("MOE_STREAM_TEST_WHOLE_OTHER_CARD")) {
+                for (const std::string & item : split_by(e, ',')) {
+                    const int il = atoi(item.c_str());
+                    if (!item.empty() && il >= 0 && il < n_layer_all && ms.whole_dev[il] != nullptr) {
+                        ms.whole_test_other.resize(n_layer_all, 0);
+                        ms.whole_test_other[il] = 1;
+                        fprintf(stderr, "%s: MOE_STREAM_TEST_WHOLE_OTHER_CARD (TEST ONLY): whole layer %d counts as being on another GPU\n", __func__, il);
+                    }
+                }
+            }
+            if (ms_pool_dev_set || wl_spec) {
+                std::string wl;
+                for (const int32_t il : ms.gpu_layers_pick) {
+                    wl += format("%s%d: %s", wl.empty() ? "" : ", ", il, ggml_backend_dev_name(ms.whole_dev[il]));
+                }
+                fprintf(stderr, "%s: devices: the VRAM pool and the prompt matmuls of the RAM pools on %s%s; whole MoE layers' experts: %s\n", __func__,
+                        ms_pool_dev ? ggml_backend_dev_name(ms_pool_dev) : "no GPU", ms_pool_dev_set ? " (--moe-stream-vram-device)" : " (the first GPU)",
+                        wl.empty() ? "none" : wl.c_str());
+            }
+        }
         if (params.moe_stream_nonpool) {
             auto & ms    = *pimpl->moe_stream;
             ms.np_key     = params.moe_stream_nonpool->key;
@@ -2497,6 +2746,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + range.first, range.last - range.first, max_size);
                     if (buf == nullptr) {
                         llama_model_alloc_host = ggml_backend_buft_is_host(buft);
+                        llama_model_alloc_drop = pimpl->moe_stream ? pimpl->moe_stream->whole_layer_to_drop(ggml_backend_buft_get_device(buft)) : -2;
                         throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                     }
                     bufs.emplace_back(buf);
@@ -2514,6 +2764,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (buf == nullptr) {
                 llama_model_alloc_host = ggml_backend_buft_is_host(buft);   // a host buffer's failure is not helped by fewer GPU layers
+                llama_model_alloc_drop = pimpl->moe_stream ? pimpl->moe_stream->whole_layer_to_drop(ggml_backend_buft_get_device(buft)) : -2;
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
             // lock the buffers that hold the tensors: a multi_buffer has no base, and its parts are pageable memory when pinning fails
@@ -2600,7 +2851,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (pimpl->moe_stream) {
-        if (params.moe_stream_needed_early == 1) {
+        // The GPU that runs each layer's router (null: the CPU), for needed-early's marks and the GPU guess's per-device rules
+        {
             // A streamed layer L hands its 1-ahead guess to the helper only if the guess runs in
             // a GPU split. The guess is L+1's router matmul (build_moe_ffn's "pred" probs), which the scheduler places with its
             // weight, so the rule is where L+1's ffn_gate_inp landed (that also follows -ngl and any -ot override of the router).
@@ -2630,8 +2882,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     }
                 }
             }
-            pimpl->moe_stream->ne_set_router_gpu(router_gpu);
-            pimpl->moe_stream->ne_gpu_setup(router_dev);   // the GPU producers, or the host producer stays
+            // MOE_STREAM_TEST_ROUTER_OTHER_CARD=L1,L2,.. (test only): these layers' routers count as running on another GPU than every
+            // other layer's (as with a layer on a second card), so the per-layer fallbacks of the marks can be seen on one GPU
+            if (const char * e = getenv("MOE_STREAM_TEST_ROUTER_OTHER_CARD")) {
+                std::string said;
+                ggml_backend_dev_t other = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);   // (a device that is none of the GPUs)
+                for (const char * c = e; *c != '\0'; ) {
+                    char * end = nullptr;
+                    const long il = strtol(c, &end, 10);
+                    if (end == c) {
+                        break;
+                    }
+                    if (il >= 0 && (size_t) il < router_dev.size() && router_dev[(size_t) il] != nullptr) {
+                        router_dev[(size_t) il] = other;
+                        said += format("%s%ld", said.empty() ? "" : ",", il);
+                    }
+                    c = *end == ',' ? end + 1 : end;
+                }
+                fprintf(stderr, "%s: MOE_STREAM_TEST_ROUTER_OTHER_CARD (TEST ONLY): the routers of layers %s count as running on another GPU\n",
+                        __func__, said.empty() ? "none" : said.c_str());
+            }
+            pimpl->moe_stream->router_dev_all = router_dev;
+            if (params.moe_stream_needed_early == 1) {
+                pimpl->moe_stream->ne_set_router_gpu(router_gpu);
+                pimpl->moe_stream->ne_gpu_setup(router_dev);   // the GPU producers, or the host producer stays
+            }
         }
         pimpl->moe_stream->ws_test_check();   // a test switch that would change nothing stops the run
         // --moe-stream-guess-combined 1: the combined guess step's stacked inputs per streamed layer - the gains
@@ -2806,6 +3081,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+
+    // --moe-stream-gpu-layers-device: a whole MoE layer's routed experts on the GPU it names, the rest of the layer where its layer is
+    // (an -ot override of the tensor still wins, in the loader)
+    if (pimpl->moe_stream && tn.bid >= 0 && (size_t) tn.bid < pimpl->moe_stream->whole_dev.size() && tn.suffix != nullptr &&
+            strcmp(tn.suffix, "weight") == 0) {
+        ggml_backend_dev_t wd = pimpl->moe_stream->whole_dev[(size_t) tn.bid];
+        if (wd != nullptr && wd != pimpl->dev_layer.at(tn.bid).dev && pimpl->gpu_buft_list.count(wd) > 0 &&
+                llama_moe_stream_is_exps(tn.str()) && !pimpl->moe_stream->has_layer(tn.bid)) {
+            buft_list_layer = &pimpl->gpu_buft_list.at(wd);
+        }
+    }
 
     // a streamed layer has no exps tensors in the model file: the pool of expert slots takes their
     // place, and the loader is told to skip them so that the size accounting adds up
@@ -4116,6 +4402,12 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_early_order     =*/ 0,   // the graph is ordered as it was
         /*.moe_stream_overlap          =*/ 0,   // off until measured to win and stay bit-identical
         /*.moe_stream_ubatch           =*/ 512, // the -ub the VRAM reserve is sized for
+        /*.moe_stream_ctx              =*/ 0,   // the training context
+        /*.moe_stream_ctx_seq          =*/ 1,
+        /*.moe_stream_ctx_type_k       =*/ GGML_TYPE_F16,
+        /*.moe_stream_ctx_type_v       =*/ GGML_TYPE_F16,
+        /*.moe_stream_ctx_rs_seq       =*/ 0,
+        /*.moe_stream_ctx_flags        =*/ 4,   // the KV cache on the layers' devices
         /*.moe_stream_ram              =*/ 0,
         /*.moe_stream_plan_only        =*/ 0,
         /*.moe_stream_oracle           =*/ nullptr,
@@ -4218,6 +4510,8 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_vram_lend_prompt =*/ 0,      // off (the prompt's GPU tensors in the compute buffer)
         /*.moe_stream_vram_lend_short  =*/ 64,     // prompt calls of <= 64 tokens in the real compute buffer
         /*.moe_stream_timing           =*/ 0,      // no timing work
+        /*.moe_stream_vram_device      =*/ nullptr, // the first GPU holds the VRAM pool
+        /*.moe_stream_gpu_layers_device =*/ nullptr, // whole layers' experts on their layer's own device
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

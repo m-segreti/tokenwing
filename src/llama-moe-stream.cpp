@@ -317,15 +317,22 @@ static int64_t os_proc_rss() {
 }
 
 // The OS layer: the process's own memory cap. The RAM plan must fit under it as well as under MemAvailable - keep-free: a
-// cgroup that kills the process at memory.max does not care how much the machine has free (the CPU-only command's cap is MemAvailable - 256 MiB
-// at start, with swap off). Linux = cgroup v2: the tightest memory.max - memory.current over the process's cgroup and every ancestor.
+// cgroup that kills the process at its limit does not care how much the machine has free (the CPU-only command's cap is MemAvailable - 256 MiB
+// at start, with swap off). Linux: the tightest limit - use over the process's cgroup and every ancestor up to the mount point, in the hierarchy
+// that holds the memory controller - cgroup v2 (memory.max, memory.current, memory.peak) or v1 (memory.limit_in_bytes, memory.usage_in_bytes,
+// memory.max_usage_in_bytes; Docker on a v1 host). The use leaves out the file cache the kernel can drop without swap (os_cg_freeable): a
+// model another program read earlier stays in the cgroup's cache, counted in its use, and the kernel frees it before it kills anything.
 // Windows = the job object's process / job memory limit minus its use (to do, stub = no cap); macOS has no such limit (stub = no cap).
 struct os_mem_cap {
     bool        has = false;
-    int64_t     max = 0, cur = 0, peak = -1;   // the tightest level: memory.max, memory.current, memory.peak (-1 = not offered)
+    int64_t     max = 0, cur = 0, peak = -1;   // the tightest level: its limit, its use, its peak use (-1 = not offered)
+    int64_t     cache = 0;                     // the free-able file cache left out of `cur` by the full rule (0 when memory.stat lacks its keys)
     std::string path;
+    std::string max_file = "memory.max";       // the file the limit came from (v1: memory.limit_in_bytes or hierarchical_memory_limit)
     int64_t room() const { return has ? max - cur : INT64_MAX; }
 };
+// below this much free-able file cache the logs do not mention it (a few MiB of headers and libraries read by any start-up)
+static const int64_t OS_CG_CACHE_SHOWN = (int64_t) 16 << 20;
 #if defined(__linux__)
 static int64_t os_cg_read(const std::string & f) {
     FILE * fp = fopen(f.c_str(), "r");
@@ -337,51 +344,224 @@ static int64_t os_cg_read(const std::string & f) {
     fclose(fp);
     return ok && b[0] >= '0' && b[0] <= '9' ? (int64_t) strtoll(b, nullptr, 10) : -1;   // "max" and unreadable files are -1
 }
+// every "key value" line of a memory.stat file (empty when it cannot be read)
+static std::map<std::string, int64_t> os_cg_stat_all(const std::string & f) {
+    std::map<std::string, int64_t> got;
+    FILE * st = fopen(f.c_str(), "r");
+    if (!st) {
+        return got;
+    }
+    char b[128];
+    while (fgets(b, sizeof(b), st)) {
+        const char * sp = strchr(b, ' ');
+        if (sp) {
+            got[std::string((const char *) b, sp)] = (int64_t) strtoll(sp + 1, nullptr, 10);
+        }
+    }
+    fclose(st);
+    return got;
+}
+// the value of the first of `keys` found in a memory.stat file (in the order given), -1 when none is there
+static int64_t os_cg_stat(const std::string & f, std::initializer_list<const char *> keys) {
+    const std::map<std::string, int64_t> got = os_cg_stat_all(f);
+    for (const char * k : keys) {
+        const auto it = got.find(k);
+        if (it != got.end()) {
+            return it->second;
+        }
+    }
+    return -1;
+}
+// The file cache in a cgroup's use that the kernel can drop without swap, from its memory.stat (v2 keys, or v1's hierarchical total_ keys,
+// else v1's own-level keys): the pages on the file lists (active_file + inactive_file) less the file pages mapped into some process
+// (file_mapped / mapped_file: a model a running program has mmapped, or our own weights without the direct-read load) and less the dirty and
+// under-writeback ones (freed only after a write to disk); never below 0. tmpfs / shm pages are on the anon lists, so they are not in the
+// file lists and stay counted as use. Mapped tmpfs pages are in the mapped count too, so they come off a second time: on the safe side.
+// Without the active / mapped keys only the inactive file pages are left out (*full = false), as before. -1 = not even those.
+static int64_t os_cg_freeable(const std::string & f, bool v1, bool * full) {
+    const std::map<std::string, int64_t> st = os_cg_stat_all(f);
+    const bool tot = v1 && st.count("total_inactive_file");
+    const auto key = [&](const char * k) {
+        const auto it = st.find(tot ? std::string("total_") + k : std::string(k));
+        return it == st.end() ? (int64_t) -1 : it->second;
+    };
+    *full = false;
+    const int64_t inact = key("inactive_file");
+    if (inact < 0) {
+        return -1;
+    }
+    const int64_t act = key("active_file"), mapped = key(v1 ? "mapped_file" : "file_mapped");
+    if (act < 0 || mapped < 0) {
+        return inact;
+    }
+    const int64_t dirty = key(v1 ? "dirty" : "file_dirty"), wb = key(v1 ? "writeback" : "file_writeback");
+    *full = true;
+    return std::max<int64_t>(0, inact + act - mapped - std::max<int64_t>(0, dirty) - std::max<int64_t>(0, wb));
+}
+// MOE_STREAM_TEST_CGROUP_ROOT=<dir> (test only, read once): /proc/self/cgroup, /proc/self/mountinfo and the cgroup directories are read under
+// this directory, so the reader can be run against made-up trees
+static const std::string & os_cg_root() {
+    static const std::string r = getenv("MOE_STREAM_TEST_CGROUP_ROOT") ? getenv("MOE_STREAM_TEST_CGROUP_ROOT") : "";
+    return r;
+}
+// a comma-separated list holds the word w
+static bool os_cg_has_word(const std::string & list, const char * w) {
+    size_t i = 0;
+    while (i <= list.size()) {
+        size_t j = list.find(',', i);
+        j = j == std::string::npos ? list.size() : j;
+        if (list.compare(i, j - i, w) == 0) {
+            return true;
+        }
+        i = j + 1;
+    }
+    return false;
+}
 static os_mem_cap os_mem_cap_get() {
     os_mem_cap r;
-    FILE * f = fopen("/proc/self/cgroup", "r");
+    const std::string & root = os_cg_root();
+    FILE * f = fopen((root + "/proc/self/cgroup").c_str(), "r");
     if (!f) {
         return r;
     }
+    // "id:controllers:path" per hierarchy: the memory controller on a v1 hierarchy wins over the v2 line ("0::path"), since a controller is
+    // in one hierarchy only (a hybrid host keeps a cgroup2 mount without the memory controller)
     char line[1024];
-    std::string rel;
+    std::string rel, rel_v2;
+    bool v1 = false, got_v2 = false;
     while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\n")] = 0;
+        const char * c1 = strchr(line, ':');
+        const char * c2 = c1 ? strchr(c1 + 1, ':') : nullptr;
+        if (!c2) {
+            continue;
+        }
+        const std::string ctl(c1 + 1, c2);
         if (strncmp(line, "0::", 3) == 0) {
-            line[strcspn(line, "\n")] = 0;
-            rel = line + 3;
-            break;
+            rel_v2 = c2 + 1;
+            got_v2 = true;
+        } else if (!v1 && os_cg_has_word(ctl, "memory")) {
+            rel = c2 + 1;
+            v1  = true;
         }
     }
     fclose(f);
-    // every level from the process's cgroup up to and INCLUDING the mount root (a container's own limit sits in its namespace root)
+    if (!v1) {
+        if (!got_v2) {
+            return r;
+        }
+        rel = rel_v2;
+    }
+    // where that hierarchy is mounted (mountinfo: "id parent maj:min root mount-point options ... - fstype source super-options"); the
+    // mount's root is the part of the cgroup path that is above the mount point (a container's own cgroup is its mount root)
+    std::string mnt = v1 ? "/sys/fs/cgroup/memory" : "/sys/fs/cgroup";   // when mountinfo says nothing
+    std::string mnt_root = "/";
+    const auto under = [&](const std::string & mr) {
+        return mr == "/" || rel == mr || (rel.compare(0, mr.size(), mr) == 0 && rel.size() > mr.size() && rel[mr.size()] == '/');
+    };
+    bool found = false, found_under = false;
+    FILE * mi = fopen((root + "/proc/self/mountinfo").c_str(), "r");
+    if (mi) {
+        char * ml = nullptr;   // (getline: an overlay mount's line can be longer than any fixed buffer)
+        size_t ml_cap = 0;
+        while (getline(&ml, &ml_cap, mi) > 0) {
+            ml[strcspn(ml, "\n")] = 0;
+            std::vector<std::string> w;
+            char * save = nullptr;
+            for (char * t = strtok_r(ml, " ", &save); t; t = strtok_r(nullptr, " ", &save)) {
+                w.emplace_back(t);
+            }
+            size_t dash = 5;
+            while (dash < w.size() && w[dash] != "-") {
+                dash++;
+            }
+            if (dash + 1 >= w.size()) {
+                continue;
+            }
+            const std::string & fstype = w[dash + 1];
+            const bool match = v1 ? fstype == "cgroup" && dash + 3 < w.size() && os_cg_has_word(w[dash + 3], "memory") : fstype == "cgroup2";
+            if (!match) {
+                continue;
+            }
+            // the mount whose root holds the process's cgroup (the deepest when several do); else the first one, read at its mount point only
+            const bool u = under(w[3]);
+            if (!found || (u && (!found_under || w[3].size() > mnt_root.size()))) {
+                mnt = w[4]; mnt_root = w[3]; found = true; found_under = u;
+            }
+        }
+        free(ml);
+        fclose(mi);
+    }
+    // the cgroup path below the mount point (all of it under a "/" root; nothing when the mount's root is not above it)
+    if (mnt_root != "/") {
+        rel = found_under ? rel.substr(mnt_root.size()) : "";
+    }
+    const std::string base = root + mnt;
+    // every level from the process's cgroup up to and INCLUDING the mount point (a container's own limit sits in its namespace root)
     std::vector<std::string> dirs;
     while (!rel.empty() && rel != "/") {
-        dirs.push_back(std::string("/sys/fs/cgroup") + rel);
+        dirs.push_back(base + rel);
         const size_t sl = rel.rfind('/');
         rel = sl == std::string::npos || sl == 0 ? "" : rel.substr(0, sl);
     }
-    dirs.push_back("/sys/fs/cgroup");
-    for (const std::string & d : dirs) {
-        const int64_t mx = os_cg_read(d + "/memory.max");
-        int64_t cu = os_cg_read(d + "/memory.current");
-        if (mx > 0 && cu >= 0) {
-            // memory.current counts clean file cache the kernel drops before it kills anything: not "in use" (a persistent cgroup that read the
-            // model before would otherwise look full)
-            FILE * st = fopen((d + "/memory.stat").c_str(), "r");
-            if (st) {
-                char b[128];
-                while (fgets(b, sizeof(b), st)) {
-                    if (strncmp(b, "inactive_file ", 14) == 0) {
-                        cu = std::max<int64_t>(0, cu - (int64_t) strtoll(b + 14, nullptr, 10));
-                        break;
-                    }
-                }
-                fclose(st);
+    dirs.push_back(base);
+    const auto take = [&](const std::string & d, int64_t mx, int64_t cu, int64_t pk, int64_t ca, const char * file) {
+        if (mx > 0 && cu >= 0 && (!r.has || mx - cu < r.max - r.cur)) {
+            r.has = true; r.max = mx; r.cur = cu; r.peak = pk; r.cache = ca; r.path = d; r.max_file = file;
+        }
+    };
+    // a level's use without the file cache the kernel can drop (*ca = what the full rule left out, else 0)
+    const auto use_of = [&](const std::string & d, int64_t cu, int64_t * ca) {
+        *ca = 0;
+        if (cu < 0) {
+            return cu;
+        }
+        bool full = false;
+        const int64_t fr = os_cg_freeable(d + "/memory.stat", v1, &full);
+        if (fr < 0) {
+            return cu;
+        }
+        const int64_t left = std::max<int64_t>(0, cu - fr);
+        if (full) {
+            *ca = cu - left;
+        }
+        return left;
+    };
+    if (!v1) {
+        for (const std::string & d : dirs) {
+            const int64_t mx = os_cg_read(d + "/memory.max");
+            int64_t cu = os_cg_read(d + "/memory.current"), ca = 0;
+            if (mx > 0 && cu >= 0) {
+                cu = use_of(d, cu, &ca);
+            }
+            if (mx > 0 && cu >= 0 && (!r.has || mx - cu < r.max - r.cur)) {
+                take(d, mx, cu, os_cg_read(d + "/memory.peak"), ca, "memory.max");   // (the peak read only for the level taken)
             }
         }
-        if (mx > 0 && cu >= 0 && (!r.has || mx - cu < r.max - r.cur)) {
-            r.has = true; r.max = mx; r.cur = cu; r.peak = os_cg_read(d + "/memory.peak"); r.path = d;
+        return r;
+    }
+    // v1: a limit of 2^62 or more is "no limit" (the kernel shows 9223372036854771712); memory.usage_in_bytes less the free-able file cache
+    const int64_t V1_NO_LIMIT = (int64_t) 1 << 62;
+    int64_t min_limit = INT64_MAX, leaf_cur = -1, leaf_peak = -1, leaf_cache = 0;
+    for (size_t i = 0; i < dirs.size(); i++) {
+        const std::string & d = dirs[i];
+        const int64_t mx = os_cg_read(d + "/memory.limit_in_bytes");
+        int64_t ca = 0;
+        const int64_t cu = use_of(d, os_cg_read(d + "/memory.usage_in_bytes"), &ca);
+        const int64_t pk = os_cg_read(d + "/memory.max_usage_in_bytes");
+        if (i == 0) {
+            leaf_cur = cu; leaf_peak = pk; leaf_cache = ca;
         }
+        if (mx > 0 && mx < V1_NO_LIMIT) {
+            min_limit = std::min(min_limit, mx);
+            take(d, mx, cu, pk, ca, "memory.limit_in_bytes");
+        }
+    }
+    // the leaf's hierarchical_memory_limit = the tightest limit on the whole path, also above the mount point (not visible here): taken
+    // when it is lower than every limit seen, with the leaf's use
+    const int64_t hml = os_cg_stat(dirs[0] + "/memory.stat", { "hierarchical_memory_limit" });
+    if (hml > 0 && hml < V1_NO_LIMIT && hml < min_limit) {
+        take(dirs[0], hml, leaf_cur, leaf_peak, leaf_cache, "hierarchical_memory_limit");
     }
     return r;
 }
@@ -1774,6 +1954,7 @@ llama_moe_stream::llama_moe_stream(
     // per-layer sidecar blocks. The MTP/nextn blocks are in the sidecar but are not part of the
     // decode graph, so they get no pool: without speculative decoding they are never computed.
     const int32_t nextn_base = (int32_t) (mi.n_layer_all - mi.n_layer_nextn);
+    pl_il_crop = nextn_base - 1;
 
     // A split GGUF is several files, and a sidecar of one has to say which file each tensor
     // is in before the read-back check can compare anything against the model
@@ -2075,6 +2256,112 @@ llama_moe_stream::llama_moe_stream(
             }
         }
 
+        // An explicit list or count is checked against the free VRAM before the weights load. Per GPU device, the whole layers there
+        // must fit next to what the model load counted (the other weights, the KV cache and recurrent state, the compute buffers'
+        // estimate, the cuBLAS workspace and op scratch) and, on the VRAM pool's device, the pool's minimum (its zero slices + one
+        // place per streamed layer, and the tail its GPU-wave graphs copy into: the largest RAM pool view + the zero slices, one copy set)
+        // and the growth after the pool's check. Layers that do not fit are dropped from the end of the list (the count: the last
+        // picked) and stay streamed - their experts get RAM slots from the plan below. Without a drop: no line
+        // (the auto-fit counts the first GPU only; with more than one GPU the per-device check then drops what the placement contradicts)
+        if ((!gpu_layers_list_in.empty() || !gpu_layers_auto || p1.wl_devs.size() > 1) && !sel.empty() && !p1.wl_devs.empty() &&
+                p1.wl_dev_of.size() >= n_layer_in) {
+            static const bool wl_say = getenv("MOE_STREAM_TEST_WL_SAY") && atoi(getenv("MOE_STREAM_TEST_WL_SAY")) != 0;
+            const auto & D = p1.wl_devs;
+            const bool pool = p1.vram_experts > 0 || p1.vram_free > 0;
+            // the pool's tail (vx_setup's rules: the auto pool with the follower, GPU waves, one GPU, no repacked or moving pools)
+            const bool tail = p1.vram_free > 0 && p1.vram_follow && gpu_waves > 0 && p1.wl_ubatch >= (int64_t) gpu_waves && D.size() == 1 &&
+                              !cpu_repack && !p1.elastic && !p1.shares;
+            std::vector<int32_t> keep = sel, dropped;
+            std::vector<int64_t> wl(D.size()), other(D.size());
+            int64_t pool_min = 0, growth = 0, tail_b = 0, tail_n = 0;
+            for (;;) {
+                int64_t one_place = 0, largest = 0;
+                int32_t n_str = 0;
+                std::map<int64_t, int32_t> n_of_size;   // the tail's places are the most common expert size
+                for (uint32_t il = 0; il < n_layer_in; il++) {
+                    if (have[il] && std::find(keep.begin(), keep.end(), (int32_t) il) == keep.end()) {
+                        one_place += (int64_t) blocks[il].block_bytes;
+                        largest    = std::max<int64_t>(largest, (int64_t) blocks[il].block_bytes);
+                        n_of_size[(int64_t) blocks[il].block_bytes]++;
+                        n_str++;
+                    }
+                }
+                tail_b = tail_n = 0;
+                if (tail && n_str > 0 && one_place > 0) {
+                    // the RAM slots per layer as the plan below would size them (without a process memory cap: an upper bound)
+                    int64_t slots = n_slots > 0 ? (int64_t) n_slots
+                                  : std::max<int64_t>(0, std::min<int64_t>(ram_budget > 0 ? ram_budget : INT64_MAX,
+                                                                           mem_available - std::max<int64_t>(0, ram_free) - other_bytes))/one_place;
+                    slots = std::max<int64_t>(3*(int64_t) mi.n_expert_used, std::min<int64_t>(slots, n_expert));
+                    const int64_t rows = std::min<int64_t>(n_expert, p1.wl_ubatch*(int64_t) mi.n_expert_used);
+                    if (rows > slots || (p1.copy_ahead > 0 && slots >= (int64_t) n_expert)) {   // (a GPU-wave graph can run)
+                        int64_t mode_b = 0;
+                        int32_t mode_n = 0;
+                        for (const auto & [b, c] : n_of_size) {
+                            if (c > mode_n) { mode_b = b; mode_n = c; }
+                        }
+                        tail_n = slots + (int64_t) mi.n_expert_used;
+                        tail_b = tail_n*mode_b;
+                    }
+                }
+                pool_min = pool && n_str > 0 ? one_place + (int64_t) mi.n_expert_used*largest + tail_b : 0;
+                // (vx_growth_bytes' derived terms: kernel modules + one CUDA-graph instance per streamed layer)
+                growth   = p1.vram_growth > 0 ? p1.vram_growth : ((int64_t) 20 << 20) + (int64_t) n_str*1572864;
+                std::fill(wl.begin(), wl.end(), 0);
+                for (const int32_t il : keep) {
+                    if (p1.wl_dev_of[il] >= 0) {
+                        wl[p1.wl_dev_of[il]] += (int64_t) n_expert*(int64_t) blocks[il].block_bytes;
+                    }
+                }
+                std::vector<uint8_t> short_dev(D.size(), 0);
+                bool any_short = false;
+                for (size_t d = 0; d < D.size(); d++) {
+                    other[d] = D[d].weights + D[d].ctx + D[d].compute + D[d].prewarm + (D[d].pool ? pool_min + growth : 0);
+                    short_dev[d] = wl[d] > 0 && other[d] + wl[d] > D[d].free ? 1 : 0;
+                    any_short = any_short || short_dev[d];
+                }
+                if (!any_short) {
+                    break;
+                }
+                for (size_t i = keep.size(); i-- > 0; ) {
+                    const int32_t d = p1.wl_dev_of[keep[i]];
+                    if (d >= 0 && short_dev[d]) {
+                        dropped.push_back(keep[i]);
+                        keep.erase(keep.begin() + i);
+                        break;
+                    }
+                }
+            }
+            if (!dropped.empty() || wl_say) {
+                const double M = 1048576.0;
+                std::string ld, lk, per;
+                for (const int32_t il : dropped) {
+                    ld += format("%s%d", ld.empty() ? "" : ",", il);
+                }
+                for (const int32_t il : keep) {
+                    lk += format("%s%d", lk.empty() ? "" : ",", il);
+                }
+                for (size_t d = 0; d < D.size(); d++) {
+                    per += format("%s%s: free %.0f MiB - weights %.0f - context %.0f (KV cache + recurrent state) - compute ~%.0f - cuBLAS + "
+                            "scratch %.0f%s = %.0f MiB for whole layers, %.0f used",
+                            per.empty() ? "" : "; ", D[d].name.c_str(), D[d].free/M, D[d].weights/M, D[d].ctx/M, D[d].compute/M, D[d].prewarm/M,
+                            D[d].pool ? format(" - VRAM pool minimum %.0f%s - growth %.0f", pool_min/M,
+                                    tail_n > 0 ? format(" (with its tail of %lld places, %.0f)", (long long) tail_n, tail_b/M).c_str() : "",
+                                    growth/M).c_str() : "",
+                            (D[d].free - other[d])/M, wl[d]/M);
+                }
+                fprintf(stderr, "%s: whole MoE layers and the free VRAM (%s): %s; %s\n", __func__,
+                        p1.wl_by_device ? "--moe-stream-gpu-layers-device" : !gpu_layers_list_in.empty() ? "--moe-stream-gpu-layers-list" :
+                        gpu_layers_auto ? "--moe-stream-gpu-layers -1, checked per GPU" : "--moe-stream-gpu-layers",
+                        dropped.empty() ? format("all fit (TEST ONLY: MOE_STREAM_TEST_WL_SAY), kept %s", lk.c_str()).c_str()
+                                        : format("layer(s) %s do not fit and are streamed instead (replies slower), kept %s",
+                                                 ld.c_str(), lk.empty() ? "none" : lk.c_str()).c_str(),
+                        per.c_str());
+            }
+            sel = keep;
+        }
+        gpu_layers_pick = sel;
+
         std::sort(sel.begin(), sel.end());
 
         for (const int32_t il : sel) {
@@ -2165,7 +2452,7 @@ llama_moe_stream::llama_moe_stream(
 
     size_t pool_bytes = 0;
 
-    // The process's own memory cap (cgroup v2: the tightest level up the tree); MOE_STREAM_TEST_NO_CAP=1 (test only) ignores it
+    // The process's own memory cap (cgroup v2 or v1: the tightest level up the tree); MOE_STREAM_TEST_NO_CAP=1 (test only) ignores it
     const os_mem_cap own_cap = (getenv("MOE_STREAM_TEST_NO_CAP") && atoi(getenv("MOE_STREAM_TEST_NO_CAP")) != 0) ? os_mem_cap() : os_mem_cap_get();
     const double pt_frac = os_page_table_fraction();
     // what the cap allows for pools + other_bytes together: (room - margin)/(1 + page tables); -1 = no cap
@@ -2173,8 +2460,10 @@ llama_moe_stream::llama_moe_stream(
     if (n_streamed > 0 && mem_available > 0) {
         fprintf(stderr, "%s: RAM limit: MemAvailable %lld MiB - keep-free %lld MiB = %lld MiB; %s; decided by: %s\n", __func__,
                 (long long) (mem_available >> 20), (long long) (ram_free >> 20), (long long) (((int64_t) mem_available - ram_free) >> 20),
-                own_cap.has ? format("process cap '%s' memory.max %lld MiB - in use %lld MiB = room %lld MiB, less the %lld MiB margin and %.3f %% page tables = %lld MiB",
-                        own_cap.path.c_str(), (long long) (own_cap.max >> 20), (long long) (own_cap.cur >> 20), (long long) (own_cap.room() >> 20),
+                own_cap.has ? format("process cap '%s' %s %lld MiB - in use %lld MiB%s = room %lld MiB, less the %lld MiB margin and %.3f %% page tables = %lld MiB",
+                        own_cap.path.c_str(), own_cap.max_file.c_str(), (long long) (own_cap.max >> 20), (long long) (own_cap.cur >> 20),
+                        own_cap.cache >= OS_CG_CACHE_SHOWN ? format(" (not counted: %lld MiB of file cache the kernel can free)", (long long) (own_cap.cache >> 20)).c_str() : "",
+                        (long long) (own_cap.room() >> 20),
                         (long long) (MOE_STREAM_CAP_MARGIN >> 20), 100.0*pt_frac, (long long) (zero_cap_room >> 20)).c_str()
                             : "no process memory cap",
                 own_cap.has && zero_cap_room < (int64_t) mem_available - ram_free ? "the process cap" : "MemAvailable");
@@ -4516,6 +4805,9 @@ void llama_moe_stream::verify_slot(llama_moe_stream_layer & sl, int32_t slot, in
     bytes_verify += (int64_t) n;
     n_verify     += 1;
     t_verify_us  += ggml_time_us() - t0;
+    if ((size_t) sl.il < verify_checked.size()) {
+        verify_checked[sl.il] = 1;   // the fill at start keeps this layer's claim even if the slot is dropped later
+    }
 
     if (!err.empty()) {
         n_verify_bad += 1;
@@ -5110,6 +5402,9 @@ void llama_moe_stream::io_loop_t(int ith) {
             if (sl.slot_pending[job.slot] == 0) {
                 if (job.idle) {
                     n_idle_loading -= n_idle_loading > 0 ? 1 : 0;   // an idle read settled (landed, taken back or failed)
+                    if (!fs_verify_slot.empty()) {
+                        fs_verify_settled(sl, job.slot, ok && whole);   // (a whole good read goes READY below)
+                    }
                 }
                 if constexpr (BEHIND) {
                     if (bh_on) {
@@ -5574,7 +5869,9 @@ void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int3
 
         // The first demand read of a layer that the check has not covered yet carries it, and only
         // the first chunk of the slice (the rest of the slice is not in the slot yet)
-        if (!prefetch && !idle && (n_chunks == 1 || (by_proj && i == 0)) && verify && sl.il >= 0 && (size_t) sl.il < verify_done.size()) {   // an idle read can be taken back unread; a chunked read is not whole after its first chunk (the model file's check does not look at the slot, it rides on the first piece)
+        // An idle read can be taken back unread, so it carries the check only in the fill at start, which gives a claim back when its read
+        // does not land (fs_verify_settled): a model whose experts all fit in RAM would otherwise have no needed read to carry it
+        if (!prefetch && (!idle || fs_running) && (n_chunks == 1 || (by_proj && i == 0)) && verify && sl.il >= 0 && (size_t) sl.il < verify_done.size()) {   // a chunked read is not whole after its first chunk (the model file's check does not look at the slot, it rides on the first piece)
             std::lock_guard<std::mutex> lock(verify_mtx);
 
             // The count is taken at the first read of the run, not in the constructor: the layers
@@ -5588,6 +5885,9 @@ void llama_moe_stream::enqueue(llama_moe_stream_layer & sl, int32_t expert, int3
                 verify_done[sl.il]   = 1;
                 verify_claims.fetch_sub(1);
                 job.verify           = true;
+                if (idle && (size_t) sl.il < fs_verify_slot.size()) {
+                    fs_verify_slot[sl.il] = slot;   // given back if this read does not land
+                }
                 if (by_proj) {   // the check waits for the last piece of the slot (verify_slot)
                     mf_left[{ sl.il, slot }] = (int32_t) n_chunks;
                     verify_all_pieces        = true;
@@ -7541,6 +7841,17 @@ void llama_moe_stream::ne_oracle_list_start() {
     }
 }
 
+int32_t llama_moe_stream::whole_layer_to_drop(ggml_backend_dev_t failed) const {
+    for (size_t i = gpu_layers_pick.size(); i-- > 0; ) {
+        const int32_t il = gpu_layers_pick[i];
+        const bool other = (size_t) il < whole_test_other.size() && whole_test_other[(size_t) il];
+        if (failed == nullptr || ((size_t) il < whole_dev.size() && whole_dev[(size_t) il] == failed && !other)) {
+            return il;
+        }
+    }
+    return -1;
+}
+
 void llama_moe_stream::ne_call_start() {
     std::lock_guard<std::mutex> lock(mtx);
     ne_call_seq += 1;
@@ -7591,6 +7902,23 @@ void llama_moe_stream::ne_gpu_setup(const std::vector<ggml_backend_dev_t> & rout
         }
         return n;
     };
+    // With more than one GPU the marks live on one of them: the VRAM pool's GPU when some posting layer has all its targets' routers
+    // there (its layers can then also run the pool's device pass in their launch), else the GPU of the first posting layer's first target
+    const auto all_on = [&](const llama_moe_stream_layer & sl, ggml_backend_dev_t d) {
+        int32_t t[LOOKAHEAD_MAX];
+        const int32_t nt = targets_of(sl, t);
+        bool ok = d != nullptr && nt > 0;
+        for (int32_t i = 0; i < nt && ok; i++) {
+            ok = (size_t) t[i] < router_dev.size() && router_dev[(size_t) t[i]] == d;
+        }
+        return ok;
+    };
+    for (auto & slp : layers) {
+        if (slp && slp->ne_post_on && pool_dev != nullptr && all_on(*slp, pool_dev)) {
+            gpu_dev = pool_dev;
+            break;
+        }
+    }
     for (auto & slp : layers) {
         if (slp && slp->ne_post_on && gpu_dev == nullptr) {
             int32_t t[LOOKAHEAD_MAX];
@@ -7603,12 +7931,7 @@ void llama_moe_stream::ne_gpu_setup(const std::vector<ggml_backend_dev_t> & rout
         if (!slp || !slp->ne_post_on) {
             continue;
         }
-        int32_t t[LOOKAHEAD_MAX];
-        const int32_t nt = targets_of(*slp, t);
-        bool ok = gpu_dev != nullptr && nt > 0;
-        for (int32_t i = 0; i < nt && ok; i++) {
-            ok = (size_t) t[i] < router_dev.size() && router_dev[(size_t) t[i]] == gpu_dev;
-        }
+        const bool ok = all_on(*slp, gpu_dev);
         slp->ne_gpu_ok = ok;
         if (ok) {
             posting += format("%s%d", n_post++ > 0 ? "," : "", slp->il);
@@ -7622,11 +7945,15 @@ void llama_moe_stream::ne_gpu_setup(const std::vector<ggml_backend_dev_t> & rout
     }
     if (n_post == 0) {
         // No layer posts a guess (e.g. --moe-stream-prefetch 0, or an architecture that builds none) - router done
-        // still applies to the streamed layers whose router runs on a GPU: the first such device
+        // still applies to the streamed layers whose router runs on a GPU: the VRAM pool's GPU when one is there, else the first such device
+        gpu_dev = nullptr;
         for (auto & slp : layers) {
-            if (slp && (size_t) slp->il < router_dev.size() && router_dev[(size_t) slp->il] != nullptr) {
+            if (slp && (size_t) slp->il < router_dev.size() && router_dev[(size_t) slp->il] != nullptr &&
+                    (gpu_dev == nullptr || router_dev[(size_t) slp->il] == pool_dev)) {
                 gpu_dev = router_dev[(size_t) slp->il];
-                break;
+                if (gpu_dev == pool_dev) {
+                    break;
+                }
             }
         }
         if (gpu_dev == nullptr) {
@@ -7874,6 +8201,7 @@ void llama_moe_stream::ne_gpu_setup(const std::vector<ggml_backend_dev_t> & rout
     ne_mark_unregister = f_unreg;
     ne_mark_sync       = f_sync;
     ne_gpu          = true;
+    ne_mark_dev     = gpu_dev;
     ne_rd_layer        = rd_layer;
     ne_rd              = n_rd > 0;
     ws_gpu              = ws_all;
@@ -8441,7 +8769,9 @@ void llama_moe_stream::end_call(bool complete) {
     }
 
     // --moe-stream-plan 1: the word is over - every entry whose target ran in it leaves the list, so the list is
-    // empty at every word boundary (the guess helper relies on it). Anything left is a bug, and the run stops.
+    // empty at every word boundary (the guess helper relies on it). An entry for the last trunk layer in a call with no
+    // output row leaves it too: that layer is cut to the output rows, so its experts had nothing to run (a reader may simply
+    // not have reached the entry before the call ended). Anything else left is a bug, and the run stops.
     if (!pl_list.empty()) {
         for (const pl_entry & en : pl_list) {
             llama_moe_stream_layer & nx = *layers[en.il];
@@ -8451,10 +8781,14 @@ void llama_moe_stream::end_call(bool complete) {
             } else if (!complete) {
                 nx.pl_listed[en.e] = 0;
                 pl_drop(nx, en, MOE_STREAM_PL_ABORTED, 0);   // the call stopped before its target ran: not a bug
+            } else if (call_n_out == 0 && en.il == pl_il_crop && en.word == n_tok_outer) {
+                nx.pl_listed[en.e] = 0;
+                pl_drop(nx, en, MOE_STREAM_PL_WORDEND, 0);   // the word ended; its target had no row to run
             } else {
                 moe_stream_fail("waiting list: an entry for layer %d (expert %d, added in decode word %lld) is left at the end "
-                        "of a call, and its layer did not run in that word (it last ran in word %lld); the list must be empty "
-                        "at every word boundary", en.il, en.e, (long long) en.word, (long long) nx.pl_ran_word);
+                        "of a call (%d output rows asked), and its layer did not run in that word (it last ran in word %lld); "
+                        "the list must be empty at every word boundary", en.il, en.e, (long long) en.word, call_n_out,
+                        (long long) nx.pl_ran_word);
             }
         }
         pl_list.clear();   // keeps the capacity
@@ -8559,6 +8893,9 @@ void llama_moe_stream::idle_setup() {
         fprintf(stderr, "%s: --moe-stream-idle-load / --moe-stream-read-ahead are not used with %s\n", __func__, rec_on() || rec_ev_on
                 ? "--moe-stream-record (its events would count idle reads as needed reads)"
                 : "elastic RAM / moving shares (built for fixed pools)");
+        if (p1.fill_start) {
+            fprintf(stderr, "%s: --moe-stream-idle-load 2: the RAM pools are not filled at start (the model is ready with empty pools)\n", __func__);
+        }
         return;
     }
     idle_on       = p1.idle_load;
@@ -8667,8 +9004,9 @@ bool llama_moe_stream::us_save(std::unique_lock<std::mutex> & lock) {
     return ok;
 }
 
-// llama_context, once the context (and with it the VRAM expert pool) is built: the first time also the table and the thread
-void llama_moe_stream::idle_arm() {
+// llama_context, once the context (and with it the VRAM expert pool) is built: the first time also the table and the thread; with
+// --moe-stream-idle-load 2 the first time also fills every RAM slot before it returns (the model counts as loaded only after it)
+void llama_moe_stream::idle_arm(bool may_fill) {
     if (!us_on) {
         return;
     }
@@ -8688,6 +9026,20 @@ void llama_moe_stream::idle_arm() {
     }
     if (!idle_on) {
         return;
+    }
+    if (p1.fill_start && !fs_done && may_fill) {
+        // No call can come before the context is returned, so the fill never shares the drive with a call: it runs here, on the
+        // calling thread, and every tool (and llama-server's health check) sees the model loaded only after it
+        fs_done = true;
+        fs_verify_slot.assign(verify_done.size(), -1);
+        {
+            std::lock_guard<std::mutex> vlock(verify_mtx);
+            verify_checked.assign(verify_done.size(), 0);
+            for (size_t il = 0; il < verify_done.size(); il++) {
+                verify_checked[il] = verify_done[il];   // a layer checked before (or claimed by a read that is not ours) keeps its state
+            }
+        }
+        idle_round(lock, /* start = */ true);
     }
     if (!idle_thread.joinable()) {
         idle_thread = std::thread([this] { idle_loop(); });
@@ -8735,6 +9087,9 @@ void llama_moe_stream::idle_drain() {
             drop_slot(sl, job.slot);
             n_idle_drained += 1;
             n_idle_loading -= n_idle_loading > 0 ? 1 : 0;
+            if (!fs_verify_slot.empty()) {
+                fs_verify_settled(sl, job.slot, /* landed = */ false);
+            }
         }
     }
     q_idle.clear();
@@ -8758,11 +9113,30 @@ void llama_moe_stream::idle_loop() {
     }
 }
 
+// mtx held: the fill at start's read of layer sl's slot settled. Landed: the layer's check went with it. Not landed (failed or taken
+// back): the claim is given back unless the check already ran, so the layer's next read (a fill read or a call's needed read) carries it
+void llama_moe_stream::fs_verify_settled(llama_moe_stream_layer & sl, int32_t slot, bool landed) {
+    if (sl.il < 0 || (size_t) sl.il >= fs_verify_slot.size() || fs_verify_slot[sl.il] != slot) {
+        return;
+    }
+    fs_verify_slot[sl.il] = -1;
+    if (landed) {
+        return;
+    }
+    std::lock_guard<std::mutex> vlock(verify_mtx);
+    if ((size_t) sl.il < verify_checked.size() && !verify_checked[sl.il] && verify_done[sl.il]) {
+        verify_done[sl.il] = 0;
+        verify_claims.fetch_add(1);
+        mf_left.erase({ sl.il, slot });
+    }
+}
+
 // one round (mtx held, released while waiting): save the table if it changed, then read the table's experts, best first and rank by
 // rank across the layers (rank 1 of every layer, then rank 2, ...), into EMPTY RAM slots - never a slot that holds or is reading an
 // expert, never an expert in RAM or in VRAM - with at most one read per I/O thread outstanding, until the slots or the table run out
-// or a call starts
-void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock) {
+// or a call starts. start: the fill at start (idle_arm, --moe-stream-idle-load 2) - 2 reads per I/O thread outstanding, the issuer
+// sleeps until a read settles instead of polling, its reads carry the read-back check, and progress lines go to stderr
+void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock, bool start) {
     if (us_dirty) {
         us_save(lock);
     }
@@ -8771,6 +9145,9 @@ void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock) {
     }
     struct lyr { llama_moe_stream_layer * sl; std::vector<int32_t> rank; uint32_t scan; uint32_t n_empty; uint32_t n_iss; };
     std::vector<lyr> ls;
+    int64_t plan_n = 0, plan_bytes = 0, n_picks = 0;   // start: the reads the fill will make, their bytes; the table's picks
+    int64_t n_held = 0;                                // start: experts held in the VRAM pool (not read)
+    bool    fits_all = true;                           // start: every expert that is not in RAM or VRAM has an empty slot
     for (const int32_t il : il_of_moe) {
         if (il < 0 || (size_t) il >= layers.size() || !layers[il] || (size_t) il >= us_cnt.size() || us_cnt[il].empty()) {
             continue;
@@ -8792,21 +9169,71 @@ void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock) {
             x.rank.push_back(e);
         }
         std::stable_sort(x.rank.begin(), x.rank.end(), [&](int32_t a, int32_t b) { return c[a] > c[b]; });
+        if (start) {
+            int64_t n_cand = 0;
+            for (int32_t e = 0; e < (int32_t) c.size(); e++) {
+                n_cand  += sl.expert_slot[e] < 0 && !(sl.vx_held(e) && !vx_keep_ram) ? 1 : 0;
+                n_held  += sl.expert_slot[e] < 0 &&   sl.vx_held(e) && !vx_keep_ram  ? 1 : 0;
+                n_picks += c[e];
+            }
+            const int64_t n = std::min<int64_t>(n_cand, n_empty);
+            plan_n     += n;
+            plan_bytes += n*(int64_t) sl.block_bytes;
+            fits_all    = fits_all && n_cand <= (int64_t) n_empty;
+        }
         if (!x.rank.empty()) {
             ls.push_back(std::move(x));
         }
     }
     if (ls.empty()) {
+        if (start) {
+            fprintf(stderr, "llama_moe_stream: loading: experts into RAM: nothing to read (no empty RAM slot)\n");
+        }
         return;   // the pools are full (the usual case between requests) or the table is empty
     }
     n_idle_rounds += 1;
     const int64_t t0    = ggml_time_us();
-    const size_t  max_out = std::max<size_t>(2, io_threads.size());
+    // the fill at start keeps a second read per I/O thread queued, so a thread that finishes one takes the next at once
+    const size_t  max_out = start ? 2*std::max<size_t>(1, io_threads.size()) : std::max<size_t>(2, io_threads.size());
     const auto    outstanding = [&] { return (size_t) n_idle_loading; };
     const int64_t seq0 = idle_call_seq;
     const auto    stop = [&] { return idle_quit || idle_calls > 0 || idle_call_seq != seq0; };   // any call since the start
     int64_t n_issued = 0;
     bool    any      = true;
+    // start: progress on stderr every 10 % of the planned reads (a read counts when it settled), for a front end that shows the load
+    const int64_t b0 = n_idle_bytes, f0 = n_idle_failed;
+    int     pct_said    = 0;
+    const auto progress = [&](bool last) {
+        if (!start || plan_n <= 0) {
+            return;
+        }
+        const int64_t done = n_issued - (int64_t) outstanding();
+        const int     pct  = last ? 100 : (int) std::min<int64_t>(90, done*10/plan_n*10);
+        if (pct <= pct_said) {
+            return;
+        }
+        pct_said = pct;
+        fprintf(stderr, "llama_moe_stream: loading: experts into RAM %d %% (%lld of %lld, %.1f of %.1f GB, %.1f s)\n", pct, (long long) done,
+                (long long) plan_n, (n_idle_bytes - b0)/1e9, plan_bytes/1e9, (ggml_time_us() - t0)/1e6);
+    };
+    // start: sleep until a read settles (every settle notifies cv_done) instead of the 2 ms poll of the idle-time rounds
+    const auto wait_below = [&](size_t lim) {
+        while (outstanding() >= lim && !stop()) {
+            if (start) {
+                if (io_stop) {
+                    break;
+                }
+                cv_done.wait(lock);
+                progress(false);
+            } else {
+                idle_cv.wait_for(lock, std::chrono::milliseconds(2));
+            }
+        }
+    };
+    if (start) {
+        fprintf(stderr, "llama_moe_stream: loading: experts into RAM 0 %% (0 of %lld, 0.0 of %.1f GB, 0.0 s)\n", (long long) plan_n, plan_bytes/1e9);
+        fs_running = true;
+    }
     for (size_t r = 0; any && !stop(); r++) {
         any = false;
         for (lyr & x : ls) {
@@ -8814,9 +9241,7 @@ void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock) {
                 continue;
             }
             any = true;
-            while (outstanding() >= max_out && !stop()) {
-                idle_cv.wait_for(lock, std::chrono::milliseconds(2));
-            }
+            wait_below(max_out);
             if (stop()) {
                 break;
             }
@@ -8868,15 +9293,48 @@ void llama_moe_stream::idle_round(std::unique_lock<std::mutex> & lock) {
             cv_work.notify_one();
         }
     }
-    while (outstanding() > 0 && !stop()) {
-        idle_cv.wait_for(lock, std::chrono::milliseconds(2));
-    }
+    wait_below(1);
+    fs_running = false;
     const bool stopped = stop();
     n_idle_stopped += stopped ? 1 : 0;
     n_idle_last     = n_issued;
     t_idle_last_ms  = (ggml_time_us() - t0)/1000;
-    fprintf(stderr, "llama_moe_stream: idle load: %lld experts read into empty RAM slots of %zu layers in %lld ms%s\n", (long long) n_issued,
-            ls.size(), (long long) t_idle_last_ms, stopped ? " (stopped by a call: the queued reads were taken back)" : "");
+    if (!start || stopped) {
+        fprintf(stderr, "llama_moe_stream: idle load: %lld experts read into empty RAM slots of %zu layers in %lld ms%s\n", (long long) n_issued,
+                ls.size(), (long long) t_idle_last_ms, stopped ? " (stopped by a call: the queued reads were taken back)" : "");
+    }
+    if (!start) {
+        return;
+    }
+    progress(true);
+    // the summary: what was read, what the pools hold now, which experts were taken (all, or each layer's most-used by which table)
+    int64_t n_slots_all = 0, n_slots_full = 0, n_layers = 0;
+    for (const int32_t il : il_of_moe) {
+        if (il < 0 || (size_t) il >= layers.size() || !layers[il]) {
+            continue;
+        }
+        const llama_moe_stream_layer & sl = *layers[il];
+        n_layers += 1;
+        for (uint32_t s = 0; s < sl.n_slots; s++) {
+            if (!sl.slot_off.empty() && sl.slot_off[s]) {
+                continue;
+            }
+            n_slots_all  += 1;
+            n_slots_full += sl.slot_state[s] != MOE_STREAM_SLOT_EMPTY ? 1 : 0;
+        }
+    }
+    const double secs   = (ggml_time_us() - t0)/1e6;
+    const double gb     = (n_idle_bytes - b0)/1e9;
+    const int64_t n_bad = n_idle_failed - f0;
+    fprintf(stderr, "llama_moe_stream: loading: experts into RAM done: %lld experts read into the RAM pools of %lld streamed layers, %lld of %lld slots "
+            "filled; %s; %lld experts held in the VRAM pool not read; %.2f GB in %.2f s (%.2f GB/s)%s%s\n",
+            (long long) (n_issued - n_bad), (long long) n_layers, (long long) n_slots_full, (long long) n_slots_all,
+            fits_all ? "every expert fits (each one is now in RAM or in the VRAM pool)"
+                     : n_picks > 0 ? format("the most-used experts of each layer by %s", us_from.c_str()).c_str()
+                                   : "the experts of each layer in id order (the usage table is empty)",
+            (long long) n_held, gb, secs, secs > 0 ? gb/secs : 0.0,
+            n_bad > 0 ? format("; %lld reads failed (their slots stay empty; idle loading reads them later)", (long long) n_bad).c_str() : "",
+            stopped ? "; stopped by a call before the end" : "");
 }
 
 // See the header. mtx held (inside layer sl's wave-0 remap op, after its needed reads are queued)
@@ -12542,11 +13000,16 @@ void llama_moe_stream::print_stats() const {
     if (p1.nonpool) {
         np_print();
     }
-    {   // how close the process came to its own memory cap (Linux cgroup v2; two small file reads, once at exit)
+    {   // how close the process came to its own memory cap (Linux cgroup v1 or v2; a few small file reads, once at exit)
         int64_t mx = 0, pk = 0, mg = 0;
         if (llama_moe_stream_cap_margin(&mx, &pk, &mg)) {
-            fprintf(stderr, "moe-stream: process memory cap %lld MiB, peak use %lld MiB, margin to the cap %lld MiB (planned margin %lld MiB)\n",
-                    (long long) (mx >> 20), (long long) (pk >> 20), (long long) (mg >> 20), (long long) (MOE_STREAM_CAP_MARGIN >> 20));
+            // the peak counts file cache too; with much of it the use now without it says how close the process really is
+            int64_t un = 0, ca = 0;
+            const bool now = llama_moe_stream_cap_now(&un, &ca) && ca >= OS_CG_CACHE_SHOWN;
+            fprintf(stderr, "moe-stream: process memory cap %lld MiB, peak use %lld MiB, margin to the cap %lld MiB (planned margin %lld MiB)%s\n",
+                    (long long) (mx >> 20), (long long) (pk >> 20), (long long) (mg >> 20), (long long) (MOE_STREAM_CAP_MARGIN >> 20),
+                    now ? format("; the peak counts file cache: in use now %lld MiB without %lld MiB of file cache the kernel can free, room now %lld MiB",
+                                 (long long) (un >> 20), (long long) (ca >> 20), (long long) ((mx - un) >> 20)).c_str() : "");
         }
     }
 
@@ -13137,6 +13600,7 @@ void llama_moe_stream::vx_lists_by_id(const char * why) {
             "experts in)\n", why);
     vx_file_layers.clear();
     vx_file_scores.clear();
+    vx_file_len.clear();
     vx_non_uniform = false;
     // a pinned N without --moe-stream-vram-free: each list is N long, as a file's is (whole lists overran the pool)
     const uint32_t n_list = p1.vram_free > 0 || p1.vram_experts == 0 ? n_expert_total : std::min<uint32_t>(p1.vram_experts, n_expert_total);
@@ -13148,6 +13612,7 @@ void llama_moe_stream::vx_lists_by_id(const char * why) {
         vx_list_min = vx_file_layers.empty() ? (uint32_t) lst.size() : std::min<uint32_t>(vx_list_min, (uint32_t) lst.size());
         vx_file_layers[il] = lst;
     }
+    vx_file_min = vx_list_min;
 }
 
 void llama_moe_stream::vx_load_list() {
@@ -13216,8 +13681,15 @@ void llama_moe_stream::vx_load_list() {
 
     vx_file_layers.clear();
     vx_file_scores.clear();
+    vx_file_len.clear();
     vx_non_uniform = j.value("counted", std::string()).find("non-uniform") != std::string::npos;
-    int64_t n_short = 0, n_bad_all = 0;   // the layers filled in id order, the entries left out
+    // The auto fit (no pinned N): a listed layer's list goes on after the file's entries with the experts the file leaves out, in
+    // expert-id order (the order without a file), so the list never caps the pool. MOE_STREAM_TEST_VX_LIST_CAP=1 (test only) keeps the
+    // file's lists as they are - the shortest one caps the pool - so both run from one binary
+    static const bool test_list_cap = getenv("MOE_STREAM_TEST_VX_LIST_CAP") && atoi(getenv("MOE_STREAM_TEST_VX_LIST_CAP")) != 0;
+    const bool extend = auto_n && N == 0 && !test_list_cap;
+    int64_t n_short = 0, n_bad_all = 0, n_ext = 0;   // the layers filled in id order, the entries left out, the layers extended
+    uint32_t file_min = 0, ext_min = 0, ext_max = 0;   // the shortest file list; the shortest and longest of the extended ones
     for (const int32_t il : il_of_moe) {
         const std::string key = std::to_string(il);
         std::vector<int32_t> lst;
@@ -13242,8 +13714,8 @@ void llama_moe_stream::vx_load_list() {
         }
         n_bad_all += n_bad;
         if ((N > 0 && lst.size() < N) || lst.empty()) {
-            // A layer missing or short of a pinned N in the file - the rest of its list in expert-id order (never a refusal). (The
-            // auto fit keeps a listed layer's list as it is - its length caps the pool, as before; a missing layer gets every expert)
+            // A layer missing or short of a pinned N in the file - the rest of its list in expert-id order (never a refusal). (A
+            // missing layer gets every expert, all of them counted as its list)
             n_short += 1;
             for (uint32_t e = 0; e < n_expert_total && (N > 0 ? lst.size() < N : true); e++) {
                 if (!seen[e]) {
@@ -13252,15 +13724,37 @@ void llama_moe_stream::vx_load_list() {
                     sc_lst.push_back(0);
                 }
             }
+        } else if (extend && lst.size() < n_expert_total) {
+            // the file's entries first, in the file's order; the rest after them (VRAM follow's fill ranking counts only the file's
+            // part, and the score split places all the file's entries first: vx_file_len)
+            ext_min = n_ext == 0 ? (uint32_t) lst.size() : std::min<uint32_t>(ext_min, (uint32_t) lst.size());
+            ext_max = std::max<uint32_t>(ext_max, (uint32_t) lst.size());
+            n_ext += 1;
+            vx_file_len[il] = lst.size();
+            for (uint32_t e = 0; e < n_expert_total; e++) {
+                if (!seen[e]) {
+                    seen[e] = 1;
+                    lst.push_back((int32_t) e);
+                    sc_lst.push_back(0);
+                }
+            }
         }
+        const uint32_t n_file = (uint32_t) vx_file_part(il, lst.size());
+        file_min    = vx_file_layers.empty() ? n_file : std::min<uint32_t>(file_min, n_file);
         vx_list_min = vx_file_layers.empty() ? (uint32_t) lst.size() : std::min<uint32_t>(vx_list_min, (uint32_t) lst.size());
         vx_file_layers[il] = lst;
         vx_file_scores[il] = sc_lst;
     }
+    vx_file_min = file_min;
     if (n_short > 0 || n_bad_all > 0) {
         fprintf(stderr, "llama_moe_stream: --moe-stream-vram-experts-file '%s': %lld streamed layers missing or short of %u - the rest of their "
                 "lists in expert-id order%s\n", shown.c_str(), (long long) n_short, N, n_bad_all > 0 ? format("; %lld entries out of range or "
                 "listed twice left out", (long long) n_bad_all).c_str() : "");
+    }
+    if (n_ext > 0) {
+        fprintf(stderr, "llama_moe_stream: --moe-stream-vram-experts-file '%s': %lld streamed layers list %s of their %u experts: their lists go "
+                "on with the rest in expert-id order, so the free VRAM alone sizes the GPU pool\n", shown.c_str(), (long long) n_ext,
+                ext_min == ext_max ? format("%u", ext_min).c_str() : format("%u-%u", ext_min, ext_max).c_str(), n_expert_total);
     }
 }
 
@@ -13341,10 +13835,19 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
 
     // --moe-stream-vram-parallel 1: only with the GPU producer (decided at load, before this): its "router done" is what lets the
     // CPU split start while the GPU runs the device pass; without it the pass stays after the CPU experts
-    vp = p1.vram_parallel && ne_gpu;
+    // With more than one GPU: only when the marks and the pool are on the same GPU - the device pass runs in the router's GPU launch.
+    // MOE_STREAM_TEST_POOL_OTHER_CARD=1 (test only): the pool counts as being on another GPU than the marks
+    static const bool test_pool_other = getenv("MOE_STREAM_TEST_POOL_OTHER_CARD") && atoi(getenv("MOE_STREAM_TEST_POOL_OTHER_CARD")) != 0;
+    const bool vp_same_card = ne_mark_dev == dev && !test_pool_other;
+    vp = p1.vram_parallel && ne_gpu && vp_same_card;
     if (p1.vram_parallel && !ne_gpu) {
         fprintf(stderr, "%s: vram-parallel: off - the GPU producer of --moe-stream-needed-early is not active (the line above says why), "
                 "so the device pass stays after the CPU experts\n", __func__);
+    } else if (p1.vram_parallel && !vp_same_card) {
+        fprintf(stderr, "%s: vram-parallel: off - needed-early's marks are on %s and the VRAM pool on %s; it needs both on one GPU, so "
+                "the device pass stays after the CPU experts%s\n", __func__, ggml_backend_dev_name(ne_mark_dev),
+                test_pool_other ? "another GPU (TEST ONLY: MOE_STREAM_TEST_POOL_OTHER_CARD=1)" : ggml_backend_dev_name(dev),
+                p1.prompt_split ? " (and --moe-stream-prompt-split, which needs it, is off too)" : "");
     }
 
     // 2. sizes, and the free VRAM before anything is allocated
@@ -13382,14 +13885,16 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 const auto & G = vx_groups[gi];
                 const size_t total_places = (size_t) N_now * G.layers.size() + (gi == 0 ? (size_t) vx_extra : 0u);
                 std::map<int32_t, size_t> cnt_per_il;
-                std::vector<std::tuple<int64_t, int32_t, int32_t>> cands;   // (score, -rank, il)
+                // (in the file, score, -rank, -il): the file's entries before the id-order rest appended after them
+                std::vector<std::tuple<int32_t, int64_t, int32_t, int32_t>> cands;
                 for (const int32_t il : G.layers) {
-                    const auto & full = vx_rank_lists.at(il);
-                    const auto & scs  = vx_file_scores.at(il);
+                    const auto & full   = vx_rank_lists.at(il);
+                    const auto & scs    = vx_file_scores.at(il);
+                    const size_t n_file = vx_file_part(il, full.size());
                     cnt_per_il[il] = full.empty() ? 0u : 1u;   // guarantee at least 1 place per layer
                     for (size_t r = 1; r < full.size(); r++) {
                         const int64_t sc = r < scs.size() ? scs[r] : 0;
-                        cands.emplace_back(sc, -(int32_t) r, -il);
+                        cands.emplace_back(r < n_file ? 1 : 0, sc, -(int32_t) r, -il);
                     }
                 }
                 std::sort(cands.begin(), cands.end(), std::greater<>());
@@ -13398,7 +13903,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     if (used >= total_places) {
                         break;
                     }
-                    cnt_per_il[-std::get<2>(c)]++;
+                    cnt_per_il[-std::get<3>(c)]++;
                     used++;
                 }
                 for (const int32_t il : G.layers) {
@@ -13416,7 +13921,8 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             kv.second.assign(full.begin(), full.begin() + n);
         }
     };
-    // The whole list stays for the tail's extras and for the fill's tie-break (the lists are cut to N below)
+    // The whole list stays for the tail's extras and for the fill's tie-break (the lists are cut to N below); the rank covers the
+    // file's part only (an expert of the appended id-order rest is no fill candidate until it is used)
     const auto keep_whole_lists = [&]() {
         vx_rank_lists = vx_file_layers;
         vx_rank_of.assign(layers.size(), {});
@@ -13424,7 +13930,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             if (kv.first >= 0 && (size_t) kv.first < vx_rank_of.size()) {
                 auto & rk = vx_rank_of[(size_t) kv.first];
                 rk.assign(n_expert_total, -1);
-                for (size_t i = 0; i < kv.second.size(); i++) {
+                for (size_t i = 0; i < vx_file_part(kv.first, kv.second.size()); i++) {
                     rk[(size_t) kv.second[i]] = (int16_t) std::min<size_t>(i, 32767);
                 }
             }
@@ -13457,10 +13963,12 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         const int64_t n_use   = n_use_u/Lg0;           // N per layer
         vx_extra = (uint32_t) (n_use_u % Lg0);          // N + 1 in the first vx_extra layers (0 for the uniform fit)
         fprintf(stderr, "%s: --moe-stream-vram-free %.0f MiB: free VRAM now %.1f MiB - zero slices%s %.1f MiB - keep-free %.1f MiB - growth %.1f MiB (%s) "
-                "= %.1f MiB for places of %.2f MiB each (%s) -> %lld %s fit; cap %lld (%s, list %u) -> N = %lld per layer%s\n", __func__,
+                "= %.1f MiB for places of %.2f MiB each (%s) -> %lld %s fit; cap %lld (%s, list %s) -> N = %lld per layer%s\n", __func__,
                 p1.vram_free/1048576.0, vfree/1048576.0, vp ? " + id table" : "", bytes_zero/1048576.0, p1.vram_free/1048576.0,
                 vx_growth_used/1048576.0, growth_why.c_str(), room/1048576.0, place_b/1048576.0, fine ? "one place" : "every streamed layer",
-                (long long) n_fit, fine ? "places" : "per layer", (long long) n_cap, p1.vram_experts > 0 ? "the pinned N" : "the list", vx_list_min,
+                (long long) n_fit, fine ? "places" : "per layer", (long long) n_cap, p1.vram_experts > 0 ? "the pinned N" : "the list",
+                vx_file_min < vx_list_min ? format("%u from the file + the rest in expert-id order = %u", vx_file_min, vx_list_min).c_str()
+                                          : format("%u", vx_list_min).c_str(),
                 (long long) n_use, vx_extra > 0 ? format(" + 1 more in the first %u layers", vx_extra).c_str() : "");
         if (floor1) {
             fprintf(stderr, "%s: --moe-stream-vram-free: 1 per layer fits only inside the %.1f MiB keep-free (free %.1f MiB, zero slices %.1f MiB, "
@@ -14026,7 +14534,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 }
             }
             fprintf(stderr, "%s: the pool's tail: %d places (the largest RAM pool view, %d slots + zero slices; %.1f MiB = the pool copies of a GPU-wave graph, "
-                    "which no longer take compute-buffer memory): %d filled with the file's next experts, %d free%s\n", __func__, tail_n, tail_n,
+                    "which no longer take compute-buffer memory): %d filled with the list's next experts, %d free%s\n", __func__, tail_n, tail_n,
                     (double) tail_n*(2*nb_g + nb_d)/1048576.0, k, tail_n - k, tail_preset ? "" : " (MOE_STREAM_TEST_PRESET_COPY=0: the copies stay in the compute buffer, the tail is still vacated for GPU-wave graphs)");
         }
     }
@@ -18367,6 +18875,18 @@ bool llama_moe_stream_cap_margin(int64_t * cap_max, int64_t * peak, int64_t * ma
     if (cap_max) { *cap_max = c.max; }
     if (peak)    { *peak    = pk; }
     if (margin)  { *margin  = c.max - pk; }
+    return true;
+}
+
+// The same level's use now without the file cache the kernel can free, and that cache (0 when memory.stat does not offer the keys); false
+// when there is no cap. The kernel keeps no peak of this use: its peak counter counts the cache too
+bool llama_moe_stream_cap_now(int64_t * use, int64_t * file_cache) {
+    const os_mem_cap c = os_mem_cap_get();
+    if (!c.has) {
+        return false;
+    }
+    if (use)        { *use        = c.cur; }
+    if (file_cache) { *file_cache = c.cache; }
     return true;
 }
 

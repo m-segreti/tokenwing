@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -30,12 +31,31 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
+#include <atomic>
 #include <set>
 #include <tuple>
 
 //
 // llama_context
 //
+
+// A compute buffer that cannot be made is counted as device memory when the context has a GPU backend (the reserve does not say which
+// buffer failed; the GPU's is the large one)
+static bool llama_backends_have_gpu(const std::vector<ggml_backend_ptr> & backends) {
+    for (const auto & b : backends) {
+        if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The GPU of the compute buffer the last reserve could not allocate (null: not known, or not a GPU)
+static ggml_backend_dev_t llama_reserve_failed_dev() {
+    ggml_backend_buffer_type_t buft = ggml_gallocr_last_failed_buft();
+    ggml_backend_dev_t dev = buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr;
+    return dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU ? dev : nullptr;
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -446,6 +466,15 @@ llama_context::llama_context(
             /*.no_alloc  =*/ model.no_alloc(),
         };
 
+        // MOE_STREAM_TEST_CTX_ALLOC_FAIL=1 (test only): with whole GPU MoE layers, the first context's memory fails as if device memory
+        // were short, once per process, so the reload with one whole layer fewer (common) can be tested
+        static std::atomic<bool> test_ctx_fail_done{false};
+        static const bool test_ctx_fail = getenv("MOE_STREAM_TEST_CTX_ALLOC_FAIL") && atoi(getenv("MOE_STREAM_TEST_CTX_ALLOC_FAIL")) != 0;
+        if (test_ctx_fail && !model.no_alloc() && model.moe_stream() && !model.moe_stream()->gpu_layers.empty() && !test_ctx_fail_done.exchange(true)) {
+            llama_memory_note_alloc_failure(true, model.moe_stream()->pool_dev);   // (as if on the GPU of the VRAM pool)
+            throw std::runtime_error("failed to allocate buffer for kv cache (TEST ONLY: MOE_STREAM_TEST_CTX_ALLOC_FAIL)");
+        }
+
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
@@ -506,6 +535,14 @@ llama_context::llama_context(
             }
         }
 
+        // Not with streamed MoE layers: its copies of every input that crosses devices (4) would hold the RAM pools that the prompt matmuls
+        // copy to a GPU (85-234 GiB asked for before the retry without it); whole layers only keep it
+        if (pipeline_parallel && model.moe_stream() != nullptr && !model.moe_stream()->il_of_moe.empty()) {
+            pipeline_parallel = false;
+            fprintf(stderr, "%s: pipeline parallelism: off - %zu MoE layers are streamed (its copies of every input that crosses devices would "
+                    "include the RAM pools)\n", __func__, model.moe_stream()->il_of_moe.size());
+        }
+
         cparams.pipeline_parallel = pipeline_parallel;
 
         if (cparams.pipeline_parallel) {
@@ -520,15 +557,10 @@ llama_context::llama_context(
         if (auto * ms = model.moe_stream()) {
             ggml_backend_dev_t         gdev  = nullptr;
             ggml_backend_buffer_type_t gbuft = nullptr;
-            ggml_backend_t             gback = nullptr;
-            for (auto & backend : backends) {
-                auto * dev = ggml_backend_get_device(backend.get());
-                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    gdev  = dev;
-                    gbuft = ggml_backend_get_default_buffer_type(backend.get());
-                    gback = backend.get();
-                    break;
-                }
+            ggml_backend_t             gback = ms_pool_backend();   // the GPU of the VRAM pool (--moe-stream-vram-device, else the first GPU)
+            if (gback != nullptr) {
+                gdev  = ggml_backend_get_device(gback);
+                gbuft = ggml_backend_get_default_buffer_type(gback);
             }
             {   // the pool's tail needs one GPU backend, no pipeline copies (the scheduler's n_copies is 1) and op offload
                 int n_gpu_t = 0;
@@ -578,6 +610,7 @@ llama_context::llama_context(
                 sched_reserve();
             }
             ms->vx_report(gdev);
+            llama_memory_note_alloc_failure(false);   // (the pool sizing's trial reserves fail on purpose; they are not the context's failure)
             if (ms->lend_on && ms->lend_owner == this) {   // the final reserve's decision
                 const auto U = ms->lend_places_at((int64_t) cparams.n_ctx);
                 int64_t nU = 0;
@@ -611,7 +644,8 @@ llama_context::llama_context(
             if (ms->p1.layer_major && cparams.n_batch > cparams.n_ubatch && llama_arch_layer_major(model.arch) && (ms->lm_lend_on() || lm_gpu_own)) {
                 const int64_t big = (int64_t) model.hparams.n_embd*4, small = (int64_t) model.hparams.n_expert_used()*4;
                 size_t vfree = 0, vtot = 0;
-                ggml_backend_dev_memory(gdev, &vfree, &vtot);
+                // (the own buffer is made on layer 0's device - with several GPUs maybe not the VRAM pool's)
+                ggml_backend_dev_memory(lm_gpu_own ? model.dev_layer(0) : gdev, &vfree, &vtot);
                 const int64_t t_lend = ms->lm_lend_max_tokens(big, small);
                 // (a margin for growth: with the pool off, the engine's own growth estimate - the lazy CUDA memory still to come, as the
                 // pool's fit uses it - instead of a fixed 512 MiB, which on a 4.6 GB start left 0 tokens for 221 MiB free. Only
@@ -693,9 +727,10 @@ llama_context::llama_context(
     // them, so this is the only place where a wrong offset in that path would be caught.
     llama_moe_stream_verify_gpu_tier(this);
 
-    // The context (and the VRAM expert pool) is built - idle-time loading may start after its pause (off: nothing)
+    // The context (and the VRAM expert pool) is built - idle-time loading may start after its pause (off: nothing); with
+    // --moe-stream-idle-load 2 the RAM pools are filled here first (not for a model loaded without memory)
     if (auto * ms = model.moe_stream()) {
-        ms->idle_arm();
+        ms->idle_arm(/* may_fill = */ !model.no_alloc());
     }
 }
 
@@ -872,6 +907,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    if (auto * ms = model.moe_stream(); ms && ms->pool_dev_set) {   // --moe-stream-vram-device: the prompt matmuls of the RAM pools on that GPU only
+        ggml_backend_sched_set_op_offload_backend(sched.get(), ms_pool_backend());
+    }
     if (auto * ms = model.moe_stream()) {   // this context's prompt graphs may plan into lent pool places
         static const bool lend_off = getenv("MOE_STREAM_TEST_LEND_OFF") && atoi(getenv("MOE_STREAM_TEST_LEND_OFF")) != 0;
         ms->lend_test_off = lend_off;
@@ -1010,6 +1048,7 @@ void llama_context::sched_reserve() {
                         model.no_alloc(), model.no_alloc() ? backend_buf_exp_size.data() : nullptr);
             }
             if (!gf) {
+                llama_memory_note_alloc_failure(llama_backends_have_gpu(backends), llama_reserve_failed_dev());
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
         }
@@ -1024,6 +1063,7 @@ void llama_context::sched_reserve() {
     {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.no_alloc());
         if (!gf) {
+            llama_memory_note_alloc_failure(llama_backends_have_gpu(backends), llama_reserve_failed_dev());
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
 
@@ -1051,6 +1091,7 @@ void llama_context::sched_reserve() {
         };
 
         if (!gf) {
+            llama_memory_note_alloc_failure(llama_backends_have_gpu(backends), llama_reserve_failed_dev());
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
     }
@@ -2447,7 +2488,7 @@ static void llama_moe_stream_la_now(const llama_moe_stream_stats & ms, int64_t (
 // --moe-stream-layer-major 1: may this call run layer by layer? Only the cases that were checked; everything else
 // runs the plain path. MOE_STREAM_TEST_LM_GROUP=G (test-only) runs it with groups of G layers even without the setting (G = 0 = off).
 // Calls llama_moe_stream::lm_layer_done for every streamed layer of [il_from, il_to), after its expert work of this call is
-// queued. When the engine asks for events (lm_events), one per layer is recorded on the first GPU backend's stream right here: once it
+// queued. When the engine asks for events (lm_events), one per layer is recorded on the VRAM pool GPU's stream right here: once it
 // has completed, nothing of this call reads the layer's RAM slots (null on a CPU-only run: the work has run when the graph returns)
 void llama_context::lm_signal_done(int il_from, int il_to) {
     auto * ms = model.moe_stream();
@@ -2461,13 +2502,8 @@ void llama_context::lm_signal_done(int il_from, int il_to) {
         }
         ggml_backend_event_t ev = nullptr;
         if (ms->lm_events) {
-            if (lm_ev_be == nullptr) {
-                for (auto & backend : backends) {
-                    if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        lm_ev_be = backend.get();
-                        break;
-                    }
-                }
+            if (lm_ev_be == nullptr) {   // the GPU that reads the RAM slots in a prompt (the VRAM pool's: its prompt matmuls run there)
+                lm_ev_be = ms_pool_backend();
             }
             if (lm_ev_be != nullptr) {
                 if ((int) lm_evs.size() < n_layer) {
@@ -2486,6 +2522,17 @@ void llama_context::lm_signal_done(int il_from, int il_to) {
         }
         ms->lm_layer_done(il, ev);
     }
+}
+
+ggml_backend_t llama_context::ms_pool_backend() const {
+    const auto * ms = model.moe_stream();
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (ms != nullptr && ms->pool_dev != nullptr ? dev == ms->pool_dev : ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return backend.get();
+        }
+    }
+    return nullptr;
 }
 
 bool llama_context::lm_layer_major_ok(uint32_t n_tokens_all) {
@@ -3021,13 +3068,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         tm_call.kind = dec ? 1 : 0;   // (the call's timing goes where the engine's counters of prompt and decode go)
 
         mstream->vf_word_ctx = cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP;   // VRAM follow's reply words
-        if (mstream->vp) {   // the id-table rows of this call start go on this context's GPU stream
-            for (auto & backend : backends) {
-                if (ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    mstream->vp_backend = backend.get();
-                    break;
-                }
-            }
+        if (mstream->vp) {   // the id-table rows of this call start go on this context's stream of the VRAM pool's GPU
+            mstream->vp_backend = ms_pool_backend();
         }
         if (mstream->vf_ev_on) {   // VRAM follow's tick records its event on this context's stream of VRAM follow's own GPU
             mstream->vf_ctx_be = nullptr;   // (none: the tick keeps the device-wide wait)
@@ -3056,6 +3098,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
         mstream->rg_need = dec ? 0 : rg_call_need(n_tokens_all, *mctx);   // (before the call's start)
+        mstream->call_n_out = (int32_t) n_outputs_all;   // (the word-end check of the waiting list)
         mstream->set_decode(dec, (int32_t) n_tokens_all, this);
 
         // The expert pools, their pins and the counters belong to the model, so a second context
@@ -6390,6 +6433,8 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    llama_memory_note_alloc_failure(false);
+
     try {
         auto * ctx = new llama_context(*model, params);
         const auto & cparams = ctx->get_cparams();
@@ -7032,6 +7077,30 @@ int32_t llama_moe_stream_get_layer_stats(const llama_context * ctx, llama_moe_st
         n++;
     }
     return n;
+}
+
+int32_t llama_moe_stream_gpu_layers(const llama_model * model, int32_t * out, int32_t n_max) {
+    const auto * mstream = model ? model->moe_stream() : nullptr;
+
+    if (!mstream) {
+        return 0;
+    }
+
+    const auto & pick = mstream->gpu_layers_pick;
+    for (size_t i = 0; out && i < pick.size() && (int32_t) i < n_max; i++) {
+        out[i] = pick[i];
+    }
+
+    return (int32_t) pick.size();
+}
+
+bool llama_moe_stream_ctx_failed_on_gpu(void) {
+    return llama_memory_alloc_failed_on_device();
+}
+
+int32_t llama_moe_stream_gpu_layer_to_drop(const llama_model * model) {
+    const auto * mstream = model ? model->moe_stream() : nullptr;
+    return mstream ? mstream->whole_layer_to_drop(llama_memory_alloc_failed_dev()) : -1;
 }
 
 bool llama_moe_stream_get_layout(const llama_context * ctx, llama_moe_stream_layout * out) {

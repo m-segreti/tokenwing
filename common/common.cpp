@@ -1310,6 +1310,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // The whole-layer VRAM fit happens inside the model load, where the physical batch is
     // not otherwise known, so the model params carry it (the fit's margin has to grow with -ub)
     mparams.moe_stream_ubatch = (int32_t) cparams.n_ubatch;
+    // and the context's shape, for the VRAM check of an explicit whole-layer list / count (the KV cache, recurrent state, masks)
+    mparams.moe_stream_ctx        = cparams.n_ctx;
+    mparams.moe_stream_ctx_seq    = cparams.n_seq_max;
+    mparams.moe_stream_ctx_type_k = (int32_t) cparams.type_k;
+    mparams.moe_stream_ctx_type_v = (int32_t) cparams.type_v;
+    mparams.moe_stream_ctx_rs_seq = cparams.n_rs_seq;
+    mparams.moe_stream_ctx_flags  = (cparams.kv_unified ? 1 : 0) | (cparams.swa_full ? 2 : 0) | (cparams.offload_kqv ? 4 : 0);
 
     if (params.fit_params && params.moe_stream.empty()) {
         // the fit pass loads the model with no_alloc, which the streamed expert pools need to
@@ -1463,7 +1470,41 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    const common_params_sampling sampling_in = params.sampling;   // (the init adds the model's biases to it)
     common_init_result_ptr res(new common_init_result(params, model_only));
+
+    // A context whose KV cache, recurrent state or compute buffers do not fit in VRAM next to the whole MoE layers kept on the GPU:
+    // the model again with one whole layer fewer (the last picked: a list's last), until the context fits or none is left - one line
+    // each. The layers given up are streamed (replies slower); a shorter prompt batch is the context's own last step
+    while (!model_only && !res->plan_only && res->model() != nullptr && res->context() == nullptr && llama_moe_stream_ctx_failed_on_gpu()) {
+        std::vector<int32_t> ids(1024);
+        const int32_t n = std::min<int32_t>(llama_moe_stream_gpu_layers(res->model(), ids.data(), (int32_t) ids.size()), (int32_t) ids.size());
+        if (n <= 0) {
+            break;
+        }
+        // the last picked of the whole layers on the device whose allocation failed (with several GPUs that may not be the list's last)
+        const int32_t drop = llama_moe_stream_gpu_layer_to_drop(res->model());
+        if (drop < 0) {
+            COM_WRN("--moe-stream: the context did not fit in VRAM on a GPU that holds none of the %d whole GPU MoE layer(s) - "
+                    "fewer whole layers cannot help there\n", n);
+            break;
+        }
+        std::string list;
+        for (int32_t i = 0; i < n; i++) {
+            if (ids[i] != drop) {
+                list += string_format("%s%d", list.empty() ? "" : ",", ids[i]);
+            }
+        }
+        COM_WRN("--moe-stream: the context did not fit in VRAM next to %d whole GPU MoE layer(s) - the model again with whole "
+                "GPU MoE layers %s (layer %d streamed; replies slower)\n", n, list.empty() ? "none" : list.c_str(), drop);
+        res.reset();
+        params.sampling                   = sampling_in;
+        params.moe_stream_gpu_layers_list = list;
+        if (list.empty()) {
+            params.moe_stream_gpu_layers = 0;
+        }
+        res.reset(new common_init_result(params, model_only));
+    }
 
     if (res->plan_only) {
         // --moe-stream-plan-only printed the plan and loaded nothing on purpose
@@ -1875,6 +1916,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_vram_lend_prompt     = params.moe_stream_vram_lend_prompt;
     mparams.moe_stream_vram_lend_short      = params.moe_stream_vram_lend_short;
     mparams.moe_stream_timing               = params.moe_stream_timing;
+    mparams.moe_stream_vram_device          = params.moe_stream_vram_device.empty() ? NULL : params.moe_stream_vram_device.c_str();
+    mparams.moe_stream_gpu_layers_device    = params.moe_stream_gpu_layers_device.empty() ? NULL : params.moe_stream_gpu_layers_device.c_str();
     mparams.moe_stream_vram_follow_tick     = params.moe_stream_vram_follow_tick;
     mparams.moe_stream_vram_follow_swaps    = params.moe_stream_vram_follow_swaps;
     mparams.moe_stream_vram_follow_recent   = params.moe_stream_vram_follow_recent;

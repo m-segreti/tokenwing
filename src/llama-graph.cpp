@@ -1556,6 +1556,22 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     }
 }
 
+ggml_backend_t llm_graph_context::moe_backend_of(ggml_backend_dev_t dev) const {
+    for (int b = 0; dev != nullptr && sched != nullptr && b < ggml_backend_sched_get_n_backends(sched); b++) {
+        ggml_backend_t be = ggml_backend_sched_get_backend(sched, b);
+        if (ggml_backend_get_device(be) == dev) {
+            return be;
+        }
+    }
+    return nullptr;
+}
+
+void llm_graph_context::moe_pin(ggml_tensor * t, ggml_backend_dev_t dev) const {
+    if (ggml_backend_t be = moe_backend_of(dev); be != nullptr && t != nullptr && ggml_backend_supports_op(be, t)) {
+        ggml_backend_sched_set_tensor_backend(sched, t, be);
+    }
+}
+
 void llm_graph_context::cb_tag(ggml_tensor * cur, const char * name, int il, const char * tag) const {
     if (!cb_func) {
         return;
@@ -2457,6 +2473,7 @@ void llm_graph_context::moe_ws_layer(const llama_model & model, int il, ggml_ten
             cols = ggml_cont(ctx0, cols);
         }
         mstream->ws_mark_node(il, cols);
+        moe_pin(cols, mstream->ne_mark_dev);
         ggml_build_forward_expand(gf, cols);
     } else if (cols) {
         st.cols = st.cols ? ggml_concat(ctx0, st.cols, cols, 1) : cols;
@@ -3382,8 +3399,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
                 // --moe-stream-guess-skip-full-gpu 1 (a GPU machine): the same tag for the GPU's combined step and its top-k, with
                 // the GPU copy of the 'full' bytes (skip-full's layout in the op params; its own magic, so a CPU never reads a GPU address)
+                // (the bytes live on the VRAM pool's GPU: a guess that runs on another GPU may not read them; a CPU guess ignores the GPU tag)
+                const ggml_backend_dev_t g9_rd = la_nt > 0 ? mstream->router_dev_of(il + la_ds[0]) : nullptr;
+                const bool g9_here = g9_rd == nullptr || g9_rd == mstream->pool_dev;
                 if (mstream->p1.guess_skip_full && mstream->p1.guess_skip_full_gpu && mstream->el_has_gpu && la_nt <= 4 &&
-                        mstream->g9_dev_ptr() != nullptr) {
+                        mstream->g9_dev_ptr() != nullptr && !g9_here) {
+                    static bool said = false;
+                    if (!said) {
+                        said = true;
+                        fprintf(stderr, "llama_moe_stream: --moe-stream-guess-skip-full-gpu: off for the layers whose guess runs on another GPU than "
+                                "the VRAM pool's (%s): their guess reads every row (first: layer %d)\n",
+                                mstream->pool_dev ? ggml_backend_dev_name(mstream->pool_dev) : "none", il);
+                    }
+                }
+                if (mstream->p1.guess_skip_full && mstream->p1.guess_skip_full_gpu && mstream->el_has_gpu && la_nt <= 4 &&
+                        mstream->g9_dev_ptr() != nullptr && g9_here) {
                     uint8_t * full = mstream->g9_dev_ptr();
                     ggml_tensor * as_t = comb_id;
                     while (as_t && as_t->op != GGML_OP_ARGSORT) {
@@ -3497,6 +3527,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred)) {   // what the producer copies
                     pred->flags |= (int32_t) LLAMA_MOE_STREAM_TENSOR_GUESS_MARK;
                     pred->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = il;
+                    moe_pin(pred, mstream->ne_mark_dev);   // (with several GPUs the scheduler could move it to the next layer's)
                 }
 
                 // Measurement only (MOE_STREAM_LEAD2_COST=1): the 2-ahead guess that 2-ahead reads would need - the
@@ -3732,6 +3763,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ids_cont->flags |= (int32_t) LLAMA_MOE_STREAM_TENSOR_ROUTER_MARK;
                 ids_cont->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = il;
                 ids_cont->src[1] = cur_in;   // CONT reads only src[0]; the producer copies src[1] too, and it orders cur_in first
+                moe_pin(ids_cont, mstream->ne_mark_dev);   // the mark runs on the GPU of the marks (several GPUs)
                 ggml_build_forward_expand(gf, ids_cont);
                 if (pred) {
                     ggml_build_forward_expand(gf, pred);
@@ -3779,6 +3811,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ids_cont->src[1] = cur_in;   // the CPU split's other inputs, packed in this order (the producer stops at the first null)
                 ids_cont->src[2] = pred ? pred : weights;
                 ids_cont->src[3] = pred ? weights : nullptr;
+                moe_pin(ids_cont, mstream->ne_mark_dev);   // its guess source may come from the next layer's GPU: copied here, not moved there
                 ggml_build_forward_expand(gf, ids_cont);
                 weights_expanded = true;   // (a source of the mark: computed before it)
                 const bool vx_ok = !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps &&
@@ -3890,16 +3923,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // With GPU waves, each wave's ids (and the VRAM ids) go to the GPU ONCE through a cont on the
             // GPU backend and the chunks take views of that - not one async host copy per chunk view, which the next wave's remap op
             // could overwrite before it ran (--moe-stream-async-h2d)
-            ggml_backend_t lm_gpu_be = nullptr;
+            ggml_backend_t lm_gpu_be = nullptr;   // (the VRAM pool's GPU: the wave matmuls of the RAM pools run there)
             if (lm_phase == 2 && mstream->gpu_waves > 0 && lm_chunk >= (int64_t) mstream->gpu_waves && !mstream->cpu_repack_on.load() &&
                     cparams.op_offload) {
-                for (int b = 0; b < ggml_backend_sched_get_n_backends(sched) && !lm_gpu_be; b++) {
-                    ggml_backend_t     be  = ggml_backend_sched_get_backend(sched, b);
-                    ggml_backend_dev_t dev = ggml_backend_get_device(be);
-                    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                        lm_gpu_be = be;
-                    }
-                }
+                lm_gpu_be = moe_backend_of(mstream->pool_dev);
             }
             const auto lm_ids_on_dev = [&](ggml_tensor * ids_all) -> ggml_tensor * {
                 if (!lm_gpu_be) {

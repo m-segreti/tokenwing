@@ -866,7 +866,7 @@ struct common_params {
     int64_t     moe_stream_vram_scratch = -1;       // the op scratch pool mapped before the VRAM check, bytes; -1 = derived from the model, 0 = not mapped
     int64_t     moe_stream_vram_growth = 0;         // what the CUDA runtime adds lazily after the load-time check, bytes, 0 = derived
     std::string moe_stream_correction = "";         // the trained correction file of the router-trick guess, "" = off
-    int32_t     moe_stream_idle_load = 0;           // 1 = idle-time loading of empty RAM slots from the usage table
+    int32_t     moe_stream_idle_load = 0;           // 1 = idle-time loading of empty RAM slots from the usage table; 2 = also every RAM slot filled before the model counts as loaded
     std::string moe_stream_usage_file = "";         // the usage table's path, "" = <sidecar>.usage.json
     int32_t     moe_stream_idle_pause_ms = 0;       // no call for this long = idle, 0 = 500
     int32_t     moe_stream_read_ahead = 0;          // 1 = read the next layer's most-used experts during a big prompt call
@@ -917,6 +917,8 @@ struct common_params {
     int32_t     moe_stream_vram_lend_prompt  = 0; // a prompt's big GPU tensors in lent VRAM pool places (0 = off, 1)
     int32_t     moe_stream_vram_lend_short   = 64; // prompt calls of at most N tokens in the real compute buffer
     int32_t     moe_stream_timing            = 0; // 1 = measure where a call's time goes (host, device, copies, syncs), report it per word
+    std::string moe_stream_vram_device;           // the GPU that holds the VRAM expert pool, "" = the first GPU
+    std::string moe_stream_gpu_layers_device;     // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (repeated flags joined with ';')
     int32_t     moe_stream_vram_follow_tick = 8;
     int32_t     moe_stream_vram_follow_swaps = 64;
     int32_t     moe_stream_vram_follow_recent = 256;

@@ -765,6 +765,8 @@ static void common_params_apply_system_config(common_params & params, llama_exam
     }
 }
 
+static std::vector<int32_t> moe_stream_dev_spec_layers(const std::string & spec);
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
 
@@ -830,7 +832,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
             if (!seen_args.insert(arg).second) {
-                const bool skip = (arg == "--spec-type");
+                const bool skip = (arg == "--spec-type" || arg == "--moe-stream-gpu-layers-device");   // (the second: each one adds a device)
 
                 if (!skip) {
                     LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -993,6 +995,18 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (!params.moe_stream_correction.empty() && params.moe_stream.empty()) {
         off("--moe-stream-correction", "--moe-stream (the guess it corrects is the streaming engine's)");
         params.moe_stream_correction.clear();
+    }
+    // --moe-stream-gpu-layers-device: its layers are the whole-layer list (in the order named), its devices the places of their experts
+    if (!params.moe_stream_gpu_layers_device.empty()) {
+        std::string list;
+        for (const int32_t il : moe_stream_dev_spec_layers(params.moe_stream_gpu_layers_device)) {
+            list += string_format("%s%d", list.empty() ? "" : ",", il);
+        }
+        if (!params.moe_stream_gpu_layers_list.empty() && params.moe_stream_gpu_layers_list != list) {
+            LOG_WRN("--moe-stream-gpu-layers-list %s is not used: --moe-stream-gpu-layers-device names the whole layers (%s)\n",
+                    params.moe_stream_gpu_layers_list.c_str(), list.c_str());
+        }
+        params.moe_stream_gpu_layers_list = list;
     }
     // VRAM follow moves the VRAM expert pool; the device pass in the launch needs the pool and the GPU form of needed-early's "router
     // done"; the copy-back is part of VRAM follow
@@ -1335,7 +1349,7 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
             throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
         }
         if (!seen_args.insert(arg).second) {
-            const bool skip = (arg == "--spec-type");
+            const bool skip = (arg == "--spec-type" || arg == "--moe-stream-gpu-layers-device");   // (the second: each one adds a device)
 
             if (!skip) {
                 LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -1516,6 +1530,42 @@ static std::vector<std::string> parse_csv_row(const std::string& input) {
     fields.push_back(std::move(field));
 
     return fields;
+}
+
+// --moe-stream-gpu-layers-device: "DEV=LIST;DEV=LIST", LIST = layer numbers and ranges a-b separated by commas. Returns the layers in
+// the order given (each once); throws std::invalid_argument naming what is wrong
+static std::vector<int32_t> moe_stream_dev_spec_layers(const std::string & spec) {
+    std::vector<int32_t> ids;
+    for (const std::string & part : string_split<std::string>(spec, ';')) {
+        if (part.empty()) {
+            continue;
+        }
+        const size_t eq = part.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 >= part.size()) {
+            throw std::invalid_argument("expected DEV=LIST (e.g. CUDA1=25-48 or CUDA0=2,3), got '" + part + "'");
+        }
+        for (const std::string & item : string_split<std::string>(part.substr(eq + 1), ',')) {
+            const size_t dash = item.find('-', 1);
+            char * end = nullptr;
+            const long a = item.empty() || !isdigit((unsigned char) item[0]) ? -1 : strtol(item.c_str(), &end, 10);
+            long b = a;
+            if (a >= 0 && dash != std::string::npos && end == item.c_str() + dash && isdigit((unsigned char) item[dash + 1])) {
+                b = strtol(item.c_str() + dash + 1, &end, 10);
+            }
+            if (a < 0 || end == nullptr || *end != '\0' || b < a || b > 4095) {
+                throw std::invalid_argument("expected layer numbers or ranges a-b in '" + part + "', got '" + item + "'");
+            }
+            for (long il = a; il <= b; il++) {
+                if (std::find(ids.begin(), ids.end(), (int32_t) il) == ids.end()) {
+                    ids.push_back((int32_t) il);
+                }
+            }
+        }
+    }
+    if (ids.empty()) {
+        throw std::invalid_argument("expected DEV=LIST (e.g. CUDA1=25-48), got '" + spec + "'");
+    }
+    return ids;
 }
 
 // a byte count with an optional suffix: 20GiB, 20g, 512MiB, 1048576
@@ -3398,7 +3448,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "loaded from the model file and that layer's MoE runs entirely on the GPU, at the cost of one "
         "layer's worth of experts (1.494 GiB per layer on Ling-3.0-flash). A negative value fits as many "
         "layers as the free VRAM takes (default: -1, which is 4 layers on a 12 GB card at -c 4096; 0 "
-        "streams every layer)",
+        "streams every layer). A positive N is checked against the free VRAM before the load: the layers that do not fit next to "
+        "the other weights, the context and the VRAM pool's minimum are streamed instead (the last picked first), with one line",
         [](common_params & params, int value) {
             params.moe_stream_gpu_layers = value;
         }
@@ -3406,9 +3457,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-gpu-layers-list"}, "LIST",
         "comma-separated MoE layer indices to keep on the GPU instead of streaming them, e.g. \"5,17,38\" "
-        "(takes precedence over --moe-stream-gpu-layers)",
+        "(takes precedence over --moe-stream-gpu-layers). Checked against the free VRAM before the load: the layers that do not fit "
+        "next to the other weights, the context and the VRAM pool's minimum are streamed instead, the list's last first, with one line; "
+        "a context that still cannot be created in VRAM loads the model again with one layer fewer",
         [](common_params & params, const std::string & value) {
             params.moe_stream_gpu_layers_list = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-gpu-layers-device"}, "DEV=LIST",
+        "whole MoE layers whose routed experts sit on GPU DEV (a name as --list-devices prints it), whatever device holds the rest of "
+        "the layer (its attention, KV cache, router and shared expert follow -ngl / -ts / --device as always): e.g. CUDA1=25-48 or "
+        "CUDA0=2,3. Repeat it for more devices (or join them with ';'). The whole layers are every layer named, in the order given; "
+        "when it is given, --moe-stream-gpu-layers-list and --moe-stream-gpu-layers are not used. Checked against each device's free "
+        "VRAM before the load: the layers that do not fit are streamed instead, the last named on the device that is short first, with "
+        "one line; a DEV that is not a GPU of the model streams its layers, with one line (default: unset = whole layers sit on their "
+        "layer's own device)",
+        [](common_params & params, const std::string & value) {
+            (void) moe_stream_dev_spec_layers(value);   // the syntax, here; the device names at load
+            params.moe_stream_gpu_layers_device += (params.moe_stream_gpu_layers_device.empty() ? "" : ";") + value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-vram-device"}, "DEV",
+        "the GPU (a name as --list-devices prints it, e.g. CUDA1) that holds the VRAM expert pool (--moe-stream-vram-free / "
+        "--moe-stream-vram-experts) and everything that belongs to it, sized from that GPU's free VRAM; the prompt matmuls that read "
+        "the RAM pools then run on that GPU only, so it is the one GPU that works with RAM and the SSD. It may differ from the GPUs "
+        "that hold the streamed layers' attention and routers. A DEV that is not a GPU of the model keeps the first GPU, with one "
+        "line (default: unset = the first GPU of the model's device list)",
+        [](common_params & params, const std::string & value) {
+            params.moe_stream_vram_device = value;
         }
     ));
     add_opt(common_arg(
@@ -4094,17 +4172,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--moe-stream-idle-load"}, "0|1",
+        {"--moe-stream-idle-load"}, "0|1|2",
         "1 = idle-time loading: after the model is loaded, and after every request once no call has come for --moe-stream-idle-pause, "
         "EMPTY RAM slots are filled with the most-used experts of the usage table (--moe-stream-usage-file), at the lowest read "
         "priority; it never evicts an expert, and a request stops it at once. The table is counted live (picks per expert per layer) "
         "and saved next to the sidecar by an atomic replace; the first start reads <table>-seed (counted from recordings) when the table "
-        "does not exist yet. Not with elastic RAM (default: 0)",
+        "does not exist yet. 2 = 1, and the model counts as loaded only once every RAM slot is filled (every expert when all fit, else "
+        "each layer's most-used; no time limit): the first request does not start cold, the load takes longer (progress lines "
+        "'llama_moe_stream: loading: experts into RAM ...' on stderr). Not with elastic RAM (default: 0)",
         [](common_params & params, int value) {
-            if (value != 0 && value != 1) {   // clamped with a warning
+            if (value < 0 || value > 2) {   // clamped with a warning
                 const int v0 = value;
-                value = std::min(std::max(value, 0), 1);
-                LOG_WRN("--moe-stream-idle-load must be 0 or 1: %d -> %d\n", v0, value);
+                value = std::min(std::max(value, 0), 2);
+                LOG_WRN("--moe-stream-idle-load must be 0, 1 or 2: %d -> %d\n", v0, value);
             }
             params.moe_stream_idle_load = value;
         }
@@ -4120,7 +4200,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-idle-pause"}, "MS",
-        "with --moe-stream-idle-load 1, no call for this many milliseconds = idle (default: 500)",
+        "with --moe-stream-idle-load 1 or 2, no call for this many milliseconds = idle (default: 500)",
         [](common_params & params, int value) {
             if (value <= 0) {   // clamped with a warning
                 const int v0 = value;

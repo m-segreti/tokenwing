@@ -397,6 +397,9 @@ extern "C" {
     // whether ops that read host weights may run on a device backend, with a copy of those weights.
     // Read when a graph is assigned, so it may be changed between graphs
     GGML_API void                 ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, bool op_offload);
+    // the one backend such an op may be offloaded to (it is not offloaded when that backend declines it); NULL = the first backend
+    // in the scheduler's order that takes it (the default)
+    GGML_API void                 ggml_backend_sched_set_op_offload_backend(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     // Where the time of a graph goes, measured only when GGML_PROFILE is set, printed by
     // ggml_prof_dump(). The slots accumulate microseconds, the counts are plain integers.

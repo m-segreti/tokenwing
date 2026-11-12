@@ -1717,6 +1717,7 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+    int  op_offload_only;   // the backend index op offload may use, -1 = the first that takes the op
 
     int debug;
 
@@ -1858,6 +1859,9 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
+                        if (sched->op_offload_only >= 0 && b != sched->op_offload_only) {
+                            continue;
+                        }
                         if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
                             SET_CAUSE(tensor, "1.off");
                             return b;
@@ -3321,6 +3325,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->op_offload_only = -1;
 
     ggml_backend_sched_reset(sched);
 
@@ -3460,6 +3465,11 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, bool op_offload) {
     GGML_ASSERT(sched);
     sched->op_offload = op_offload;
+}
+
+void ggml_backend_sched_set_op_offload_backend(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    sched->op_offload_only = backend != NULL ? ggml_backend_sched_backend_id(sched, backend) : -1;
 }
 
 // See async_host_input. Only with one copy of the inputs (no pipeline parallelism: no events), which the

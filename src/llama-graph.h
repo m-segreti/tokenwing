@@ -1167,6 +1167,11 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    // MoE streaming: run node t on the backend of device dev (none: as the scheduler decides) - needed-early's marked nodes must run on
+    // the GPU that holds the marks, the GPU pass of a layer-major call on the VRAM pool's GPU
+    ggml_backend_t moe_backend_of(ggml_backend_dev_t dev) const;
+    void           moe_pin(ggml_tensor * t, ggml_backend_dev_t dev) const;
     // A tensor that belongs to the predictor of the next layer gets its own name, so that a trace
     // tool that keys on the name (llama-moe-trace) does not record the predicted ids as the real ones
     void cb_tag(ggml_tensor * cur, const char * name, int il, const char * tag) const;

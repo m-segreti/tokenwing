@@ -9,7 +9,7 @@ enum {
     MOE_STREAM_PL_PICKED  = 0,   // its target's remap picked the expert (a needed read is issued for it there)
     MOE_STREAM_PL_PRESENT = 1,   // at a reader's turn the expert was already in the target pool (READY or LOADING) or VRAM-held
     MOE_STREAM_PL_NOROOM  = 2,   // at a reader's turn the target pool had no slot a guess may take
-    MOE_STREAM_PL_WORDEND = 3,   // the word ended (its target had run)
+    MOE_STREAM_PL_WORDEND = 3,   // the word ended (its target had run, or was the last trunk layer in a call with no output row)
     MOE_STREAM_PL_FULL    = 4,   // the list was full when it was added (never added)
     MOE_STREAM_PL_ABORTED = 5,   // the decode call stopped part-way (abort callback, failed compute) before its target ran
     MOE_STREAM_PL_STALE   = 6,   // --moe-stream-drop-stale 1: its target ran and did not pick it
@@ -172,7 +172,8 @@ struct llama_moe_stream_p1 {
     int64_t     vram_growth = 0;    // --moe-stream-vram-growth: the fit's reserve for lazy allocations; 0 = derived
     std::string correction_file;   // --moe-stream-correction FILE: the trained correction of the router-trick guess, "" = off
     uint64_t    correction_base = 0, correction_size = 0;   // the file is the `size` bytes at `base` of correction_file (the word `model`: data appended to the model file); 0 = the whole file
-    bool        idle_load      = false;   // --moe-stream-idle-load 1 (idle-time loading)
+    bool        idle_load      = false;   // --moe-stream-idle-load 1 or 2 (idle-time loading)
+    bool        fill_start     = false;   // --moe-stream-idle-load 2: every RAM slot filled before the model counts as loaded
     std::string usage_file;               // --moe-stream-usage-file, "" = <sidecar>.usage.json
     int32_t     idle_pause_ms  = 500;     // --moe-stream-idle-pause
     bool        read_ahead     = false;   // --moe-stream-read-ahead 1
@@ -242,6 +243,22 @@ struct llama_moe_stream_p1 {
     int32_t     copy_ahead        = 0;     // --moe-stream-copy-ahead 0|1|2|3 (1: two copy sets when a set costs <= 1/4 of the pool's room, else one; 2: one set; 3: two)
     int32_t     vram_end_fill     = 0; // --moe-stream-vram-end-fill 0|1|2 (the GPU tail refilled at a prompt-end call's end
                                        //   with the prompt-end weights; 2 = also one tick for the per-layer places; 0 = off)
+    // The VRAM check of an explicit whole-layer list / count: per GPU device what it must hold besides the whole layers (bytes, from the
+    // model load); the VRAM pool's minimum and the growth after the check follow the streamed layers and are added by the engine on the
+    // pool's device. Empty = no check (the auto-fit, the plan, no GPU)
+    struct wl_dev {
+        std::string name;
+        int64_t free    = 0;   // free VRAM before the weights load
+        int64_t weights = 0;   // the weights that go there and are not routed experts of streamed or whole layers
+        int64_t ctx     = 0;   // the KV cache and the recurrent state of the layers there
+        int64_t compute = 0;   // the compute buffers' estimate at the physical batch (with the attention mask)
+        int64_t prewarm = 0;   // the backend's cuBLAS handle + workspace and its op scratch pool
+        bool    pool    = false;   // the VRAM pool's device
+    };
+    std::vector<wl_dev>  wl_devs;
+    std::vector<int32_t> wl_dev_of;   // per block: the index in wl_devs of the device that holds the layer's experts when whole, -1 = not a GPU
+    int64_t              wl_ubatch = 512;   // the physical batch (whether GPU-wave graphs, and so the pool's tail, can run)
+    bool                 wl_by_device = false;   // the list came from --moe-stream-gpu-layers-device (the check line names it)
 };
 
 // a slot is empty, has a read in flight, or holds the expert it was loaded with
@@ -1086,6 +1103,7 @@ struct llama_moe_stream {
     std::vector<vx_group_t> vx_groups;
     std::map<int32_t, std::vector<int32_t>> vx_file_layers;   // the list file, by model layer
     std::map<int32_t, std::vector<int64_t>> vx_file_scores;   // optional per-expert priority scores from the list file
+    std::map<int32_t, size_t>               vx_file_len;      // the file's part of a layer's list when the rest was appended in expert-id order (absent = all of it)
     bool                                    vx_non_uniform = false;
     bool        vx_ready     = false;   // the pool is allocated (and filled): the graphs carry the device pass
     bool     (* vx_zero_unreg)(const void * pool) = nullptr;   // --moe-stream-gpu-skip-zero: the CUDA table's unregister
@@ -1881,7 +1899,9 @@ struct llama_moe_stream {
     int64_t vx_growth_bytes(int64_t n_ubatch, int64_t n_ctx, std::string * why) const;   // the fit's reserve for what is still lazy
     void vx_end_state();                              // after a prompt: the free VRAM now against the load-time check
     bool        vx_auto        = false;     // --moe-stream-vram-free: N was chosen by the fit
-    uint32_t    vx_list_min    = 0;         // the shortest list in the file over the streamed layers (auto mode)
+    uint32_t    vx_list_min    = 0;         // the shortest list over the streamed layers (auto mode; with the id-order rest appended)
+    uint32_t    vx_file_min    = 0;         // the shortest list in the file itself over the streamed layers (for the log)
+    size_t      vx_file_part(int32_t il, size_t n) const { const auto it = vx_file_len.find(il); return it == vx_file_len.end() ? n : std::min(n, it->second); }
     uint32_t    vx_extra       = 0;         // the first vx_extra layers of the (single) pool group hold N + 1 places (auto pool: steps of one place, not of one place in every layer)
     ggml_backend_dev_t vx_dev  = nullptr;   // the pool's device, for the end-state line
     int64_t     vx_free_check  = 0;         // free VRAM the placement line (vx_report) read after the pool and the 2nd reserve, bytes
@@ -2115,6 +2135,12 @@ struct llama_moe_stream {
     };
     std::vector<pl_entry> pl_list;
     size_t                pl_cap = 0;
+    // The model's last trunk layer: a graph cuts it to the call's output rows before its experts, so in a call that asks
+    // for no output row its experts never run - its list entries of that word are dropped at the word's end, not a bug
+    // (llama-server sends such a call of one token when it cuts a prompt's last 4 tokens off for a context checkpoint and
+    // one uncached token comes before them; with pos > 0 and one token it counts as a decode word)
+    int32_t               pl_il_crop = -1;
+    int32_t               call_n_out = -1;   // the output rows the current call asks for (llama_context sets it before set_decode; -1 = not told)
     bool                  plan_on = false;
     bool                  drop_stale = false;   // --moe-stream-drop-stale 1 (with plan 1)
 
@@ -2158,6 +2184,7 @@ struct llama_moe_stream {
     // The counter rule of both stages compares the slot with ne_call_seq, a number that moves once per
     // one-token decode call with needed-early on (ne_call_start), so a slot left by an aborted call can never pass.
     bool                  ne_gpu = false;
+    ggml_backend_dev_t    ne_mark_dev = nullptr;   // the GPU whose backend holds the mark tables (every marked node is pinned to it)
     uint32_t              ne_call_seq = 0;         // mtx: this call's number (0 = no call yet; the slots start at 0)
     ggml_backend_buffer_t ne_pin_buf = nullptr;
     int32_t *             ne_pin = nullptr;        // [n_layer_all * ne_stride]: ids, then the counter (the same layout as ne_buf)
@@ -2648,6 +2675,20 @@ struct llama_moe_stream {
     // The MoE layers whose routed experts are not streamed but loaded onto the GPU (no pool, no
     // remap op, no prefetch: the stock build_moe_ffn path over all n_expert experts)
     std::vector<int32_t>   gpu_layers;
+    std::vector<int32_t>   gpu_layers_pick;   // the same layers in the order they were picked (a list's own order)
+    // More than one GPU. pool_dev: the GPU of the VRAM expert pool (--moe-stream-vram-device, else the first GPU of the model; null =
+    // none), set at load before the per-device check; pool_dev_set: the flag named it (the prompt matmuls of the RAM pools then run on that
+    // GPU only). whole_dev[il]: the device that holds whole layer il's experts (--moe-stream-gpu-layers-device, else the layer's own device).
+    // router_dev_all[il]: the GPU that runs layer il's router (null: the CPU, or not known), set after the weights load
+    ggml_backend_dev_t              pool_dev     = nullptr;
+    bool                            pool_dev_set = false;
+    std::vector<ggml_backend_dev_t> whole_dev;
+    std::vector<uint8_t>            whole_test_other;   // MOE_STREAM_TEST_WHOLE_OTHER_CARD (test only): counts as on another GPU for the drop
+    std::vector<ggml_backend_dev_t> router_dev_all;
+    ggml_backend_dev_t router_dev_of(int32_t il) const { return il >= 0 && (size_t) il < router_dev_all.size() ? router_dev_all[(size_t) il] : nullptr; }
+    // The whole layer to give up after an allocation failed on device `failed`: the last picked whose experts are there (the last picked
+    // when `failed` is null); -1 = none there
+    int32_t whole_layer_to_drop(ggml_backend_dev_t failed) const;
     // The VRAM budget the auto-fit divides by the cost of one whole layer, and the order it
     // takes them in ("hot": the layers a census measured as reading the most, "last": the deepest; the default is "hot")
     int64_t     vram_reserve    = 0;
@@ -2790,12 +2831,20 @@ struct llama_moe_stream {
     // once in idle_setup) gives the stamps before the fix (use_counter - 1 - r at the issue, wrapping; the landing's own stamp after it)
     bool                        idle_stamp_old = false;
     int64_t                     n_idle_shifts  = 0;   // layer shifts made for the fixed stamps
+    // --moe-stream-idle-load 2: the fill at start. idle_arm runs one idle round on the calling thread before the context returns
+    // (no call can come meanwhile); it waits for the reads to land instead of polling, keeps 2 reads per I/O thread queued, and the
+    // first fill read of each layer carries the read-back check (a model that fits whole would have no needed read to carry it)
+    bool                        fs_done    = false;   // the fill at start has run (once per model, not per context)
+    bool                        fs_running = false;   // mtx: the fill at start is issuing reads (enqueue lets its reads carry the check)
+    std::vector<int32_t>        fs_verify_slot;       // [n_layer] mtx: the slot whose fill read carries the layer's check, -1 = none
+    std::vector<uint8_t>        verify_checked;       // [n_layer] verify_mtx: the layer's check has run (only sized for the fill at start)
+    void fs_verify_settled(llama_moe_stream_layer & sl, int32_t slot, bool landed);   // mtx held: a fill read's claim kept or given back
     void idle_setup();                           // the constructor's part: the table, the thread
-    void idle_arm();                             // llama_context, once the context (and the VRAM pool) is built
+    void idle_arm(bool may_fill = true);         // llama_context, once the context (and the VRAM pool) is built; may_fill = false: no fill at start
     void idle_call_start();                      // llama_context::decode, before anything of the call runs
     void idle_call_end();                        // end_call
     void idle_loop();
-    void idle_round(std::unique_lock<std::mutex> & lock);
+    void idle_round(std::unique_lock<std::mutex> & lock, bool start = false);   // start: the fill at start (see fs_done)
     void idle_drain();                           // mtx held: every queued idle read taken back (its slot settles EMPTY)
     void idle_used(llama_moe_stream_layer & sl, int32_t s) {   // mtx held: a call used an expert an idle load (or a read-ahead) brought in
         if (!sl.slot_idle.empty() && sl.slot_idle[s]) {

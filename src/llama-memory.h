@@ -31,6 +31,13 @@ struct llama_memory_params {
     bool no_alloc;
 };
 
+// Whether the last failed allocation of a context's memory (KV cache, recurrent state, compute buffers) was in device memory, not host
+// memory - whole GPU MoE layers can give it room (llama_moe_stream_ctx_failed_on_gpu); llama_init_from_model clears it. Per thread
+// The device whose allocation failed is kept too when it is known (NULL = not known), for the choice of the whole layer to give up
+void llama_memory_note_alloc_failure(bool on_device, ggml_backend_dev_t dev = nullptr);
+bool llama_memory_alloc_failed_on_device();
+ggml_backend_dev_t llama_memory_alloc_failed_dev();
+
 // the tensor contexts and backend buffers of a memory instance
 // with no_alloc, dummy buffers are attached instead of allocating the tensor data, so the memory use can still be measured
 struct llama_memory_bufs {

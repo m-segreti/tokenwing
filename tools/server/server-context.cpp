@@ -1064,11 +1064,20 @@ struct server_slot {
                         n_dec_tok > 0 ? (double) dec_stall/(double) n_dec_tok/1000.0 : 0.0,
                         n_pre_tok > 0 ? (double) pre_stall/(double) n_pre_tok/1000.0 : 0.0);
 
-                {   // the margin to the process's own memory cap, after every request (Linux cgroup v2)
+                {   // the margin to the process's own memory cap, after every request (Linux cgroup v1 or v2)
                     int64_t cmx = 0, cpk = 0, cmg = 0;
                     if (llama_moe_stream_cap_margin(&cmx, &cpk, &cmg)) {
-                        SLT_INF(*this, "      moe stream: process memory cap %.0f MiB, peak use %.0f MiB, margin to the cap %.0f MiB\n",
-                                (double) cmx/1048576.0, (double) cpk/1048576.0, (double) cmg/1048576.0);
+                        // the peak counts file cache too (a model another program read earlier); with 16 MiB or more of it the use now without it
+                        int64_t cun = 0, cca = 0;
+                        if (llama_moe_stream_cap_now(&cun, &cca) && cca >= ((int64_t) 16 << 20)) {
+                            SLT_INF(*this, "      moe stream: process memory cap %.0f MiB, peak use %.0f MiB, margin to the cap %.0f MiB; the peak counts file cache: "
+                                    "in use now %.0f MiB without %.0f MiB of file cache the kernel can free, room now %.0f MiB\n",
+                                    (double) cmx/1048576.0, (double) cpk/1048576.0, (double) cmg/1048576.0,
+                                    (double) cun/1048576.0, (double) cca/1048576.0, (double) (cmx - cun)/1048576.0);
+                        } else {
+                            SLT_INF(*this, "      moe stream: process memory cap %.0f MiB, peak use %.0f MiB, margin to the cap %.0f MiB\n",
+                                    (double) cmx/1048576.0, (double) cpk/1048576.0, (double) cmg/1048576.0);
+                        }
                     }
                 }
 

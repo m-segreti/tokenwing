@@ -397,6 +397,16 @@ extern "C" {
                                            //       ones are still being read (the wait moves from remap() into
                                            //       ggml's mul_mat_id), 0 = off
         int32_t      moe_stream_ubatch;   // the physical batch the VRAM reserve is sized for, 0 = 512
+        // The context the model is loaded for, for the VRAM check of a whole-layer list / count (its KV cache, recurrent state and
+        // attention mask are counted from it): the size (0 = the training context), sequences (0 = 1), the KV cache types (enum ggml_type),
+        // the recurrent state's extra rows per sequence, and flags: 1 = one KV buffer for all sequences, 2 = a full-size SWA cache,
+        // 4 = the KV cache on the layers' devices (the default)
+        uint32_t     moe_stream_ctx;
+        uint32_t     moe_stream_ctx_seq;
+        int32_t      moe_stream_ctx_type_k;
+        int32_t      moe_stream_ctx_type_v;
+        uint32_t     moe_stream_ctx_rs_seq;
+        int32_t      moe_stream_ctx_flags;
         int64_t      moe_stream_ram;        // RAM budget for the pools in bytes, 0 = moe_stream_slots decides
         int32_t      moe_stream_plan_only;  // print the streaming plan and stop, load nothing
         const char * moe_stream_oracle;     // trace prefix to replay instead of predicting, NULL = off
@@ -465,7 +475,7 @@ extern "C" {
         int64_t      moe_stream_vram_scratch;   // the op scratch pool mapped before the VRAM check, bytes; -1 = derived from the model, 0 = not mapped
         int64_t      moe_stream_vram_growth;    // VRAM the CUDA runtime still adds after the load-time check, bytes, 0 = derived
         const char * moe_stream_correction;     // the trained correction file of the router-trick guess, NULL = none
-        int32_t      moe_stream_idle_load;      // 1 = idle-time loading (empty RAM slots filled from the usage table), 0 = off
+        int32_t      moe_stream_idle_load;      // 1 = idle-time loading (empty RAM slots filled from the usage table), 2 = 1 + every RAM slot filled before the model counts as loaded, 0 = off
         const char * moe_stream_usage_file;     // the usage table's path, NULL = next to the sidecar (<sidecar>.usage.json)
         int32_t      moe_stream_idle_pause_ms;  // no call for this long = idle, 0 = 500
         int32_t      moe_stream_read_ahead;     // 1 = in a big prompt call, layer L's expert stage reads layer L+1's
@@ -555,6 +565,11 @@ extern "C" {
                                                 //      at start for one at the full context); longer ones lend (default 64)
         int32_t      moe_stream_timing;         // 1 = measure where a call's time goes (host compute, device kernels, copies, syncs) and
                                                 //      report it per word; costs a few clock reads and two CUDA events per graph
+        const char * moe_stream_vram_device;    // the GPU (a device name, e.g. "CUDA1") that holds the VRAM expert pool and takes the
+                                                //      prompt matmuls of the RAM pools; NULL = the first GPU of the model
+        const char * moe_stream_gpu_layers_device; // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (LIST: layers and ranges a-b): their
+                                                //      experts on DEV whatever device holds the layer; NULL = on the layer's own device.
+                                                //      The layers themselves come from moe_stream_gpu_layers_list (common fills it)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -2230,8 +2245,23 @@ extern "C" {
     // fill out with the plan of --moe-stream for a model and a sidecar. Reads the model header and
     // the sidecar metadata only, allocates nothing. Returns false when the plan does not work out
     // (a budget that is too small, a sidecar of another model, ...).
-    // The process's own memory cap (cgroup v2 on Linux) and how close the use came to it; false when there is none
+    // The process's own memory cap (cgroup v1 or v2 on Linux) and how close the use came to it; false when there is none
     LLAMA_API bool llama_moe_stream_cap_margin(int64_t * cap_max, int64_t * peak, int64_t * margin);
+    // The same cap's use now without the file cache the kernel can free, and that cache (0 when the system does not say); false when there
+    // is no cap. The peak above counts that cache too
+    LLAMA_API bool llama_moe_stream_cap_now(int64_t * use, int64_t * file_cache);
+
+    // The whole MoE layers the model keeps on the GPU (--moe-stream-gpu-layers / --moe-stream-gpu-layers-list), in the order they
+    // were picked (a list's own order); fills up to n_max ids and returns how many there are (0 without streaming)
+    LLAMA_API int32_t llama_moe_stream_gpu_layers(const struct llama_model * model, int32_t * out, int32_t n_max);
+
+    // true when the last llama_init_from_model on this thread failed to allocate device memory (not host memory) for the KV cache,
+    // the recurrent state or the compute buffers - room that whole GPU MoE layers can give
+    LLAMA_API bool llama_moe_stream_ctx_failed_on_gpu(void);
+
+    // The whole GPU MoE layer to give up after such a failure: the last picked of those whose experts sit on the device whose
+    // allocation failed (the last picked of all when that device is not known); -1 = none on that device (fewer whole layers cannot help)
+    LLAMA_API int32_t llama_moe_stream_gpu_layer_to_drop(const struct llama_model * model);
 
     // With --moe-stream-elastic 1, no --moe-stream-slots and no --moe-stream-ram-free, the
     // pools start with all free RAM minus keep-free (opts keep=, else ram_margin, else 500 MiB) minus the freeable part (opts part=,

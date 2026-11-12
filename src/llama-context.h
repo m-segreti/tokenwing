@@ -447,6 +447,9 @@ private:
     ggml_backend_t                    lm_ev_be = nullptr;
     void lm_signal_done(int il_from, int il_to);   // lm_layer_done for the streamed layers of [il_from, il_to)
 
+    // This context's backend of the VRAM pool's GPU (--moe-stream-vram-device, else the first GPU); null = no such backend
+    ggml_backend_t ms_pool_backend() const;
+
     // The cuts armed for the next call (cc_cuts all, cc_keep the ones whose state is copied), the call that runs them
     // (cc_active), the staging (one block of cc_bytes per kept cut: the sequence cell's rows of every recurrent tensor, at
     // cc_off[tensor]; pinned host memory of the first GPU device when there is one), the layers copied per kept cut, and the cuts

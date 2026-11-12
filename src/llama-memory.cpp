@@ -70,6 +70,22 @@ bool llama_memory_status_is_fail(llama_memory_status status) {
 // llama_memory_bufs
 //
 
+static thread_local bool               llama_memory_alloc_dev     = false;
+static thread_local ggml_backend_dev_t llama_memory_alloc_dev_ptr = nullptr;
+
+void llama_memory_note_alloc_failure(bool on_device, ggml_backend_dev_t dev) {
+    llama_memory_alloc_dev     = on_device;
+    llama_memory_alloc_dev_ptr = on_device ? dev : nullptr;
+}
+
+bool llama_memory_alloc_failed_on_device() {
+    return llama_memory_alloc_dev;
+}
+
+ggml_backend_dev_t llama_memory_alloc_failed_dev() {
+    return llama_memory_alloc_dev_ptr;
+}
+
 ggml_backend_buffer_ptr llama_memory_bufs::alloc_buf(ggml_context * ctx, ggml_backend_buffer_type_t buft, bool no_alloc, const char * name) {
     ggml_backend_buffer_ptr buf;
     if (no_alloc) {
@@ -81,6 +97,7 @@ ggml_backend_buffer_ptr llama_memory_bufs::alloc_buf(ggml_context * ctx, ggml_ba
         buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft)); // real buffer
     }
     if (!buf) {
+        llama_memory_note_alloc_failure(!ggml_backend_buft_is_host(buft), ggml_backend_buft_get_device(buft));
         throw std::runtime_error(std::string("failed to allocate buffer for ") + name);
     }
     return buf;

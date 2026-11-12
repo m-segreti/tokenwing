@@ -973,8 +973,16 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+// the buffer type of the last buffer a reserve could not allocate (see ggml_gallocr_last_failed_buft)
+static ggml_backend_buffer_type_t ggml_gallocr_failed_buft = NULL;
+
+ggml_backend_buffer_type_t ggml_gallocr_last_failed_buft(void) {
+    return ggml_gallocr_failed_buft;
+}
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
+    ggml_gallocr_failed_buft = NULL;
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -1135,6 +1143,7 @@ static bool ggml_gallocr_reserve_n_impl(
                     if (own->chunks[0] == NULL) {
                         free(own);
                         GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), need);
+                        ggml_gallocr_failed_buft = galloc->bufts[i];
                         galloc->force_replan = true;
                         return false;
                     }
@@ -1177,6 +1186,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
+                    ggml_gallocr_failed_buft = galloc->bufts[i];
                     return false;
                 }
             }
