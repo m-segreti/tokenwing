@@ -242,7 +242,8 @@ table read per token, a file that is not aligned for direct reads, and expert fo
   uses of 3.13 MB (AGENTS.md, T25); here it is 430+ uses of ~2 MB on AVX2-only kernels, Q3_K being the slowest to unpack. **CPU
   kernels are a main decode term for this model.**
 - **To add:** E1 wire Q3_K and Q4_0 into `--moe-stream-cpu-iqk` (prompt-size calls; small-medium); E2 4-row AVX-512 kernels for
-  Q3_K, Q2_0 and Q4_0 with the same output as ggml, the T97 way (large; Flint's item 9 was the same job for Q5_K / IQ4_XS);
+  Q3_K, Q2_0 and Q4_0 with the same output as ggml, built the way Ling's MXFP4 kernel was (`ggml_vec_dot_mxfp4_q8_0_x4`,
+  `ggml/src/ggml-cpu/arch/x86/quants.c`; large - Flint's formats got theirs the same way);
   Strata's own AVX-512 Q2_0 kernels (MIT) are a reference (`ideas-from-other-engines.md`).
 - **Check:** `kernel_bench --check` (4 rows per call memcmp-equal to 4 one-row calls); CPU-only md5 unchanged; CPU ms per token.
 - **CUDA:** MMQ / MMVQ cover all three. Our fused GPU route (`--moe-stream-fused-route`) needs expert groups and does not apply

@@ -68,6 +68,58 @@ reason and test; `notes/port-needs.md` names files and lines.
    the fold for the guess input above (`W' = W_X + Bt`), the engine's model check, and the training scripts
    (`tokenwing-tools/correction/` is Ling's version).
 
+### How each of the three was done before, and a way into it here
+
+The repo's own guide `docs/adding-a-model.md` describes what Flint's port changed in the code (section 3) and the correction file
+(section 5). Read those two sections first; the notes below add this model's side.
+
+**1. Layer-by-layer prompts**
+- *What it is:* a prompt call of several pieces is processed layer by layer over the whole call, instead of piece by piece through
+  all layers. Each layer's experts are then read about once per call, not once per piece. When it landed on Ling, a 16k / 32k
+  prompt took 78 % less time.
+- *How Ling and Flint do it:* `src/llama-context.cpp` runs each layer in two phases - phase 1 per piece (attention, router, shared
+  expert), phase 2 one expert graph per streamed layer for the whole call. The model's graph builds only the layers it is asked
+  for and reads the `lm_*` parameters (`src/models/flint.cpp`, `src/models/bailingmoe3.cpp`). The memory is applied once and
+  replayed for the later layers (`rewind` / `reapply`; Flint's window cache keeps each piece's own cell records,
+  `src/llama-kv-cache.cpp`). The switch per architecture is `llama_arch_layer_major`. `notes/qwen38-q14.md` has file and line.
+- *What is different here:* the hybrid memory with the sparse-attention indexer cache and the k-pool state has no `rewind` /
+  `reapply` yet; the n-gram rows are per piece; four hyper-connection streams must be carried between layer groups, where Ling
+  and Flint carry one.
+- *A way in:* (1) the layer-range graph builder with whole layers per piece (`MOE_STREAM_TEST_LM_GROUP=G`). It runs the same ops
+  in the same order as the normal path, so its CPU text must equal the normal path's exactly: this proves the memory replay before
+  any speed work. (2) Then the two-phase form; its text may differ at the rounding level, so check KLD and a sane answer.
+  (3) Prompt time and GiB read at 10k / 32k / 50k, and the first reply tokens after the prompt.
+
+**2. CPU kernels for Q3_K, Q4_0, Q2_0**
+- *What it is:* the CPU computes most of a reply token's experts (16 of 43 ms here), and for your three formats it uses ggml's
+  one-row AVX2 kernels.
+- *How Ling and Flint do it:* for replies, a 4-row AVX-512 kernel that gives exactly ggml's output (`ggml_vec_dot_mxfp4_q8_0_x4`
+  in `ggml/src/ggml-cpu/arch/x86/quants.c`, switched by `--moe-stream-cpu-x4`), and one fused step for gate + up + SwiGLU
+  (`--moe-stream-cpu-fuse`). For prompt-size calls, ik_llama.cpp's matmuls (`ggml/src/ggml-cpu/iqk/`, `--moe-stream-cpu-iqk`),
+  which today cover Q4_K, Q5_K, IQ4_XS, IQ3_S and Q8_0.
+- *A way in:* (1) small: ik's Q3_K and Q4_0 matmuls are already in the ported files (`iqk_gemm_kquants.cpp`,
+  `iqk_gemm_legacy_quants.cpp`); wire them into the format switch in `iqk_port.cpp`. (2) large: 4-row kernels for the three
+  formats with ggml's exact output. (3) the fused step for these formats. `notes/port-needs.md` section E has the table of what
+  exists per format.
+- *Checks:* a kernel test where 4 rows per call must be byte-equal to 4 one-row calls of ggml's kernel
+  (`scripts/kernels/kernel_bench.cpp` is our test tool for Ling's format, as a pattern); the CPU frozen text unchanged; CPU time
+  per token and CPU-only tok/s before and after.
+
+**3. The correction file**
+- *What it is:* a small trained file that sharpens the guess of the next layer's experts: the routers' weights plus a low-rank
+  term, applied to the guess input. The text never changes with it; only fewer experts are read late. On Ling it saved
+  1.4 ms per token on math at a small RAM size.
+- *How Ling does it:* recordings of real runs with the engine's recorder (`--moe-stream-record`), training with
+  `tokenwing-tools/correction/` (`correction_fit.py`, `make_correction.py`, `check_correction.py`), loading with
+  `--moe-stream-correction FILE`; the engine checks the file against the model (`src/llama-moe-correction.cpp`).
+- *What is different here:* this model has no `ffn_norm`, which the file format and the engine's check both use, so the engine
+  refuses the file today. The guess input is the hyper-connection mix (`--moe-stream-pred-shared 1`), and the shape is 512
+  experts, top 10, no groups, layers 0-47.
+- *A way in:* (1) keep the guess input as it is now - it must not change once training starts. (2) A second form in the file
+  format and the engine's check for this kind of model (`W' = W_X + Bt`; `notes/port-needs.md` B2). (3) The training scripts for
+  this shape. (4) Checks: how often the guess is right with and without the file, on recordings the training did not see
+  (`scripts/q10/erec_recall.py`); the frozen texts unchanged; needed reads and SSD wait in 5 pairs.
+
 **Also yours: improvements and speed-ups**, kernels first, for the engine in general or for this model. Two places to start.
 
 What our measurements say:
