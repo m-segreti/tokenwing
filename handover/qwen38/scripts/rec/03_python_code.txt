@@ -1,0 +1,6 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+Write a Python function `dijkstra(graph, source)` where graph is a dict mapping nodes to lists of (neighbour, weight) tuples. Use a heap, handle negative weights by raising a ValueError, and add a type-annotated version using `heapq` and `collections`. Add a docstring with a doctest example.<|im_end|>
+<|im_start|>assistant
+<think>

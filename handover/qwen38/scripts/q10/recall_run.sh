@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+cd /path/to/project/traces/qwen38/q10
+OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 python3 erec_recall.py recall_g123.json  g1=er_g1_01_casual_chat,er_g1_03_python_code,er_g1_04_cpp_code,er_g1_05_math_word_problem g2=er_g2_01_casual_chat,er_g2_03_python_code,er_g2_04_cpp_code,er_g2_05_math_word_problem g3=er_g3_01_casual_chat,er_g3_03_python_code,er_g3_04_cpp_code,er_g3_05_math_word_problem

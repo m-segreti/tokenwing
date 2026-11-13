@@ -1,0 +1,495 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+Summarise the following design notes in five short bullet points.
+
+# Ling 3.0 Flash on 12 GB VRAM + 32 GB RAM: SSD-streamed MoE with a prefetcher
+
+Research notes, design, and experiment plan. Compiled 2026-09-29.
+
+---
+
+## 0. TL;DR
+
+- **Goal:** run Ling-3.0-flash (124B total, 5.1B active, MXFP4, 69.8 GB) on a laptop with
+  12 GB VRAM + 30 GB RAM, with the SSD feeding missing experts in the background.
+  Target: close to what the same laptop would do with 64 GB+ RAM.
+- **The core rule.** Prediction hides *latency*. It does not create *bandwidth*.
+  The SSD stays invisible when:
+
+      (GB of routed experts per token NOT already in RAM/VRAM) × tok/s  ≤  SSD bandwidth
+      i.e.  miss_rate × 1.0 GB × tok/s ≤ ~5.5 GB/s
+
+  At 25 tok/s that allows a **~22% miss rate**. At 20 tok/s it allows ~27%.
+- **Why Ling:** only ~1.0 GB of routed experts per token, about half of gpt-oss-120b's 1.9 GB.
+  Everything else (attention, 1 shared expert, 2 dense layers, embeddings; ~3B of the 5.1B active)
+  stays resident in VRAM.
+- **Nobody has published this exact combination yet.** Existing SSD-streaming engines reach 2–7 tok/s:
+  - Pulsar, colibri, MoE-Direct, and llama.cpp PR #25294 are mostly on-demand loading, or GPU-only compute.
+  - Nobody has combined all three on a consumer laptop:
+    1. SSD tier + RAM tier where the **CPU computes RAM-resident experts** (llama.cpp `--cpu-moe` style);
+    2. a real multi-layer / next-token **predictor**;
+    3. **non-blocking miss handling**.
+- **Plan:** measure → trace real routing → simulate → build an MVP on llama.cpp (fork PR #25294 ideas)
+  → add predictors → add miss fallback → polish (persistence, file layout, MTP hints).
+- **Key experiment:** "oracle replay". Record the exact expert trace of a greedy run, then replay
+  the same prompt with perfect prefetch. That is the user's "100% predictor" measured on the real
+  machine, and it sets the true ceiling.
+
+---
+
+## 1. The machine (measured, not assumed)
+
+| Component | Spec | Measured / notes |
+|---|---|---|
+| GPU | RTX 5070 Ti Laptop, 12 GB GDDR7, Blackwell, compute cap 12.0 | 11.6 GB free. Native MXFP4 on GPU. |
+| GPU link | PCIe 4.0 **x8** (card supports gen5 x16; the CPU limits it) | ~13–14 GB/s real. Only matters for moving weights *to* VRAM. |
+| CPU | Ryzen AI 9 HX 370 (4× Zen 5 + 8× Zen 5c, 24 threads, AVX-512) | CPU computes RAM-resident experts. |
+| RAM | 30 GB usable LPDDR5-8000, 128-bit | 128 GB/s theoretical. **Measured CPU read (AVX-512, 4 GiB, AC/performance): 46 GB/s @1 thread, 84 GB/s @4, 72 @8, 69 @12, 63-65 @16-24** (more threads = lower; tune `-t`). ~8 GB used by OS/desktop at idle. |
+| SSD | WD PC SN5000S 1 TB, PCIe 4.0 x4 | See the table below. |
+| Model disk | `/path/to/disk` = nvme0n1p4, **NTFS via ntfs3**, 207 GB free | O_DIRECT works on ntfs3 (verified). |
+| Linux root | btrfs, 56 GB free | Too small for the model. Holds `~/llama.cpp`. |
+| Toolchain | CUDA 13.3 at `/usr/local/cuda`; host compiler `g++-15` (nvcc 13.3 rejects GCC 16); cmake + ninja | llama.cpp b11242 built at `~/llama.cpp/build/bin`. |
+
+**SSD random-read benchmark** (O_DIRECT, random offsets in a 21.7 GB GGUF on the NTFS partition,
+Python threads acting as queue depth):
+
+| Read size | 1 thread | 8 threads | 16 | 32 | 64 |
+|---|---|---|---|---|---|
+| 1.04 MB (one Ling expert *slice*: gate, up or down) | – | 3.12 GB/s | 4.79 | **5.30** | 5.14 |
+| 3.13 MB (one whole Ling expert, if repacked contiguous) | 3.62 | **5.73** | – | 5.52 | – |
+| 13.2 MB (gpt-oss expert) | 5.00 | 5.69 | – | 5.37 | – |
+| 4 KB random | 9k IOPS | 66k IOPS | – | 106k IOPS (Python-limited) | – |
+
+**Re-run on AC power, "performance" profile (2026-09-29):**
+
+| Read size | 1 | 8 | 16 | 32 | 64 threads |
+|---|---|---|---|---|---|
+| 1.04 MB slice | – | **5.26** | **5.46** | 5.38 | 5.25 GB/s |
+| 3.13 MB expert | 3.88 | **5.66** | 5.57 | 5.51 | – |
+| 13.2 MB | – | 5.60 | – | – | – |
+
+On AC/performance, 1 MB slices reach ~5.3 GB/s with only 8 in flight (was 3.1 on the default profile).
+**Always benchmark and run on AC + performance profile.**
+
+**Sustained read (3.13 MB × 8 threads, 40 s):** 5.34–5.75 GB/s throughout; NVMe temperature 55 → 75 °C and still
+rising at the end (sensor: `/sys/class/nvme/nvme0/hwmon4/temp1_input`). No throttling within 40 s. A multi-minute
+test is still needed (thermal throttling risk for long generations).
+
+What this means (default power profile, first run):
+- Full bandwidth (~5.5 GB/s) needs about **8 in-flight 3 MB reads** or **~32 in-flight 1 MB reads**.
+- In the stock GGUF, each Ling expert is 3 separate 1.04 MB slices, one each in the
+  `ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps` tensors.
+- Repacking into expert-contiguous 3.1 MB blocks (mbolt "interleave") makes the I/O easier.
+
+**Sanity benchmark of the build:** Qwen3.6-35B-A3B Q4_K (20 GiB), `-ngl 99 -ncmoe 20 -fa 1`
+→ pp512 **601 tok/s**, tg128 **69 tok/s**.
+
+---
+
+## 2. The model: Ling-3.0-flash (inclusionAI, released Aug 2026, MIT license)
+
+### 2.1 Architecture (from config.json and llama.cpp `src/models/bailingmoe3.cpp`)
+
+- **Layers:** 42, plus 1 MTP/NextN layer (blk.42).
+  - Layers 0–1 are dense FFN (intermediate 6144).
+  - Layers 2–41 are MoE, so **40 MoE layers**.
+- **Attention:** 35 KDA (Kimi Delta Attention, linear) + 7 gated MLA layers at 5/11/17/23/29/35/41.
+  - Ratio 5:1.
+  - Tiny KV cache: MLA kv_lora_rank 512 + rope 64. KDA keeps a fixed-size recurrent state.
+- **hidden_size** 2560; **moe_intermediate_size** 768; **shared expert** 768 (1 per layer).
+- **Routed experts:** 512 per layer, **top-8**.
+  - Sigmoid scoring with an expert bias (`exp_probs_b`), `noaux_tc`.
+  - **Grouped routing:** 8 groups of 64, pick the top-4 groups, then the top-8 experts inside them.
+  - routed_scaling_factor 2.5, normalized top-k.
+- **Vocab** 157,184, untied embeddings. Context 256K (scalable to 1M).
+- **Official FP4:** `inclusionAI/Ling-3.0-flash-fp4`, MXFP4 routed experts, within ~1% of BF16
+  on most of its reported benchmarks (SciCode −6.8%).
+
+### 2.2 Derived numbers (MXFP4 ≈ 4.25 bits per weight)
+
+| Quantity | Value |
+|---|---|
+| Params per expert | 3 × 2560 × 768 = 5.90M |
+| Bytes per expert slice (gate, up or down) | 1,044,480 B = **exactly 255 × 4096** |
+| Bytes per expert | 3.13 MB |
+| Routed experts per layer | 512 × 3.13 MB = 1.60 GB |
+| All routed experts (40 layers) | **~64.1 GB** (+1.6 GB for MTP-layer experts) |
+| Routed experts used per token | 40 × 8 = 320 experts = 960 slices = **~1.0 GB** |
+| Non-routed weights (attention, shared, dense, embeddings, routers) | ~4 GB in the MXFP4_MOE file → VRAM |
+| Expert cache budget | VRAM ~5.5–6 GB + RAM ~20 GB ≈ **26 GB ≈ 40% of experts** |
+| Allowed miss rate (SSD 5.5 GB/s) | 20 tok/s → 27.5% · 25 → 22% · 30 → 18% |
+| Time per MoE layer at 25 tok/s | ~1 ms (40 ms per token / ~40 layers) |
+| SSD capacity in expert units | ~1.76 experts/ms → a 22% miss budget ≈ 70 experts ≈ 40 ms of SSD per token |
+
+### 2.3 In llama.cpp (mainline)
+
+- **Support:** arch `bailingmoe3`, PR #26608, merged 2026-08-17 (first release b10470).
+  - Ling 3.0 VL folded in via PR #29151.
+  - Files: `src/models/bailingmoe3.cpp` (563 lines); `src/models/delta-net-base.cpp` (the KDA path).
+- **KDA runs on the GPU:** it goes through the existing `gated_delta_net` op, which has a CUDA kernel
+  (`ggml/src/ggml-cuda/gated_delta_net.cu`). "No new kernels" in the PR meant it reused this op.
+- **Expert tensors:** `blk.N.ffn_{gate,up,down}_exps.weight`, shape [2560, 768, 512]
+  (down is [768, 2560, 512]).
+  - In ggml, `ne2` is the outermost dimension, so **each expert's slice is contiguous**.
+  - Router: `ffn_gate_inp` [2560, 512] + `ffn_exp_probs_b` [512].
+  - Shared expert: `ffn_{gate,up,down}_shexp`.
+- **MoE call:** `build_moe_ffn(...)` in `src/llama-graph.cpp`, then `ggml_add(moe, shared)`.
+- **Graph callback names** (for tracing): `ffn_moe_logits`, `ffn_moe_probs`, `ffn_moe_probs_biased`,
+  `ffn_moe_probs_masked` (group masking), **`ffn_moe_topk`** (the selected expert ids, int32
+  [n_expert_used, n_tokens]), `ffn_moe_weights`, ...
+- **MTP:** bundled in the community GGUFs; `--spec-type draft-mtp`.
+  - Reviewers saw ~50% acceptance, and MTP was a **net slowdown** as speculative decoding on
+    Metal and Vulkan.
+  - Use it only as a *prefetch hint*, not for speculative decoding.
+- **Reference speeds** from the PR: Strix Halo (Vulkan) Q4_K_M 41.6–43.1 tok/s without MTP;
+  M3 Ultra 56.5 tok/s.
+
+### 2.4 Files
+
+- **Main:** `bloomer010/Ling-3.0-flash-GGUF` → `Ling-3.0-flash-MXFP4_MOE.gguf` (69,847,777,696 B, single file, includes MTP).
+  https://huggingface.co/bloomer010/Ling-3.0-flash-GGUF/resolve/main/Ling-3.0-flash-MXFP4_MOE.gguf
+- **Dev/debug:** `noctrex/Ling-3.0-tiny-MXFP4_MOE-GGUF` → `Ling-3.0-tiny-MXFP4_MOE.gguf` (4.88 GB).
+  - Same `bailingmoe3` code path, but 24 layers, hidden 1536, **128 experts** (not 512), top-8.
+  - Good for checking correctness. Not representative for routing statistics.
+  https://huggingface.co/noctrex/Ling-3.0-tiny-MXFP4_MOE-GGUF/resolve/main/Ling-3.0-tiny-MXFP4_MOE.gguf
+
+---
+
+## 3. Theory, and what the simulations say
+
+### 3.1 Lookahead vs bandwidth (the key correction to the early brainstorm)
+- A 7-token lookahead does not help if every token needs fresh data. Over 7 tokens you must load
+  7 tokens' worth of misses.
+- Lookahead only needs to cover **one miss-load time**. At 25 tok/s, a 1–2 token (or 3–4 layer)
+  lead is enough.
+- What decides speed is the **miss rate**, set by:
+  1. routing locality;
+  2. cache size;
+  3. eviction quality.
+- Evicting is free: weights are read-only, so nothing is ever written back to the SSD.
+
+### 3.2 Simulation (synthetic routing; `tools/sim.py` and `tools/sim2.py`)
+- Model shapes: Ling = 512 experts, top-8, 41% resident, 1.0 GB per token.
+  gpt-oss = 128 experts, top-4, 46% resident, 1.9 GB per token.
+- SSD ceiling = 5.5 / (GB per token × miss).
+- LRU = no prediction. Oracle = Belady / MIN, perfect knowledge of the future.
+
+| Routing pattern | gpt-oss LRU / oracle | Ling LRU / oracle |
+|---|---|---|
+| Uniform, no locality (worst case) | 5 / 12 tok/s | 9 / 21 tok/s |
+| Skewed popularity (Zipf 1.0) | 13 / 28 | 26 / 58 |
+| Skewed + 40% token-to-token reuse | 20 / 45 | 42 / 92 |
+
+Findings:
+- Ling's SSD ceiling is about 2× gpt-oss's in every scenario.
+- Knowing only the next ~8 tokens barely beats LRU for *eviction*. The value of short-range
+  prediction is **hiding latency**; long-range knowledge (Belady) is what cuts bytes.
+- **These are synthetic. Real Ling traces (Phase 2) decide everything.**
+
+### 3.3 Real-world locality evidence
+- **Qwen3.5-122B (llama.cpp RFC #24528):** the top 10% of experts take ~80% of decode hits.
+- **LinMoE:** fit routing as Zipf with s ≈ 0.456 for Qwen3.5-397B.
+- **ST-MoE (2606.15453):**
+  - Consecutive-token expert overlap is ~2× random.
+  - Cross-layer selections are statistically dependent.
+  - Math is more predictable than summarization.
+- **OpenMoE (2402.01739):** "context-independent specialization". Routing is largely decided by
+  token ID and fixed early in training. So routing for a guessed token can be looked up.
+- **Routing-locality paper (2604.17182), Qwen3.5-35B:**
+  - Same token → Jaccard 0.649 (40× random).
+  - Different token → 0.175 (11× random).
+- **SeqMoE (2609.12978):** at **45% expert residency → 96.97% hit rate → 80.22% of full-load
+  performance**, using seq-to-seq multi-step prediction + probabilistic Belady.
+  This is the closest published evidence for the whole idea.
+- **Frequency-Diversity Law (2607.20427):** frequent tokens use sparse, stable routing; rare ones
+  use diverse experts. Load balancing masks this somewhat.
+
+### 3.4 Energy caveat
+- SSD offloading costs up to ~12× more energy per token than HBM (arXiv 2508.06978).
+- Prefetching hides latency, not energy.
+- On a laptop, expect battery drain and SSD heat. Watch for thermal throttling during
+  sustained ~5 GB/s reads.
+
+---
+
+## 4. Proposed system design
+
+### 4.1 Where things live, and where things are computed
+
+    VRAM (~11.6 GB)
+      - all non-routed weights (attention/KDA/MLA, shared experts, dense layers, routers, embeddings/output) ~4 GB
+      - KV cache + KDA state (small) + compute buffers ~1.5 GB
+      - [phase 2+] static HOT expert set ~5.5 GB (~1,800 experts), computed on GPU
+    RAM (~20 GB for experts)
+      - dynamic expert SLOT POOLS (~6,400 experts), computed on the CPU (like --cpu-moe)
+      - pinned (cudaHostRegister) only if promoting to VRAM
+    SSD (NTFS, O_DIRECT, read-only)
+      - full expert store (the original GGUF, or a repacked 4 KB-aligned expert-major sidecar file)
+
+- **The PCIe bottleneck doesn't apply.** RAM-resident experts are computed by the CPU, not copied
+  to the GPU. Only activations cross PCIe.
+- **The GPU tier is optional at first.**
+  - The MVP puts all routed experts on the CPU from RAM slots.
+  - Then add the VRAM hot set with hybrid hit/miss execution (RFC #24528 idea): GPU computes its
+    cached experts, CPU computes the rest, outputs are summed.
+- **GPUDirect Storage is not an option:** GeForce drivers return "unsupported device" for cuFile.
+  The path is NVMe → RAM (O_DIRECT) → CPU compute, or → cudaMemcpyAsync to VRAM.
+
+### 4.2 Slot pools + ID remapping (the proven mechanism)
+- Per MoE layer, replace the [.., .., 512] expert tensors with pools [.., .., n_slots]
+  (PR #25294 and the Jetson patch do this).
+- After `ffn_moe_topk`, a CPU custom op remaps expert ids → slot ids. Then `ggml_mul_mat_id` runs on the pool.
+- **Careful:** the same ids feed several consumers in the graph (gate, up, down, weights).
+  All of them must be remapped consistently. The Jetson author hit silent correctness bugs here.
+- **Slot floor:** PR #25294 needs ≥ 3 × n_expert_used slots per layer. For Ling: ≥ 24 per layer
+  (tiny next to our ~160 per layer).
+- **Budget:** global heat-based admission across layers (Pulsar) or proportional per-tensor
+  budgets (Guanaco), not a fixed equal split. Layers differ in hotness.
+
+### 4.3 The I/O layer
+- **One dedicated I/O thread with io_uring** (liburing), O_DIRECT, registered/fixed buffers,
+  queue depth 32 (Pulsar and moonshine do this). Or a thread pool of `pread`s as a fallback.
+- **O_DIRECT alignment:** buffer, file offset and length must be 4096-aligned.
+  - Ling slices are exactly 255 × 4096 B.
+  - But GGUF tensor data is only 32-byte aligned (`general.alignment`), so slice offsets are
+    probably misaligned.
+  - Options:
+    - (a) read an aligned superset into a bounce buffer + memcpy (~0.1 ms per MB);
+    - (b) **repack** into a sidecar file: expert-major, 4 KB-aligned, gate|up|down contiguous
+      (3.1 MB per read), optionally co-activation ordered (mbolt). ~64 GB, fits in the 207 GB free.
+- **mmap vs O_DIRECT:** llama.cpp discussion #18758 found mmap faster when the model is ≤ ~RAM
+  (page cache reuse). Our model is ~2.3× RAM, where O_DIRECT + our own cache wins:
+  - LinMoE: O_DIRECT 2.1–2.2 GB/s vs mmap 586 MB/s;
+  - PR #25294: O_DIRECT avoids page-cache thrash;
+  - mbolt: explicit reads +13–14% vs page faults.
+- **Keep RAM free for slot pools:** don't let the OS page cache compete. Use O_DIRECT, and don't
+  mmap the expert regions, or `MADV_DONTNEED` them.
+
+### 4.4 The predictor stack (build in this order)
+
+| # | Predictor | Lead time | Cost | Evidence |
+|---|---|---|---|---|
+| P0 | Temporal: experts used by recent tokens at the same layer stay cached | – | free | all papers |
+| P1 | **Layer-ahead router trick:** apply the routers of layers L+1..L+k (with `exp_probs_b` + group masking) to the current residual h_L; prefetch the top-M (M ≈ 12–16 to cover the real top-8) | k × ~1 ms | ~1.3M MACs per router, trivial | FATE (2502.12224), Pre-gated MoE (2308.12066), Pulsar (default on), SpecPrefetch, DALI (residual-based) |
+| P2 | Cross-layer co-activation table: expert e at layer L → likely experts at L+1 | ~1 layer | table lookup | ST-MoE, Guanaco "PILOT" |
+| P3 | **Next-token:** Ling's MTP head drafts token t+1 → token-ID → expert lookup for early layers + the router trick on draft hidden states | ~1 token (~40 ms) | one MTP layer forward (its MoE experts must be resident: +1.6 GB, or restrict) | SP-MoE (2510.10302), Edge0 prerouter (next token, +59% decode), OpenMoE token-ID routing |
+| P4 | Trained prerouter: small MLP per layer, h_t → experts at t+1, trained on our own traces | 1 token | hours of training | Edge0 (2609.18063), MoE-Beyond (2508.17137), PreScope LLaPor (2509.23638) |
+| P5 | Sequence-to-sequence multi-step predictor + probabilistic Belady eviction | multi-step | research | SeqMoE (2609.12978) |
+
+- **Scheduling:** a priority queue of predicted experts by (needed-by time, confidence).
+  - Never let speculative prefetch starve demand reads.
+  - Cap prefetch per token (SP-MoE's "cutoff layer").
+
+### 4.5 Eviction and admission
+- **Start with LFU-with-aging**, protecting anything predicted for the next N layers or tokens.
+  - RFC #24528 found plain LFU-with-aging turns budget into throughput; budget-blind policies didn't.
+  - tinyserve (#20757): SLRU default; admit only after the 2nd miss (frequency-gated admission).
+- **Later:** probabilistic Belady from predictor confidence (SeqMoE); workload-aware replacement (DALI).
+- **Persist a "warm census"** (expert popularity) to a sidecar file.
+  - At startup, bulk-read the hot set sequentially: ~26 GB at 5.7 GB/s ≈ 5 s.
+  - Pulsar's `.warm` file: 2nd run reaches full speed immediately.
+  - The RFC's hot-set file in `~/.cache/llama.cpp/`.
+
+### 4.6 Miss handling (never block compute, when enabled)
+1. **Wait** (exact, lossless). The default, and needed for correctness tests.
+2. **Skip + renormalize:** drop the missing expert, renormalize the remaining top-k weights.
+3. **Substitute:** use the best-scoring *resident* expert. Cache-aware routing: Mixture of
+   Cache-Conditional Experts (2412.00099, Qualcomm), 2× on mobile, training-free.
+4. **Low-precision fallback copy:** HOBBIT (2411.01433, integrated into llama.cpp) loads low-bit
+   versions for less critical misses; SliceMoE (2512.12990) uses bit-sliced caching. Would need
+   a resident ~2-bit copy (about 30 GB for Ling, too big), so probably not for us.
+5. **Router fine-tuning for reuse** (later research):
+   - ReMoE (2605.27081): +26% expert reuse, 1.77–1.99× decode on edge.
+   - Cache-Aware Joint Router Adaptation (2609.04895): tested on GPT-OSS.
+
+Options 2–3 change outputs, so measure KL-divergence and perplexity.
+
+### 4.7 Prompt processing (TTFT; we accept some cost)
+- A long prompt touches nearly all experts.
+- Load each expert **once per batch**. Two known approaches:
+  - wave-partitioned MoE (PR #25294, ~5.3× vs mmap);
+  - full-layer staging (glm53-ssd-streaming: pre-read the next layer's block into pinned buffers
+    during compute; 29 → 240 tok/s prefill). They replaced waves because **waves produced
+    incorrect output** for them.
+- Expect ~26–40 GB of cold reads → ~5–7 s extra TTFT on a cold start. Less once warm.
+
+### 4.8 What NOT to do (lessons from others)
+- **No speculative decoding while streaming.** Verifying k draft tokens touches the union of
+  their experts (more bytes). Pulsar found drafting ROI negative unless the draft's experts are
+  VRAM-resident; the Ling PR found MTP a net slowdown even fully resident.
+- **Don't move MUL_MAT_ID to the GPU for RAM-resident experts** (i.e. stream weights over PCIe
+  each token). Several llama.cpp attempts were abandoned over sync costs (#20757, #21609, #21614, #23170).
+- **Don't rely on the mmap page cache** when the model is ≫ RAM (thrashing, synchronous 4 KB faults).
+- **Don't expect gains once the working set fits** (RFC #24528 "working-set rule").
+
+---
+
+## 5. llama.cpp integration map (mainline b11242, `~/llama.cpp`)
+
+| Area | Where | Notes |
+|---|---|---|
+| Model graph | `src/models/bailingmoe3.cpp` (~L381 `build_moe_ffn`, shared expert add) | Tensor creation ~L117–154. |
+| MoE builder | `src/llama-graph.cpp` `build_moe_ffn` (~L2000–2160); `ggml_mul_mat_id` ~L1555 | Callback names: `ffn_moe_topk` etc. The id-remap hook goes after `ffn_moe_topk`. |
+| MUL_MAT_ID kernels | CPU: `ggml/src/ggml-cpu/ggml-cpu.c`, `repack.cpp`; CUDA: `ggml/src/ggml-cuda/ggml-cuda.cu` | The CPU path computes RAM experts. |
+| File I/O | `src/llama-mmap.cpp` (already has `O_DIRECT` support in `llama_file`, `has_direct_io()`) | Reusable for aligned reads. |
+| Load modes | `-lm/--load-mode auto\|none\|mmap\|mlock\|mmap+mlock` | Baselines. |
+| Expert placement | `--cpu-moe`, `--n-cpu-moe N`, `-ot/--override-tensor` | `--cpu-moe` ≈ our MVP compute placement. |
+| Lazy tensors | `--tensor-read-lazy on\|off\|auto` (PR #27794, merged 2026-08-27) | mmap lazy ranges + MADV_RANDOM. Built for n-gram/PLE tables; **experts not included**. Similar infrastructure. |
+| Eval callback | `cb_eval` in `llama_context_params` / `common_params`; `examples/eval-callback` (`llama-eval-callback`) | Use it to dump `ffn_moe_topk-<il>` for tracing. |
+| Scheduler | `ggml_backend_sched_*` (`ggml/src/ggml-backend.cpp`) | Hybrid GPU/CPU splits happen here. |
+| Existing streaming PR | #25294 `freedomljc:feat/moe-streaming-core`, +1,450/−16, 3 commits | Adds `src/llama-moe-stream.{h,cpp}` + hooks in loader, graph, context, arg.cpp. Flags `--moe-stream`, `--moe-stream-cache <N\|NGiB>`, `--moe-stream-io-threads`, `--moe-stream-direct`. |
+
+**PR #25294 known limitations** (from the PR):
+- Based on July master, **before** bailingmoe3 was merged, so it needs a rebase.
+- Demand-load only; compute waits (no prediction).
+- Single-tier; designed for unified memory. No CPU-MoE hybrid.
+- Single `llama_context` only.
+- Wave GEMM accumulation drift, so bytes can diverge on long generations.
+- Auto cache sizing aborts when n_expert_used ≥ 6 without a slot floor (Ling has 8, so size explicitly).
+
+Getting it:
+
+    git -C ~/llama.cpp fetch origin pull/25294/head:moe-stream
+
+---
+
+## 6. Experiment plan (phases, commands, go/no-go checkpoints)
+
+### Phase 0: machine characterization (partly done)
+- [x] SSD O_DIRECT random reads by size and queue depth (table in §1).
+- [ ] CPU effective RAM bandwidth.
+  - Use a STREAM-like test, or `llama-bench` on a model fully on CPU.
+  - Or estimate from Qwen3.6-35B with all experts on CPU (`-ncmoe 99`): bytes per token ÷ time per token.
+- [ ] CPU MoE compute rate: tok/s of a fully RAM-resident MoE with `--cpu-moe`. Converts to "RAM GB/s effective".
+- [ ] SSD sustained-read thermals: a 5-minute sustained read while watching temperature
+  (`sensors`, or `nvme smart-log /dev/nvme0` from nvme-cli). Check the rate over time.
+- [ ] File fragmentation of the 70 GB model on NTFS: `filefrag -v` (if supported on ntfs3).
+
+### Phase 1: baselines on Ling-3.0-flash
+- A. **Plain mmap** (page cache is the "cache"):
+
+      llama-bench -m Ling-3.0-flash-MXFP4_MOE.gguf -ngl 99 -ncmoe 99 -fa 1 -p 512 -n 128 -r 1
+      # also llama-cli/llama-server with --cpu-moe for real-chat numbers
+
+  Expect ~1–3 tok/s (thrashing). Record tok/s, `iostat -x 1` read MB/s, and major faults.
+- B. **PR #25294 `--moe-stream`** (after rebasing onto master with bailingmoe3). Try `--moe-stream-cache 20GiB --moe-stream-direct --moe-stream-io-threads 16`.
+- C. *(optional)* Guanaco / MoE-Direct-style engines, only if they support bailingmoe3. Probably not yet.
+- D. **Reference ceiling estimates:** community numbers for Ling at Q4 with 64–96 GB RAM (not yet
+  published for our hardware class), and the Strix Halo 42 tok/s.
+
+### Phase 2: routing traces (the go/no-go data)
+- **Capture per token and MoE layer:** `ffn_moe_topk` (8 ids), and optionally `ffn_moe_weights` / probabilities.
+- **For offline predictor experiments, also capture the router input** (the normed hidden state
+  entering `ffn_gate_inp`) per layer:
+  - 2560 floats × 40 layers × 2 bytes (f16) ≈ 205 KB per token;
+  - 20k tokens ≈ 4 GB.
+- **Tool:** small C++ tool from `examples/eval-callback` that filters tensor names and writes binary
+  (`.npy` or a raw int32 stream). Also dump token ids.
+- **Workload:** ~20 varied sessions (chat, code, math, long doc Q&A, multi-turn), both greedy and
+  temperature 0.7, ~20–50k tokens total. Slow mmap speed is fine.
+
+**Analyses to run:**
+1. Per-layer expert popularity (Zipf fit, entropy, top-10% share).
+2. Token-to-token overlap per layer (Jaccard vs the random baseline 8/512).
+3. Reuse-distance histograms.
+4. Group-level stability (4 of 8 groups): are groups sticky?
+5. Token-ID determinism: the fraction of routing explained by token id per layer.
+6. Cross-layer co-activation (L → L+1 conditional probabilities).
+7. **Cache simulation at our budget** (~40% resident, global and per-layer): LRU, LFU-aging, SLRU,
+   Belady → miss rate → SSD-limited tok/s.
+8. **Offline predictor evaluation:** recall@M of the router trick (apply router_{L+k} to h_L, for
+   k = 1..4), of temporal prediction, and of token-ID lookup.
+
+**CHECKPOINT:**
+- If Belady at ~40% residency gives a miss rate > ~27%, the SSD caps us near 20 tok/s.
+- If realistic policy + predictor gives ≤ 20%, target 25+.
+- If LRU is already ≤ 15%, the problem is mostly latency hiding (good news).
+
+### Phase 3: "oracle replay", measuring the user's hypothesis directly
+- Run 1: greedy, record the exact expert trace.
+- Run 2: same prompt and seed. The engine reads the future trace and prefetches the exact experts
+  ahead of time, with Belady eviction.
+- The result is the **true machine ceiling** for SSD-backed "illusion" inference. It also validates
+  the I/O and compute pipeline independently of predictor quality.
+- Watch out for floating-point nondeterminism changing routing. Verify the tokens are identical.
+
+### Phase 4: engine MVP (lossless)
+- Fork the PR #25294 ideas onto current master, or write fresh:
+  - RAM slot pools per layer;
+  - id-remap op;
+  - io_uring O_DIRECT reader;
+  - CPU compute for routed experts;
+  - everything else on GPU;
+  - LFU-aging;
+  - miss = wait;
+  - P0 + P1 predictors.
+- **Correctness:** greedy output token-identical to stock llama.cpp (the mmap baseline) on a set of
+  prompts (as MoE-Direct verified).
+- **Metrics:** decode tok/s, TTFT, hit rate (RAM, VRAM), SSD GB/s, stall ms per token (time compute
+  waited on I/O), CPU utilization, prefetch precision/recall, wasted bytes.
+
+### Phase 5: predictors + tiers
+- VRAM hot set (static first, from the census; hybrid hit/miss execution).
+- P2 co-activation table; P3 MTP next-token hints; tune prefetch depth k and width M.
+- Warm-census persistence + startup preload.
+- Repacked, aligned, co-activation-ordered expert file (mbolt-style); compare against stock GGUF reads.
+
+### Phase 6: non-blocking misses + quality
+- Skip/renormalize and substitute-resident modes behind flags.
+- **Quality:** `llama-perplexity --kl-divergence-base <ref> --kl-divergence` against stock-engine
+  logits on a fixed text; PPL on wikitext; a few task sanity checks.
+- Report tok/s vs KLD trade-off curves.
+
+### Phase 7 (stretch)
+- Trained prerouter (Edge0-style) from our traces.
+- Probabilistic Belady (SeqMoE).
+- Router fine-tuning for reuse (ReMoE / cache-aware adaptation), if we accept model changes.
+
+---
+
+## 7. Metrics and tools
+
+- **llama.cpp:** `llama-bench` (pp/tg), `llama-cli` / `llama-server` timings,
+  `llama-perplexity` (PPL, `--kl-divergence`), `llama-eval-callback`.
+- **I/O:** `iostat -x 1` (sysstat), `fio` (not installed; `tools/readbench.py` is an O_DIRECT bench that works),
+  `blktrace` / `biolatency` (bcc), `filefrag`.
+- **CPU/GPU:** `perf stat` / `perf top`, `nvtop`, `nvidia-smi dmon`, Nsight Systems (`nsys`,
+  installed with CUDA 13.3: `cuda-nsight-systems-13-3`) for overlap timelines.
+- **Thermals/power:** `sensors`, `nvme smart-log` (nvme-cli), `powertop`.
+  Note AC vs battery power profiles.
+- **Our own counters:** per-layer hit/miss, stall time, bytes read per token, prefetch accuracy, queue depth.
+
+---
+
+## 8. Risks and open questions
+
+1. **Real Ling routing locality is unknown** (load-balanced training with `seq_aux` works against us).
+   Phase 2 answers it.
+2. **CPU compute ceiling:** 4 Zen 5 + 8 Zen 5c cores doing MXFP4 dequant + matvec on ~0.9 GB per
+   token, plus submitting I/O. Could be the real bottleneck before the SSD. Measure in Phase 0.
+   Maybe port ik_llama.cpp's faster CPU MoE kernels later (ik_llama.cpp has only an open Ling PR as of research time).
+3. **SSD sustained-read thermals** in a laptop at ~5 GB/s continuous.
+4. **RAM pressure:** 30 GB total, desktop apps. Slot pools must be sized conservatively.
+   Consider `mlock` for the pools.
+5. **Floating-point nondeterminism** can change top-k routing slightly between runs
+   (affects oracle replay and token-identical tests).
+6. **MXFP4 on CPU:** a supported llama.cpp type (gpt-oss uses it). Check CPU kernel speed vs Q4_K on Zen 5.
+7. **NTFS (ntfs3) quirks:** fragmentation, Windows "optimize drives", Fast Startup
+   (keep Windows Fast Startup off so the volume stays consistent).
+8. **Maintenance:** upstream llama.cpp moves fast; keep the patch small and isolated (like PR #25294's single new file).
+
+---
+
+## 9. Existing projects (code to read, ideas to borrow)
+
+| Project | What it is | Numbers | Borrow |
+|---|---|---|---|
+| **llama.cpp PR #25294** — https://github.com/ggml-org/llama.cpp/pull/25294 | `--moe-stream`: slot cache per layer, id remap, O_DIRECT, async I/O pool, wave prefill | GLM-5.2 254 GB on 128 GB GB10: decode 1.8–2.2 tok/s, 73–79% hit | Base mechanism, flags, file layout of the patch |
+| **Pulsar** — https://github.com/giannisanni/pulsar | Rust+CUDA engine, 11 architectures, no llama.cpp | Reference box: 2×16 GB GPUs, **30 GB RAM**. Hy3 295B 6.0 tok/s; GLM-5.2 2.7 tok/s; Qwen3.6-35B 51.8 tok/s | io_uring + O_DIRECT QD32; next-layer router prefetch; VRAM heat admission; host LFU; `.warm` census; CPU expert lane (42 GB/s on a 9900X); measures real PCIe bandwidth |
+| **Guanaco** — https://github.com/Atomic-Germ/Guanaco | llama.cpp patch set; in-place mmap + madvise; EMA hotness pinning; PILOT cross-layer prefetch; imatrix seeding; io_uring | 122B + 35B concurrently in <15 GB RAM (48 GB box) | EMA/proportional budgets, madvise tricks, imatrix warm start |
+| **glm53-ssd-streaming** — https://github.com/xMytze/glm53-ssd-streaming | llama.cpp patch; 3 tiers; O_DIRECT; full-layer staging; mirror disk | 5090 + 64 GB: decode 2.4–2.9 → 5.8–6.0; prefill 29 → 240; 78% hit; 40% of decode waiting on disk | Staging instead of waves (waves gave wrong output); CPU expert compute dominates decode |
+| **MoE-Direct** — https://github.com/tmxkzm1925-max/MoE-Direct | Windows/CUDA; packed/virtual repack; byte verification; light prefetch | RTX 5080 + 32 GB + Gen5: Qwen3.5-122B 5.6 tok/s (2.3× mmap); gpt-oss-120b token-identical | Correctness methodology (token-identical checks) |
+| **llama-moe-cache (FATE)** — https://github.com/ongunm/llama-moe-cache | ~500 LoC llama.cpp; VRAM cache; cross-layer + temporal prediction; prefetch CUDA stream | 4070 Ti 12 GB: Qwen3-30B 33.7 → 64.5 tok/s, 99.5% hit | Heuristics; "120 GB model" claim is **extrapolated** |<|im_end|>
+<|im_start|>assistant
+<think>

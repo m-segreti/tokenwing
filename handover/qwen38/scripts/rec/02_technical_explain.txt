@@ -1,0 +1,6 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+Explain how a mixture-of-experts transformer layer decides which experts to use for a token, in the grouped-routing style used by models like Mixtral and Ling. Start from the router linear layer and go step by step, mentioning the sigmoid scoring and the expert bias. Assume I know what a matmul is but not how the routing is implemented.<|im_end|>
+<|im_start|>assistant
+<think>

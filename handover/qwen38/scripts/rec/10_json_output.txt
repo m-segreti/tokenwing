@@ -1,0 +1,6 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+Return a single valid JSON object and nothing else. It must have the keys "features" (array of 3 strings), "confidence" (number between 0 and 1), and "labels" (object mapping each feature string to an integer 0-10). Describe this text: "The library API is clean, the error messages are unhelpful, and the documentation is out of date."<|im_end|>
+<|im_start|>assistant
+<think>

@@ -1,0 +1,6 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
+<|im_start|>user
+Write a modern C++20 function that reads a directory recursively and returns a map from file extension to total size in bytes. Use <filesystem>, structured bindings and `std::ranges`. Skip files larger than 100 MiB and say why in a comment.<|im_end|>
+<|im_start|>assistant
+<think>
