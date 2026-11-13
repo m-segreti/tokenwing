@@ -60,9 +60,13 @@
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+#define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
 #define cudaEventDisableTiming hipEventDisableTiming
+#define cudaEventElapsedTime hipEventElapsedTime
 #define cudaEventRecord hipEventRecord
+#define cudaEventRecordWithFlags hipEventRecordWithFlags
+#define cudaEventRecordExternal hipEventRecordExternal
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t
 #define cudaEventDestroy hipEventDestroy
@@ -89,6 +93,9 @@
 #define cudaMemAdvise hipMemAdvise
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
+// HIP takes the symbol itself (HIP_SYMBOL); its template overload takes the address. An address passed in binds that overload
+// to a temporary pointer and the copy fails with "invalid device symbol"
+#define cudaMemcpyToSymbol(symbol, src, count) hipMemcpyToSymbol(HIP_SYMBOL(symbol), src, count)
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice

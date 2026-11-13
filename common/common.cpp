@@ -1916,6 +1916,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_vram_lend_prompt     = params.moe_stream_vram_lend_prompt;
     mparams.moe_stream_vram_lend_short      = params.moe_stream_vram_lend_short;
     mparams.moe_stream_timing               = params.moe_stream_timing;
+    mparams.moe_stream_out_check            = params.moe_stream_out_check;
     mparams.moe_stream_vram_device          = params.moe_stream_vram_device.empty() ? NULL : params.moe_stream_vram_device.c_str();
     mparams.moe_stream_gpu_layers_device    = params.moe_stream_gpu_layers_device.empty() ? NULL : params.moe_stream_gpu_layers_device.c_str();
     mparams.moe_stream_vram_follow_tick     = params.moe_stream_vram_follow_tick;
@@ -2529,6 +2530,21 @@ common_batch common_batch_get_one(llama_context * ctx, const llama_tokens & toke
     return common_batch_get_one(ctx, tokens.data(), (int32_t) tokens.size());
 }
 
+// A prompt batch whose call the engine ended (llama_decode returned 3: it could not finish the call the way it started - e.g. its GPU
+// compute buffer did not fit - and prints why) is processed again from the batch's start, after the memory is cut there. The engine
+// takes another way on the next try (more lent VRAM) and returns an error when none is left, so the tries end
+static int32_t common_prompt_decode_again(llama_context * ctx, llama_batch_ext * batch, int n_past) {
+    int32_t ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+    for (int i = 0; ret == 3 && i < 8; i++) {
+        if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, n_past, -1)) {   // (the batches here are sequence 0)
+            COM_ERR("%s: the engine ended a prompt call and the memory cannot be cut back to position %d to process it again\n", __func__, n_past);
+            break;
+        }
+        ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+    }
+    return ret;
+}
+
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
                 const llama_tokens & all_tokens,
@@ -2554,7 +2570,7 @@ bool common_prompt_batch_decode(
         // is the reason for this logic.
         llama_tokens prefix_tokens(all_tokens.begin() + offset, all_tokens.begin() + offset + n_tokens_before_last);
         common_batch batch_prefix = common_batch_get_one(ctx, prefix_tokens);
-        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch_prefix.get())) {
+        if (common_prompt_decode_again(ctx, batch_prefix.get(), n_past)) {
             COM_ERR("%s", "failed to eval\n");
             return false;
         }
@@ -2566,7 +2582,7 @@ bool common_prompt_batch_decode(
         common_batch batch_last(ctx);
         batch_last.add(all_tokens.back(), n_past, 0, true);
 
-        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch_last.get())) {
+        if (common_prompt_decode_again(ctx, batch_last.get(), n_past)) {
             COM_ERR("%s", "failed to eval last token\n");
             return false;
         }
@@ -2574,7 +2590,7 @@ bool common_prompt_batch_decode(
     } else {
         llama_tokens new_tokens(all_tokens.begin() + offset, all_tokens.begin() + offset + n_new);
         common_batch batch = common_batch_get_one(ctx, new_tokens);
-        if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+        if (common_prompt_decode_again(ctx, batch.get(), n_past)) {
             COM_ERR("%s", "failed to eval\n");
             return false;
         }

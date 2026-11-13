@@ -977,6 +977,16 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// AMD: the largest scratch in bytes launch_fattn takes from the pool for its parallel blocks (GGML_HIP_FA_TMP_MAX_MIB, default
+// 64 MiB; 0 = no cap). Read once.
+static inline size_t ggml_cuda_fattn_amd_tmp_cap() {
+    static const size_t cap = [] {
+        const char * e = getenv("GGML_HIP_FA_TMP_MAX_MIB");
+        return size_t(e ? std::max(0, atoi(e)) : 64) << 20;
+    }();
+    return cap;
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1211,6 +1221,28 @@ void launch_fattn(
                 nwaves_best = nwaves;
                 efficiency_percent_best = efficiency_percent;
                 parallel_blocks = parallel_blocks_test;
+            }
+        }
+
+        // AMD: parallel_blocks > 1 keeps every block's partial output in a scratch buffer of parallel_blocks times the output,
+        // taken from the backend's pool - on HIP builds (no VMM pool) a device allocation at run time that the pool then keeps and
+        // hands to any later request. For a prompt batch that is hundreds of MiB (2048 rows x 32 heads x 512 values: 128 MiB per
+        // block), which a card whose VRAM is planned to the last few hundred MiB does not have; there the output tiles alone fill
+        // the GPU, so fewer blocks per tile cost little.
+        // The scratch is kept under ggml_cuda_fattn_amd_tmp_cap() bytes (GGML_HIP_FA_TMP_MAX_MIB, default 64; 0 = no cap).
+        if (GGML_CUDA_CC_IS_AMD(cc) && parallel_blocks > 1) {
+            const size_t per_block = size_t(ggml_nelements(KQV))*sizeof(float);
+            const size_t cap       = ggml_cuda_fattn_amd_tmp_cap();
+            if (cap > 0 && size_t(parallel_blocks)*per_block > cap) {
+                const int pb_old = parallel_blocks;
+                parallel_blocks = std::max(1, int(cap / per_block));
+                static bool told = false;   // one line per process
+                if (!told) {
+                    told = true;
+                    fprintf(stderr, "%s: AMD: flash attention of a %lld-row call runs %d parallel blocks instead of %d (their scratch "
+                            "%.1f MiB would exceed GGML_HIP_FA_TMP_MAX_MIB %zu)\n", __func__, (long long) Q->ne[1], parallel_blocks,
+                            pb_old, pb_old*per_block/1048576.0, cap >> 20);
+                }
             }
         }
 

@@ -1187,6 +1187,7 @@ static bool ggml_gallocr_reserve_n_impl(
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     ggml_gallocr_failed_buft = galloc->bufts[i];
+                    galloc->force_replan = true;   // (the plan is kept but its buffer is gone: the next alloc_graph must plan and allocate again)
                     return false;
                 }
             }

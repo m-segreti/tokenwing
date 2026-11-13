@@ -449,6 +449,7 @@ private:
 
     // This context's backend of the VRAM pool's GPU (--moe-stream-vram-device, else the first GPU); null = no such backend
     ggml_backend_t ms_pool_backend() const;
+    int            sched_n_gpu() const;   // this context's GPU backends
 
     // The cuts armed for the next call (cc_cuts all, cc_keep the ones whose state is copied), the call that runs them
     // (cc_active), the staging (one block of cc_bytes per kept cut: the sequence cell's rows of every recurrent tensor, at
@@ -486,6 +487,7 @@ private:
     int64_t  lend_T = 0;                                  // the running call's tokens
     bool     lend_no_grow = false;                        // the real buffer may not grow now (a prompt call)
     bool     lend_again = false;                          // a full card ended the call: decode returns 3 (processed again)
+    bool     lend_start_failed = false;                   // the running prompt call's lend at its start failed (it runs on the real buffer)
     std::vector<std::pair<int64_t, bool>> prompt_calls;  // the first 64 prompt calls' tokens (and layer-major or not), for the exit line
     int64_t  n_prompt_calls = 0;                         // (all of them)
     bool     lend_lm_graphs(const llama_memory_context_i * mctx, const std::function<bool(void)> & each);   // the layer-major graphs, one by one
@@ -493,7 +495,7 @@ private:
     void     lend_set(std::vector<ggml_backend_buffer_t> && bufs, const std::vector<int32_t> & U, bool may_grow);
     void     lend_clear();
     void     lend_call_start(bool dec, int64_t T, int64_t kv);   // decode: a prompt call lends (before its graphs), a reply word gives back
-    bool     lend_alloc_retry(ggml_cgraph * gf);          // a graph whose allocation failed: lend / the largest pieces / the real buffer
+    bool     lend_alloc_retry();                           // a graph whose allocation failed: the real buffer grows / the call ends
     void lm_measure_expert_graph();   // the room one layer-major expert graph takes per chunk and wave
     bool lm_xg_fits(int64_t n_tok) const;
     struct { bool on = false; int64_t ub = 1, w = 1, base_n = 0, per_n = 0, room_n = 0, base_m = 0, per_m = 0, room_m = 0; } lm_xg;

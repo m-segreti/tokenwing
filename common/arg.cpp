@@ -1015,8 +1015,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         off("--moe-stream-vram-follow 1", "--moe-stream-vram-experts N or --moe-stream-vram-free SIZE (the GPU expert pool it moves)");
         params.moe_stream_vram_follow = 0;
     }
-    if (params.moe_stream_vram_parallel == 1 && (!pool || params.moe_stream_needed_early != 1)) {
-        off("--moe-stream-vram-parallel 1", !pool ? "--moe-stream-vram-experts N or --moe-stream-vram-free SIZE (the GPU expert pool whose pass it moves)"
+    if (params.moe_stream_vram_parallel >= 1 && (!pool || params.moe_stream_needed_early != 1)) {
+        off(params.moe_stream_vram_parallel == 2 ? "--moe-stream-vram-parallel 2" : "--moe-stream-vram-parallel 1", !pool ? "--moe-stream-vram-experts N or --moe-stream-vram-free SIZE (the GPU expert pool whose pass it moves)"
                                                   : "--moe-stream-needed-early 1 (its \"router done\" lets the CPU experts start during the GPU pass)");
         params.moe_stream_vram_parallel = 0;
     }
@@ -4286,8 +4286,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-stream-prompt-split"}, "0|1",
         "1 = in a prompt call whose expert matmuls run on the CPU (under --moe-stream-gpu-waves), the GPU "
         "computes the VRAM-held experts' pairs beside the CPU split (the router's ids, input and guess handed to the CPU through a pinned "
-        "slot), not after it - the multi-token form of --moe-stream-vram-parallel. Needs --moe-stream-vram-parallel 1, "
-        "--moe-stream-needed-early 1 and --moe-stream-gpu-waves (default: 0)",
+        "slot), not after it - the multi-token form of --moe-stream-vram-parallel. Needs --moe-stream-vram-parallel 1 or 2, "
+        "--moe-stream-needed-early 1 and --moe-stream-gpu-waves; it runs in the layers whose device pass --moe-stream-vram-parallel "
+        "moves (default: 0)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning
                 const int v0 = value;
@@ -4439,16 +4440,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--moe-stream-vram-parallel"}, "0|1",
+        {"--moe-stream-vram-parallel"}, "0|1|2",
         "with --moe-stream-vram-experts (with or without --moe-stream-vram-follow) and --moe-stream-needed-early 1, "
         "the VRAM pool's device pass of a one-token decode call runs in each layer's GPU launch right after \"router done\" - "
-        "during the CPU experts - with its ids from a per-layer table in VRAM; prompts and other calls keep the plain order. Off "
+        "during the CPU experts - with its ids from a per-layer table in VRAM; prompts and other calls keep the plain order. "
+        "1 = only in the launch of a layer whose router runs on the VRAM pool's GPU (one GPU: every layer); with several GPUs a layer "
+        "whose router is on another GPU keeps its pass after the CPU experts. 2 = as 1, and such a layer's pass also runs during its "
+        "CPU experts, on the pool's GPU (its inputs and its sum are copied between the cards on every token; one GPU: the same as 1). Off "
         "with one start-up line when needed-early's GPU form is not active (default: 0 = the device pass after the CPU experts)",
         [](common_params & params, int value) {
-            if (value != 0 && value != 1) {   // clamped with a warning
+            if (value < 0 || value > 2) {   // clamped with a warning
                 const int v0 = value;
-                value = std::min(std::max(value, 0), 1);
-                LOG_WRN("--moe-stream-vram-parallel must be 0 or 1: %d -> %d\n", v0, value);
+                value = std::min(std::max(value, 0), 2);
+                LOG_WRN("--moe-stream-vram-parallel must be 0, 1 or 2: %d -> %d\n", v0, value);
             }
             params.moe_stream_vram_parallel = value;
         }
@@ -4469,8 +4473,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-async-h2d"}, "0|1",
-        "with --moe-stream on one GPU (no pipeline parallelism), a CPU split's output that lies in the GPU's pinned "
-        "host buffer goes to the next GPU split as an async host -> device copy on the GPU's stream, without the host waiting for "
+        "with --moe-stream (no pipeline parallelism; one or more GPUs), a CPU split's output that lies in the GPU's pinned "
+        "host buffer goes to the next GPU split as an async host -> device copy on that GPU's stream, without the host waiting for "
         "the GPU (default: 0 = a synchronous copy, as before)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {   // clamped with a warning
@@ -5013,6 +5017,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 LOG_WRN("--moe-stream-timing must be 0 or 1: %d -> %d\n", v0, value);
             }
             params.moe_stream_timing = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-out-check"}, "N",
+        "with --moe-stream: check the output for NaN / Inf - 256 logits of a call's last output row are read back (one small copy and "
+        "a wait for the device) on every prompt call and on every Nth reply call; non-finite values fail the call (llama_decode "
+        "returns -3, its sequences' memory is dropped) with one line, instead of giving a wrong answer. A wrong expert byte read by a "
+        "matmul makes every later row NaN, so this catches it. 0 = no check at all (default: 16)",
+        [](common_params & params, int value) {
+            if (value < 0) {   // clamped with a warning
+                LOG_WRN("--moe-stream-out-check must be 0 or more: %d -> 0\n", value);
+                value = 0;
+            }
+            params.moe_stream_out_check = value;
         }
     ));
     add_opt(common_arg(

@@ -26,6 +26,9 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+    // the routers are softmax-gated (build_layer_ffn passes it); the file has no gating key, and shared code that builds
+    // guesses from the hparams (the expert streaming's word-start guesses) reads it here
+    hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX;
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
@@ -182,7 +185,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // The word table is read lazily under --moe-stream (llama_arch_marks_token_embd_lazy in llama-model.cpp lists this arch), only
+    // with a separate output.weight: a tied table is also the output matrix and every word would read all of it
+    const bool untied = ml.get_weight(tn(LLM_TENSOR_OUTPUT, "weight").str().c_str()) != nullptr;
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, untied ? TENSOR_READ_LAZY : 0);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -494,6 +500,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // make sure hc_init is in the same graph split as the first layer (-sm tensor)
     ggml_build_forward_expand(gf, res_hc);
 
+    // The expert streaming's word-start guesses (shared code, llama-graph.cpp; nothing without --moe-stream-wordstart)
+    llm_graph_moe_ws ws = moe_ws_begin();
+
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
@@ -543,10 +552,37 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 il);
         cur = ffn_mix.cur;
 
-        cur = build_layer_ffn(cur, il);
+        // The expert streaming's guesses for the next layers (shared code, llama-graph.cpp; all null without --moe-stream).
+        // Without --moe-stream-pred-shared a guess reads this layer's own router input. With it, the guess input for a target
+        // layer X is what X's router would read if this layer's routed experts added nothing: the wide residual plus this
+        // layer's gated shared expert, scattered as the layer's combine does it (base), mixed with X's FFN hyper-connection
+        // weights. The shared expert is then built before the routed experts
+        llm_graph_moe_guess g = moe_guess_routers(model, il);
+        ggml_tensor * shexp = nullptr;
+        ggml_tensor * base  = nullptr;
+        if (g.want_shared) {
+            shexp = build_layer_shexp(cur, il);
+            // il -1: the plain ops (no fused node registered for a tensor the graph may not use)
+            base  = shexp ? build_hc_combine(res_hc, shexp, ffn_mix.inject, -1) : res_hc;
+        }
+        static const bool guess_attn_mix = getenv("MOE_STREAM_TEST_GUESS_IN_ATTN") && atoi(getenv("MOE_STREAM_TEST_GUESS_IN_ATTN")) != 0;
+        const llm_graph_guess_in_fn guess_in = [&, base](int X) {
+            const auto & LX = model.layers[X];
+            ggml_tensor * in = guess_attn_mix   // TEST ONLY: X's attention mixing weights instead
+                ? build_hc_mix(base, LX.hc_attn_norm, LX.hc_attn_down, LX.hc_attn_up, nullptr, LX.hc_attn_down_inject, -1).cur
+                : build_hc_mix(base, LX.hc_ffn_norm,  LX.hc_ffn_down,  LX.hc_ffn_up,  nullptr, LX.hc_ffn_down_inject,  -1).cur;
+            cb(in, "ffn_moe_pred_in", X);
+            return in;
+        };
+        moe_guess_finish_in(model, il, base, base ? guess_in : nullptr, g);
+
+        ggml_tensor * ffn_in_n = cur;   // a word-start source's guess input without --moe-stream-pred-shared
+        cur = build_layer_ffn(cur, il, &g, shexp);
         cb(cur, "ffn_out", il);
 
         res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
+
+        moe_ws_layer(model, il, res_hc, g.pred_base, ffn_in_n, ws, base ? guess_in : nullptr);   // a word-start source's guesses
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
@@ -1246,9 +1282,41 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+ggml_tensor * llama_model_qwen4exp::graph::build_layer_shexp(ggml_tensor * cur, const int il) {
+    if (model.layers[il].ffn_up_shexp == nullptr) {
+        return nullptr;
+    }
+    // shared experts, as in the Qwen3Next reference
+    ggml_tensor * ffn_shexp =
+        build_ffn(cur,
+            model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+            model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+            model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+    cb(ffn_shexp, "ffn_shexp", il);
+
+    // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+    ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+    cb(shared_gate, "shared_expert_gate", il);
+
+    shared_gate = ggml_sigmoid(ctx0, shared_gate);
+    cb(shared_gate, "shared_expert_gate_sigmoid", il);
+
+    ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+    cb(ffn_shexp, "ffn_shexp_gated", il);
+    return ffn_shexp;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il, const llm_graph_moe_guess * g,
+                                                          ggml_tensor * shexp) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // the expert streaming's guesses for the next layers (all null without --moe-stream)
+    const llm_graph_moe_guess none;
+    if (g == nullptr) {
+        g = &none;
+    }
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
@@ -1263,31 +1331,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            /* selected_experts_in = */ nullptr,
+            g->gate_inp_next, g->probs_b_next, g->pred_in,
+            g->gate_inp_next2, g->probs_b_next2, g->gate_inp_next3, g->probs_b_next3,
+            g->rec_on ? &g->rec : nullptr);
     cb(moe_out, "ffn_moe_out", il);
 
-    // shared experts, as in the Qwen3Next reference
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
-
-        shared_gate = ggml_sigmoid(ctx0, shared_gate);
-        cb(shared_gate, "shared_expert_gate_sigmoid", il);
-
-        ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
-        cb(ffn_shexp, "ffn_shexp_gated", il);
-
-        cur = ggml_add(ctx0, moe_out, ffn_shexp);
+    if (shexp == nullptr) {   // built before the routed experts when the guess needed it
+        shexp = build_layer_shexp(cur, il);
+    }
+    if (shexp != nullptr) {
+        cur = ggml_add(ctx0, moe_out, shexp);
         cb(cur, "ffn_out", il);
     } else {
         cur = moe_out;

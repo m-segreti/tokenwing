@@ -219,8 +219,11 @@ struct llama_moe_stream_p1 {
     bool        vram_follow_fixed    = false;   // test only: the held set a function of the text only (synchronous switches)
     bool        vram_follow_pinned   = true;    // the uploader copies through a pinned bounce (13.6 against 12.3 GB/s)
     // --moe-stream-vram-parallel 1 - in a GPU-producer one-token decode graph the VRAM pool's device
-    // pass runs in the layer's GPU launch after "router done" (ids from a per-layer table in VRAM), during the CPU experts
+    // pass runs in the layer's GPU launch after "router done" (ids from a per-layer table in VRAM), during the CPU experts; with
+    // several GPUs only in layers whose router runs on the pool's GPU. 2 (vram_parallel_cross) - also in the other layers: their pass
+    // runs on the pool's GPU and its inputs and sum cross between the cards
     bool        vram_parallel        = false;
+    bool        vram_parallel_cross  = false;
     // --moe-stream-vram-copyback 1 - an expert leaving VRAM follow's set is copied back into its RAM pool
     // (an empty slot, or a keep value above the pool's lowest), and held experts' picks count in the keep value
     bool        vram_copyback        = false;
@@ -240,6 +243,7 @@ struct llama_moe_stream_p1 {
     bool        vram_lend_prompt  = false; // --moe-stream-vram-lend-prompt 1
     int32_t     vram_lend_short   = 64;    // --moe-stream-vram-lend-short N (prompt calls of <= N tokens in the real buffer)
     bool        timing            = false; // --moe-stream-timing 1 (where a call's time goes; see llama_moe_stream::tm_us)
+    int32_t     out_check         = 16;    // --moe-stream-out-check N (the output's NaN / Inf check: every prompt call + every Nth reply call; 0 = off)
     int32_t     copy_ahead        = 0;     // --moe-stream-copy-ahead 0|1|2|3 (1: two copy sets when a set costs <= 1/4 of the pool's room, else one; 2: one set; 3: two)
     int32_t     vram_end_fill     = 0; // --moe-stream-vram-end-fill 0|1|2 (the GPU tail refilled at a prompt-end call's end
                                        //   with the prompt-end weights; 2 = also one tick for the per-layer places; 0 = off)
@@ -507,8 +511,9 @@ struct llama_moe_stream_layer {
     // Set with it - the GPU-producer graph marked this layer's guess (the GPU writes the slot), whether or not the
     // guess also left the remap op; the remap op then marks the layer for the helper (ne_mark), never ne_post (both would write it)
     bool                  ne_guess_marked = false;
-    // The GPU producer may mark this layer's guess - all its targets' routers (la_targets, or pred_il) are on the producer's
-    // GPU; otherwise its guess keeps the host producer (ne_post) and its split the plain input path (decided once, ne_gpu_setup)
+    // The GPU producer may mark this layer's guess - all its targets' routers (la_targets, or pred_il) are on one GPU of the
+    // producer's backend (the one-card rule: on the producer's GPU); otherwise its guess keeps the host producer (ne_post) and its split
+    // the plain input path (decided once, ne_gpu_setup)
     bool                  ne_gpu_ok        = false;
     // --moe-stream-needed-early 1: the in-graph form - a layer with a guess whose own router runs on the CPU and that
     // does not post to the helper (decided once, ne_set_router_gpu): in a one-token graph its remap op is split into op A
@@ -730,7 +735,7 @@ struct llama_moe_stream_layer {
     counters & c() { return decode_phase ? dec : pre; }
     const counters & c() const { return decode_phase ? dec : pre; }
 
-    int64_t n_tok_all = 0;                                  // prompt + decode, for the oracle
+    int64_t n_tok_all = 0;                                  // prompt + decode, for the oracle (the ubatch's rows: ub_rows_of)
     int64_t n_oracle_cmp = 0, n_oracle_miss = 0;             // all tokens
     int64_t n_or_cmp_dec = 0, n_or_miss_dec = 0;             // one token per call, i.e. decode
 
@@ -741,9 +746,13 @@ struct llama_moe_stream_layer {
     int64_t n_wave_stages   = 0;     // wave stages run, summed
 };
 
-// O_DIRECT alignment; the sidecar blocks and the pool slices are multiples of it, so every byte
-// range of a read is aligned
+// The file layout's alignment: a TokenWing model file's tensors start on it, buffers are allocated on it and read chunks are
+// multiples of it
 constexpr size_t MOE_STREAM_ALIGN = 4096;
+
+// An expert slice (and so a pool slot) must be a multiple of this, the smallest sector a drive has. The drive's own direct-read
+// alignment is read at start; a slice that is not a multiple of it (a 512-multiple on a drive that needs 4096) is read through a copy
+constexpr size_t MOE_STREAM_SLICE_ALIGN = 512;
 
 // The pools are allocated 2 MiB-aligned and madvise(MADV_HUGEPAGE)d, so that THP can back
 // them with 2 MiB pages. A 3,133,440 B expert slice then spans 2 huge pages instead of ~765 of 4 KiB.
@@ -926,6 +935,7 @@ struct llama_moe_stream_wave {
     // Which target an early-guess op aims at - 2 = pred_il2 (the layer two ahead),
     // 3 = pred_il3 (three ahead). The chain's later steps come from remap() as they always did.
     int32_t tlead = 2;
+    const ggml_tensor * tail_gate = nullptr;   // the tail tensor this wave's gate matmul reads in the graph built last (copy-ahead check)
 };
 
 struct llama_moe_stream {
@@ -1211,7 +1221,9 @@ struct llama_moe_stream {
     // ordinary places at word time; while a GPU-wave graph runs they are the scheduler's pool copies' memory (a preset target, the
     // compute buffer no longer holds them). tail_ubatch (llama_context, before every ubatch) vacates them first - no expert held there,
     // its id-table row on the zero slices - and a call that is not a GPU-wave call fills the free places again (vf_fill_t).
-    bool     tail_allowed = false;   // llama_context: one GPU, no pipeline parallelism, op offload on (set before vx_setup)
+    bool     tail_allowed = false;   // llama_context: no pipeline parallelism, op offload on, the pool's GPU takes every GPU prompt wave (set before vx_setup)
+    int32_t  n_gpu_ctx    = 0;       // llama_context: the GPU backends of the context (set before vx_setup)
+    bool     tail_test_mg = false;   // MOE_STREAM_TEST_MULTI_GPU_NO_TAIL=1 with several GPUs (test only): no tail
     bool     tail_on      = false;   // the pool has a tail and the scheduler hook may use it (decided in vx_setup)
     bool     tail_vacated = false;   // no expert is held in the tail's first tail_vac_n places and no job targets them (mtx)
     int32_t  tail_vac_n   = 0;       // the places emptied from tail_first (the copy places, + what a layer-major call's tensors
@@ -1309,13 +1321,65 @@ struct llama_moe_stream {
     std::unordered_map<const ggml_tensor *, int32_t> tail_pgroup;  // a layer's pool tensor -> its pool group
     std::vector<std::array<int64_t, 3>> tail_off_g;
     std::vector<uint8_t>                tail_dn_r1;
+    // The output check (llama_context, --moe-stream-out-check N): every prompt call and every Nth reply call; MOE_STREAM_TEST_OUT_NAN=1
+    // (test only) fails every checked call as if its logits were NaN (the failure path)
+    // The rows of the running ubatch (the first streamed layer's op sets it): a layer cut to the output rows - the last layer of a
+    // prompt call, where the graph keeps only the rows that give logits - still advances its token count by the ubatch's rows
+    int64_t  ub_rows = 0;
+    int64_t  ub_rows_of(const llama_moe_stream_layer & L, int64_t n_tok, bool note = true) {
+        if (L.moe_index == 0) {
+            if (note) {
+                ub_rows = n_tok;
+            }
+            return n_tok;
+        }
+        return std::max(n_tok, ub_rows);
+    }
+    // The output check (--moe-stream-out-check N): reply calls counted, calls failed; per kind ([0] prompt calls, [1] reply calls) the
+    // calls checked and the wall time inside the checks (the copy, the wait for the device - the rest of the call's GPU work - the scan)
+    int64_t  out_calls = 0, out_failed = 0, out_checked[2] = { 0, 0 }, out_us[2] = { 0, 0 };
+    bool     out_test_nan = getenv("MOE_STREAM_TEST_OUT_NAN") && atoi(getenv("MOE_STREAM_TEST_OUT_NAN")) != 0;
+    bool     out_check_due(bool prompt) {
+        if (p1.out_check <= 0) {
+            return false;
+        }
+        out_calls += prompt ? 0 : 1;
+        return prompt || out_calls % p1.out_check == 0;
+    }
+    bool     vx_test_pad_check = getenv("MOE_STREAM_TEST_PAD_CHECK") && atoi(getenv("MOE_STREAM_TEST_PAD_CHECK")) != 0;   // (test only)
+    void     vx_pad_check(const char * where);   // MOE_STREAM_TEST_PAD_CHECK: the held places' row padding (mtx held)
+    // The held places' row padding. A quantized matmul whose rows need padding (CUDA / ROCm: to 512 values) reads the first vx_pad[g][k]
+    // bytes of the place after the one it computes (k: 0 = the gate|up tensor, 1 = down). Those bytes must be zeros or blocks of the
+    // group's own format whenever a held place before them can be read (a NaN scale of other bytes there makes the result NaN). Places
+    // whose memory has other uses for a while (the tail's copies, places lent to a prompt call's buffers or tensors) are marked in
+    // vx_dirty when that use starts; no such use writes the first bytes of the first place of its range (whose predecessor may be held);
+    // the fills that make places held again first write zeros into every marked free place (vx_pad_clean); a switched-in expert clears
+    // its place's mark. Groups whose rows need no padding have no marks and take none of these steps
+    std::vector<std::array<int64_t, 2>> vx_pad;      // [group]: the row padding of gate|up / down (0 = none)
+    std::vector<std::vector<uint8_t>>   vx_dirty;    // [group][place] (only for groups with padding)
+    int64_t  vx_n_dirty = 0;                         // marked places in all groups
+    int64_t  vx_pad_cleans = 0, vx_pad_zeroed = 0, vx_pad_writes = 0, vx_pad_us = 0, vx_pad_targeted = 0;   // the exit line
+    bool     vx_test_no_place_pad = getenv("MOE_STREAM_TEST_NO_PLACE_PAD") && atoi(getenv("MOE_STREAM_TEST_NO_PLACE_PAD")) != 0;   // (test only: off)
+    bool     vx_test_pad_plant    = getenv("MOE_STREAM_TEST_PAD_PLANT") && atoi(getenv("MOE_STREAM_TEST_PAD_PLANT")) != 0;     // (test only)
+    int64_t  vx_pad_planted = 0;
+    // the bytes a use of place memory leaves alone at the start of its range's first place (0 for a group without padding, or off in a test)
+    int64_t  vx_pad_skip(size_t g, int k) const { return !vx_test_no_place_pad && g < vx_pad.size() ? vx_pad[g][(size_t) k] : 0; }
+    void     vx_pad_init();                                         // vf_setup: the padding per group, the marks
+    void     vx_pad_mark(size_t g, int32_t p_lo, int32_t p_hi, int32_t p_kept, int k_only = -1, bool plant = true);   // mtx held: places [p_lo, p_hi) get another use
+    void     vx_pad_clean();                                        // mtx held, a fill: zeros into every marked free place
+    std::vector<std::array<int64_t, 3>> tail_pad_g;   // per group: the row padding (bytes read past a copy's end) of gate / up / down
     int64_t                             tail_tc = 0;
+    std::vector<uint8_t>                tailw_read;   // scratch [tail_tc + 1]: the places a wave's ids name
+    std::vector<uint8_t>                tailw_zero_src;   // zeros for the row padding writes
+    bool     tailw_test_no_pad = getenv("MOE_STREAM_TEST_NO_ROW_PAD") && atoi(getenv("MOE_STREAM_TEST_NO_ROW_PAD")) != 0;   // (test only: the writes off)
+    int64_t                             tailw_pads = 0, tailw_pad_bytes = 0;   // row-padding writes of the gathers (places' first bytes, copies' ends)
     std::unordered_map<const ggml_tensor *, int32_t> tail_uses;   // this graph split: consumers of a pool-derived source
     std::unordered_map<const ggml_tensor *, int32_t> tail_mm_uses;   // of them, MUL_MAT_IDs that read it as their weights
     int32_t  tail_split_used[3] = { -1, -1, -1 };         // the split that last took projection k's target
     int64_t  tail_n_vac_last = 0, tail_n_vac_max = 0;   // places emptied (the last vacate's range, the largest)
     int64_t  tail_n_vacate = 0, tail_n_vac_places = 0, tail_n_fill_calls = 0, tail_n_fill_jobs = 0, tail_n_fill_noram = 0;
     int64_t  tail_n_taken = 0, tail_n_declined[8] = { 0 }; // the hook: copies given a target / refused, by reason
+    int64_t  tail_n_taken_real = 0;                        // of the copies given a target: in graphs that were computed (tail_real)
     bool     tail_decline_said = false;
     std::map<int32_t, std::vector<int32_t>> vx_rank_lists;   // the whole list file by layer (the tail's extras, the fill's tie-break)
     std::vector<std::vector<int16_t>>       vx_rank_of;      // [layer][expert] position in that list, -1 = not in it
@@ -1454,7 +1518,13 @@ struct llama_moe_stream {
     int64_t  ca_jobs = 0, ca_experts = 0, ca_bytes = 0, ca_us = 0, ca_found = 0, ca_wait_us = 0, ca_checked = 0, ca_late = 0;
     int64_t  ca_jobs0 = 0, ca_experts0 = 0, ca_found0 = 0, ca_wait_us0 = 0;   // at the call's start (the per-call line)
     bool     ca_test_check = false;    // MOE_STREAM_TEST_COPY_AHEAD_CHECK=1 (test only): every early-copied place read back and compared
+    int64_t  ca_zero_checked = 0, ca_zero_bad = 0, ca_place_checked = 0, ca_place_bad = 0;
+    int64_t  ca_graph_checked = 0, ca_graph_bad = 0, ca_prev_checked = 0, ca_prev_bad = 0;   // (CHECK=1) the graph's tail tensor = the gather's; the last step's places intact at the next gather
+    struct ca_prev_t { const ggml_tensor * t[3]; int32_t il, wave, set, place; uint64_t h[3]; };
+    std::vector<ca_prev_t> ca_prev;   // (CHECK=1) the last gather's places and their bytes' hashes   // (CHECK=1) zero-place projections a gather trusted, read back; those not all zero
     bool     ca_test_nowait = false;   // MOE_STREAM_TEST_COPY_AHEAD_NOWAIT=1 (test only, the control): no wait for the uploader
+    int32_t  ca_test_set = -1;         // MOE_STREAM_TEST_CA_SET=0|1 (test only): every step uses that set (with CA_NO_JOBS)
+    bool     ca_test_no_jobs = false;  // MOE_STREAM_TEST_CA_NO_JOBS=1 (test only): no jobs - every gather copies its step itself (the sets still alternate)
     // TEST ONLY (MOE_STREAM_TEST_COPY_AHEAD_CHECK=2): the read-back that keeps the timing - at each gather the found places are
     // sampled (one 4 KiB block in every 64 KiB of each projection tensor, and every place's last 4 KiB) by strided GPU -> host copies on
     // the compute stream right before the matmul that reads them (stream order: what the matmul reads, before any later writer); the same
@@ -1488,7 +1558,7 @@ struct llama_moe_stream {
     // With two sets each step of a call - a wave of a layer, layer by layer - copies into the other set: step = the layer's
     // index among the streamed layers x the call's waves + the wave (one-wave prompts: the layer's index)
     int32_t  ca_set_of(int32_t il, int32_t wave, int32_t n_w) const {
-        return ca_sets > 1 && il >= 0 && (size_t) il < ca_pos.size() && ca_pos[(size_t) il] >= 0 ?
+        return ca_sets > 1 && ca_test_set >= 0 ? ca_test_set : ca_sets > 1 && il >= 0 && (size_t) il < ca_pos.size() && ca_pos[(size_t) il] >= 0 ?
             (int32_t) (((int64_t) ca_pos[(size_t) il]*std::max<int32_t>(n_w, 1) + wave) % 2) : 0;
     }
     void     ca_run_job(ca_job_t & j);   // the uploader thread
@@ -1848,6 +1918,11 @@ struct llama_moe_stream {
     int64_t vp_writes = 0, vp_syncs = 0, t_vp_sync_us = 0, t_vp_write_us = 0, vp_skips = 0;
     int32_t vp_test_stale = 0, vp_switch_n = 0;   // MOE_STREAM_TEST_VP_STALE_TABLE=N (test only): skip the N-th incoming row write
     bool vp_on() const { return vp && vx_ready; }
+    // [n_layer]: the layer's device pass runs in its GPU launch (decided at vx_setup): its router runs on the pool's GPU, or
+    // --moe-stream-vram-parallel 2 lets the pass cross from another GPU; vp_n_launch = how many streamed layers with "router done" have it
+    std::vector<uint8_t> vp_launch;
+    int32_t vp_n_launch = 0;
+    bool vp_in_launch(int32_t il) const { return vp_on() && il >= 0 && (size_t) il < vp_launch.size() && vp_launch[(size_t) il] != 0; }
     ggml_tensor * vp_table_of(int32_t il, size_t & offset) const {   // the group's table and this layer's byte offset in it
         const auto * sl = layer(il);
         const auto & G  = vx_groups[sl->vx_group];
@@ -1914,6 +1989,8 @@ struct llama_moe_stream {
     int64_t     vx_scratch_want = 0;        // the scratch the biggest prompt batch needs (derived or --moe-stream-vram-scratch), bytes
     bool        vx_graphs_on = true;        // the backend uses CUDA graphs (their instance chunks are lazy VRAM)
     bool        vx_pool_vmm = true;         // the backend's op scratch pool is the VMM pool
+    size_t    (*vx_pool_held)(ggml_backend_t, size_t *) = nullptr;   // the legacy scratch pool's held bytes (backend entry; nullptr = none)
+    ggml_backend_t vx_pool_backend = nullptr;
     std::string vx_scratch_why;             // how vx_scratch_want was chosen
     int64_t     vx_end_min_free = INT64_MAX; // the lowest free VRAM seen after a prompt
     bool        vx_end_seen    = false;
@@ -2184,14 +2261,19 @@ struct llama_moe_stream {
     // The counter rule of both stages compares the slot with ne_call_seq, a number that moves once per
     // one-token decode call with needed-early on (ne_call_start), so a slot left by an aborted call can never pass.
     bool                  ne_gpu = false;
-    ggml_backend_dev_t    ne_mark_dev = nullptr;   // the GPU whose backend holds the mark tables (every marked node is pinned to it)
+    ggml_backend_dev_t    ne_mark_dev = nullptr;   // the registration's GPU (the marks' only GPU with the one-card rule)
+    // per layer, the GPU whose stream runs its marked node (a guess / word-start mark: where its targets' routers are; a router mark:
+    // its router's GPU; null: no mark of that kind). Every marked node is pinned to it; one GPU: all equal ne_mark_dev
+    std::vector<ggml_backend_dev_t> ne_dev_guess, ne_dev_router;
+    ggml_backend_dev_t    ne_guess_dev(int32_t il) const  { return il >= 0 && (size_t) il < ne_dev_guess.size()  && ne_dev_guess[(size_t) il]  ? ne_dev_guess[(size_t) il]  : ne_mark_dev; }
+    ggml_backend_dev_t    ne_router_dev(int32_t il) const { return il >= 0 && (size_t) il < ne_dev_router.size() && ne_dev_router[(size_t) il] ? ne_dev_router[(size_t) il] : ne_mark_dev; }
     uint32_t              ne_call_seq = 0;         // mtx: this call's number (0 = no call yet; the slots start at 0)
     ggml_backend_buffer_t ne_pin_buf = nullptr;
     int32_t *             ne_pin = nullptr;        // [n_layer_all * ne_stride]: ids, then the counter (the same layout as ne_buf)
     uint32_t *            ne_call_cell = nullptr;  // pinned: ne_call_seq, read by the GPU producers when they run
     bool (*ne_mark_wait)(int32_t, int32_t)    = nullptr;   // the backend's "wait for layer L's event of a kind"
     void (*ne_mark_unregister)(const void *)  = nullptr;
-    bool (*ne_mark_sync)(void)                = nullptr;   // the producer device ran everything enqueued
+    bool (*ne_mark_sync)(void)                = nullptr;   // every producer device ran everything enqueued
     bool   ne_gpu_on() const { return ne_gpu; }
     // after ne_set_router_gpu: router_dev[il] = the GPU device that runs layer il's router (nullptr: not a GPU)
     void   ne_gpu_setup(const std::vector<ggml_backend_dev_t> & router_dev);
@@ -2249,7 +2331,7 @@ struct llama_moe_stream {
     int64_t               ps_ubatches = 0, ps_splits = 0;
     bool                  ps_unfit_said = false;
     bool ps_wants(int64_t n_tok) const {            // the graph builder and ps_ubatch: the same rule
-        return ps_slot != nullptr && ne_gpu && vp_on() && !decode_phase && n_tok > 1 && n_tok <= ps_rows && !waves_on_gpu(n_tok);
+        return ps_slot != nullptr && ne_gpu && vp_on() && vp_n_launch > 0 && !decode_phase && n_tok > 1 && n_tok <= ps_rows && !waves_on_gpu(n_tok);
     }
     // --moe-stream-gpu-wave-skip-zero: n_zero when the LAST n_zero experts of this weight tensor (a GPU wave's tail tensor or
     // g1-ahead set view, a layer's pool or its start-size view, the VRAM pool) are the all-zero slices, else 0 (then the matmul is not marked)
@@ -3252,7 +3334,7 @@ struct llama_moe_stream {
     // Called from a compute thread that was waiting for a slot whose read failed
     void   fail_slot_error();
     void   prefetch_oracle(llama_moe_stream_layer & sl, int64_t t0, int64_t n_tok);
-    void   oracle_check(llama_moe_stream_layer & sl, int64_t t0, const int32_t * ids, int64_t n, int64_t k);
+    void   oracle_check(llama_moe_stream_layer & sl, int64_t t0, const int32_t * ids, int64_t n, int64_t k, bool decode);
     void   load_oracle(const std::string & prefix);
     size_t pool_total_bytes(uint32_t n_slots) const;
     // Repack one plain expert slice into a pool slot. Called from the I/O threads right after the

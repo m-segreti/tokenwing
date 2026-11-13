@@ -166,6 +166,14 @@ static bool ggml_cuda_pinned_memory_disabled() {
     return disabled;
 }
 
+// Test only: GGML_CUDA_TEST_IGPU_AS_GPU=1 makes an integrated device report the discrete GPU type, so
+// the features that are switched on only for a discrete card can be run on an integrated one (whose
+// memory is the system RAM).
+static bool ggml_cuda_test_igpu_as_gpu() {
+    static const bool on = ggml_cuda_env_flag("GGML_CUDA_TEST_IGPU_AS_GPU");
+    return on;
+}
+
 static bool ggml_cuda_register_host_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_REGISTER_HOST");
     return enabled;
@@ -442,6 +450,12 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 // #define DEBUG_CUDA_MALLOC
 
 // buffer pool for cuda (legacy)
+// GGML_CUDA_POOL_LOG=1 (a measuring tool, read once): the legacy pool prints a line at every new peak of the device memory it holds
+static bool ggml_cuda_pool_log_on() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_POOL_LOG"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
 
@@ -454,6 +468,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
+    size_t pool_size_peak = 0;   // the most pool_size has been (held_bytes)
+    int    n_device       = 0;   // device allocations held (cached or in use)
 
     ggml_cuda_pool_leg(ggml_backend_cuda_context & ctx, int device) :
         ctx(ctx),
@@ -472,11 +488,29 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             if (b.ptr != nullptr) {
                 CUDA_CHECK(cudaFree(b.ptr));
                 pool_size -= b.size;
+                n_device--;
                 b.ptr  = nullptr;
                 b.size = 0;
             }
         }
     }
+
+#if defined(GGML_USE_HIP)
+    // a graph capture runs on one of this context's streams (a device-wide wait would end it)
+    bool ggml_cuda_pool_leg_capturing() const {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; s++) {
+            cudaStream_t st = ctx.streams[device][s];
+            if (st != nullptr) {
+                hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+                if (hipStreamIsCapturing(st, &cs) != hipSuccess || cs != hipStreamCaptureStatusNone) {
+                    (void) hipGetLastError();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+#endif // defined(GGML_USE_HIP)
 
     // captured CUDA graphs can still use freed buffers, so they must be captured again
     void invalidate_cuda_graphs() {
@@ -534,6 +568,32 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+#if defined(GGML_USE_HIP)
+        // No cached buffer fits a large request: the cached ones of 1 MiB up to this size were made for smaller calls of the same ops
+        // (a longer prompt asks again with more rows) and would stay held next to the new one - a 30k-token prompt left 4.7 + 9.5 +
+        // 14.2 + 28.4 MiB held where 28.4 was in use. They are given back first (once a size, outside a graph capture: the free waits
+        // for the device and captured graphs must be captured again), so the pool holds about what the largest call needs at once.
+        if (size >= (4u << 20) && !ggml_cuda_pool_leg_capturing()) {
+            bool any = false;
+            for (int i = 0; i < MAX_BUFFERS; ++i) {
+                ggml_cuda_buffer & b = buffer_pool[i];
+                if (b.ptr != nullptr && b.size >= (1u << 20) && b.size < size) {
+                    if (!any) {
+                        CUDA_CHECK(cudaDeviceSynchronize());
+                        any = true;
+                    }
+                    CUDA_CHECK(cudaFree(b.ptr));
+                    pool_size -= b.size;
+                    n_device--;
+                    b.ptr  = nullptr;
+                    b.size = 0;
+                }
+            }
+            if (any) {
+                invalidate_cuda_graphs();
+            }
+        }
+#endif // defined(GGML_USE_HIP)
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
@@ -551,6 +611,14 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(err);
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        n_device++;
+        if (pool_size > pool_size_peak) {
+            pool_size_peak = pool_size;
+            if (ggml_cuda_pool_log_on()) {   // GGML_CUDA_POOL_LOG=1: every new peak of the held bytes, with the request that made it
+                fprintf(stderr, GGML_CUDA_NAME " pool[%d]: the legacy pool holds %.1f MiB of device memory (new peak; this request %.1f MiB, %d buffers)\n",
+                        device, pool_size/1048576.0, look_ahead_size/1048576.0, n_device);
+            }
+        }
 #ifdef DEBUG_CUDA_MALLOC
         GGML_LOG_INFO("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, device, nnz,
                            (uint32_t)(max_size / 1024 / 1024), (uint32_t)(pool_size / 1024 / 1024), (uint32_t)(size / 1024 / 1024));
@@ -571,7 +639,16 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+        n_device--;
         invalidate_cuda_graphs();
+    }
+
+    // bytes this pool holds from the device now and at most so far (*peak)
+    size_t held_bytes(size_t * peak) const {
+        if (peak) {
+            *peak = pool_size_peak;
+        }
+        return pool_size;
     }
 };
 
@@ -755,6 +832,14 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+#if defined(GGML_USE_HIP)
+    if (ev_side_tmp != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(ev_side_tmp));
+    }
+    if (ev_side_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(ev_side_stream));
+    }
+#endif
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -5276,6 +5361,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         cuda_graph_update_required = false;
     }
 
+#if defined(GGML_USE_HIP)
+    // HIP: the profiler's pair starts before a capture - its ring eviction syncs an event this stream recorded, which HIP
+    // refuses while the stream captures (and the refusal ends the capture)
+    ggml_cuda_prof_begin(cuda_ctx->device, cuda_ctx->stream());
+#endif
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5288,7 +5378,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     const bool trace_gpu = m1_tools && ggml_trace_on();   // GGML_TRACE
     const int64_t trace_t_issue = trace_gpu ? ggml_time_us() : 0;
+#if !defined(GGML_USE_HIP)
     ggml_cuda_prof_begin(cuda_ctx->device, cuda_ctx->stream());
+#endif
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
     ggml_cuda_prof_end(cuda_ctx->device, cuda_ctx->stream());
     if (trace_gpu) {
@@ -5302,7 +5394,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+#if defined(GGML_USE_HIP)
+    // HIP refuses a sync of an event, and another stream's wait on it, while the stream that last recorded it is capturing a
+    // graph - and the refused sync ends that capture. Other threads wait on these events while this backend's stream captures
+    // the next graph, so the event is recorded on a side stream that first waits for the compute stream: the same point in
+    // the work, on a stream that never captures
+    if (cuda_ctx->ev_side_stream == nullptr) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&cuda_ctx->ev_side_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx->ev_side_tmp, cudaEventDisableTiming));
+    }
+    CUDA_CHECK(cudaEventRecord(cuda_ctx->ev_side_tmp, cuda_ctx->stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->ev_side_stream, cuda_ctx->ev_side_tmp, 0));
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->ev_side_stream));
+#else
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+#endif
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -5937,7 +6044,7 @@ static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
 
-    return prop.integrated
+    return prop.integrated && !ggml_cuda_test_igpu_as_gpu()
         ? GGML_BACKEND_DEVICE_TYPE_IGPU
         : GGML_BACKEND_DEVICE_TYPE_GPU;
 }
@@ -6636,8 +6743,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-// The engine names the ggml device its marked nodes run on; the events are created there
+#if !defined(GGML_USE_MUSA)
+// The engine names the ggml device its marked nodes run on - one for the registration, and optionally one per layer and kind
+// (the table's devs: a marked node of a layer on another card); each entry's event is created on its device
 static bool ggml_backend_cuda_moe_mark_register(ggml_backend_dev_t dev, const void * owner, int32_t n_layers,
                                                 const ggml_cuda_moe_mark_table * tables, int n_tables, const char ** why) {
     if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
@@ -6645,7 +6753,27 @@ static bool ggml_backend_cuda_moe_mark_register(ggml_backend_dev_t dev, const vo
         return false;
     }
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
-    return ggml_cuda_moe_mark_register(owner, device, n_layers, tables, n_tables, why);
+    std::vector<std::vector<int32_t>> dev_of((size_t) std::max(0, n_tables));
+    std::vector<const int32_t *>      dev_p((size_t) std::max(0, n_tables), nullptr);
+    for (int k = 0; k < n_tables; k++) {
+        if (tables[k].devs == nullptr) {
+            continue;
+        }
+        dev_of[k].assign((size_t) n_layers, -1);
+        for (int32_t il = 0; il < n_layers; il++) {
+            ggml_backend_dev_t d = (ggml_backend_dev_t) tables[k].devs[il];
+            if (d == nullptr) {
+                continue;
+            }
+            if (ggml_backend_dev_backend_reg(d) != ggml_backend_cuda_reg()) {
+                *why = "a layer's mark device is not a CUDA device";
+                return false;
+            }
+            dev_of[k][il] = ((ggml_backend_cuda_device_context *) d->context)->device;
+        }
+        dev_p[k] = dev_of[k].data();
+    }
+    return ggml_cuda_moe_mark_register(owner, device, n_layers, tables, n_tables, dev_p.data(), why);
 }
 #endif
 
@@ -6653,6 +6781,12 @@ static bool ggml_backend_cuda_moe_mark_register(ggml_backend_dev_t dev, const vo
 // expert pool that the word just computed may have read is written again from another stream
 static bool ggml_backend_cuda_device_sync(ggml_backend_dev_t dev) {
     const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+#if defined(GGML_USE_HIP)
+    // HIP refuses a device-wide sync while a stream captures a graph, and the refusal ends that capture (another context's
+    // graph): wait until no capture runs, and hold the lock so that none starts until the sync is done
+    std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+    ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+#endif
     ggml_cuda_set_device(device);
     const cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
@@ -6733,13 +6867,50 @@ static int ggml_backend_cuda_lazy_traits(ggml_backend_t backend) {
     return r;
 }
 
+// The device memory this backend's op scratch pools hold now (*peak: the most they have held), summed over its streams. Only the legacy
+// pool counts (HIP builds, GGML_CUDA_NO_VMM): the VMM pool returns 0, its mapping is measured by the engine at start instead.
+static size_t ggml_backend_cuda_pool_held(ggml_backend_t backend, size_t * peak) {
+    size_t now = 0, most = 0;
+    if (backend != nullptr && ggml_backend_is_cuda(backend)) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; s++) {
+            const auto * p = dynamic_cast<const ggml_cuda_pool_leg *>(cuda_ctx->pools[cuda_ctx->device][s].get());
+            if (p) {
+                size_t pk = 0;
+                now  += p->held_bytes(&pk);
+                most += pk;
+            }
+        }
+    }
+    if (peak) {
+        *peak = most;
+    }
+    return now;
+}
+
+// Whether this build may send CPU -> GPU split inputs as async copies on the GPU's stream (--moe-stream-async-h2d): only a build made
+// with CUDA 13 or newer - with the CUDA 12 runtime the same copies made replies several times slower. HIP and MUSA builds: true
+static bool ggml_backend_cuda_async_h2d_ok(void) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return true;
+#else
+    return CUDART_VERSION >= 13000;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_async_h2d_ok") == 0) {   // --moe-stream-async-h2d: a CUDA 13 build?
+        return (void *)ggml_backend_cuda_async_h2d_ok;
+    }
     if (strcmp(name, "ggml_backend_cuda_lazy_traits") == 0) {   // graphs on? VMM scratch pool?
         return (void *)ggml_backend_cuda_lazy_traits;
     }
     if (strcmp(name, "ggml_backend_cuda_prewarm_pool") == 0) {   // the scratch pool mapped at start
         return (void *)ggml_backend_cuda_prewarm_pool;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pool_held") == 0) {   // the legacy scratch pool's held bytes
+        return (void *)ggml_backend_cuda_pool_held;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
@@ -6777,7 +6948,7 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_moe_zero_register") == 0) {   // --moe-stream-gpu-skip-zero
         return (void *)ggml_cuda_moe_zero_register;
     }
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)   // NVIDIA only, the others keep the host producer
+#if !defined(GGML_USE_MUSA)   // NVIDIA and AMD; MUSA keeps the host producer
     if (strcmp(name, "ggml_backend_cuda_moe_mark_register") == 0) {   // --moe-stream-needed-early 1
         return (void *)ggml_backend_cuda_moe_mark_register;
     }
@@ -6790,6 +6961,8 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_moe_mark_sync") == 0) {
         return (void *)ggml_cuda_moe_mark_sync;
     }
+#endif
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)   // NVIDIA only (%globaltimer)
     if (strcmp(name, "ggml_backend_cuda_moe_test_spin") == 0) {   // test only: MOE_STREAM_TEST_VF_PLACE_CHECK
         return (void *)ggml_backend_cuda_moe_test_spin;
     }

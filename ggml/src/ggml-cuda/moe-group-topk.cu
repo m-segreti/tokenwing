@@ -232,7 +232,7 @@ static __global__ void k_moe_group_topk_fast(
             keep |= 1u << gidx[r];
         }
     } else {
-        keep = __ballot_sync(0xffffffff, lane < n_groups && rank < n_group_used);
+        keep = (uint32_t) __ballot_sync((uint64_t) 0xffffffff, (int) (lane < n_groups && rank < n_group_used));   // (HIP wants a 64-bit mask)
     }
     const bool kept = (keep >> grp) & 1;
 

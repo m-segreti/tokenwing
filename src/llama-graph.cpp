@@ -2408,11 +2408,22 @@ void llm_graph_context::moe_guess_finish(const llama_model & model, int il, ggml
     if (!mstream) {
         return;
     }
-    if (g.want_shared && shared) {
-        g.pred_base = ggml_add(ctx0, ffn_inp, shared);   // residual + shared expert, before the norm
-        // A corrected pair's norm weight is the ones (the gain is inside W')
-        g.pred_in   = build_norm(g.pred_base, mstream->corr_unit(il + 1, 1) ? mstream->corr_unit(il + 1, 1) : model.layers[il + 1].ffn_norm,
-                nullptr, LLM_NORM_RMS, il + 1);
+    // residual + shared expert, before the norm
+    moe_guess_finish_in(model, il, g.want_shared && shared ? ggml_add(ctx0, ffn_inp, shared) : nullptr, nullptr, g);
+}
+
+void llm_graph_context::moe_guess_finish_in(const llama_model & model, int il, ggml_tensor * base,
+                                            const llm_graph_guess_in_fn & guess_in, llm_graph_moe_guess & g) const {
+    if (!mstream) {
+        return;
+    }
+    if (g.want_shared && base) {
+        g.pred_base = base;
+        // The model's own guess input, or the base normed with the next layer's gain. A corrected pair's norm weight is the
+        // ones (the gain is inside W'); a model with its own guess input has no ffn_norm, so the correction file refuses it
+        g.pred_in   = guess_in ? guess_in(il + 1)
+                    : build_norm(g.pred_base, mstream->corr_unit(il + 1, 1) ? mstream->corr_unit(il + 1, 1) : model.layers[il + 1].ffn_norm,
+                            nullptr, LLM_NORM_RMS, il + 1);
     }
     // The routers and norm gains of the next four layers, for the recorder's guess logits. Up to
     // --moe-stream-lookahead layers ahead (and their selection bias) for the far guesses, built the same way
@@ -2429,7 +2440,17 @@ void llm_graph_context::moe_guess_finish(const llama_model & model, int il, ggml
                     g.rec.gate[d] = mstream->corr_gate(il + d, d);
                     g.rec.norm[d] = mstream->corr_unit(il + d, d);
                 }
+                // The model's own guess input for this target, only where a one-token graph reads it (the far guesses up to
+                // --moe-stream-lookahead, the recorder's leads): each is a few ops, and unused ones would only fill the graph's context
+                const bool used = n_tokens == 1 && ((mstream->prefetch_on() && d <= (int) mstream->lookahead) ||
+                                                    (mstream->rec_on() && d <= llama_moe_stream::REC_LEADS && mstream->rec_lead_avail(il, d)));
+                if (guess_in && g.pred_base && d >= 2 && used) {
+                    g.rec.in[d] = guess_in(il + d);
+                }
             }
+        }
+        if (guess_in && g.pred_base) {
+            g.rec.in[1] = g.pred_in;
         }
     }
 }
@@ -2447,7 +2468,7 @@ llm_graph_moe_ws llm_graph_context::moe_ws_begin() const {
 }
 
 void llm_graph_context::moe_ws_layer(const llama_model & model, int il, ggml_tensor * out, ggml_tensor * ws_base,
-                                     ggml_tensor * ffn_in_n, llm_graph_moe_ws & st) const {
+                                     ggml_tensor * ffn_in_n, llm_graph_moe_ws & st, const llm_graph_guess_in_fn & guess_in) const {
     if (!st.graph || !mstream->ws_src(il)) {
         return;
     }
@@ -2464,6 +2485,9 @@ void llm_graph_context::moe_ws_layer(const llama_model & model, int il, ggml_ten
                 ws_leads.gate[d] = mstream->corr_gate(il + d, d);
                 ws_leads.norm[d] = mstream->corr_unit(il + d, d);
             }
+            if (guess_in && mstream->pred_shared && ws_base) {   // the model's own guess input (from its base)
+                ws_leads.in[d] = guess_in(il + d);
+            }
         }
     }
     ggml_tensor * cols = build_ws_guess(il, mstream->pred_shared ? ws_base : nullptr, ffn_in_n, ws_leads,
@@ -2473,7 +2497,7 @@ void llm_graph_context::moe_ws_layer(const llama_model & model, int il, ggml_ten
             cols = ggml_cont(ctx0, cols);
         }
         mstream->ws_mark_node(il, cols);
-        moe_pin(cols, mstream->ne_mark_dev);
+        moe_pin(cols, mstream->ne_guess_dev(il));   // (the GPU of its targets' routers: its event is there)
         ggml_build_forward_expand(gf, cols);
     } else if (cols) {
         st.cols = st.cols ? ggml_concat(ctx0, st.cols, cols, 1) : cols;
@@ -2500,7 +2524,7 @@ ggml_tensor * llm_graph_context::build_ws_guess(
     const uint32_t width = mstream->guess_width(1);
     for (int32_t t = 0; t < n_t; t++) {
         GGML_ASSERT(ds[t] <= llm_graph_rec_leads::MAX_D && rec.gate[ds[t]] != nullptr);
-        GGML_ASSERT(!mstream->pred_shared || (base != nullptr && rec.norm[ds[t]] != nullptr));
+        GGML_ASSERT(!mstream->pred_shared || rec.in[ds[t]] != nullptr || (base != nullptr && rec.norm[ds[t]] != nullptr));
     }
     ggml_tensor * lg_d[llm_graph_rec_leads::MAX_D + 1] = { nullptr };   // the logits per distance (the recorder's leads)
 
@@ -2517,7 +2541,7 @@ ggml_tensor * llm_graph_context::build_ws_guess(
             const int X = il + d;
             ggml_tensor * rin = cur_in;
             if (mstream->pred_shared) {
-                rin = build_norm(base, rec.norm[d], nullptr, LLM_NORM_RMS, X);
+                rin = rec.in[d] ? rec.in[d] : build_norm(base, rec.norm[d], nullptr, LLM_NORM_RMS, X);
             }
             ggml_tensor * lg = build_lora_mm(rec.gate[d], rin);   // [n_expert, 1]
             if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
@@ -2887,6 +2911,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             gate_w = mstream->tailw_tensor(0, il, wave, n_w);   // the tail tensors of this layer's format
             up_w   = mstream->tailw_tensor(1, il, wave, n_w);
             down_w = mstream->tailw_tensor(2, il, wave, n_w);
+            if (auto * wc = mstream->wave_ctx_of(il, wave)) {
+                wc->tail_gate = gate_w;   // (the copy-ahead check compares it with the gather's tensor)
+            }
         }
 
         cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, nt);
@@ -3305,10 +3332,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     }
                     ggml_tensor * rin = cur;
                     if (mstream->pred_shared) {
-                        if (!rec->base || !rec->norm[d]) {
+                        if (rec->in[d]) {   // the model's own guess input
+                            rin = rec->in[d];
+                        } else if (!rec->base || !rec->norm[d]) {
                             break;
+                        } else {
+                            rin = build_norm(rec->base, rec->norm[d], nullptr, LLM_NORM_RMS, X);
                         }
-                        rin = build_norm(rec->base, rec->norm[d], nullptr, LLM_NORM_RMS, X);
                     }
                     ggml_tensor * lg = build_lora_mm(rec->gate[d], rin);   // [n_expert, 1]
                     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
@@ -3527,7 +3557,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         pred->type == GGML_TYPE_I32 && ggml_is_contiguous(pred)) {   // what the producer copies
                     pred->flags |= (int32_t) LLAMA_MOE_STREAM_TENSOR_GUESS_MARK;
                     pred->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = il;
-                    moe_pin(pred, mstream->ne_mark_dev);   // (with several GPUs the scheduler could move it to the next layer's)
+                    moe_pin(pred, mstream->ne_guess_dev(il));   // its event's GPU (with several GPUs the scheduler could move it)
                 }
 
                 // Measurement only (MOE_STREAM_LEAD2_COST=1): the 2-ahead guess that 2-ahead reads would need - the
@@ -3662,6 +3692,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     if (mstream->pred_shared) {
                         if (d == 1 && pred_in) {
                             rin = pred_in;
+                        } else if (rec->in[d]) {   // the model's own guess input
+                            rin = rec->in[d];
                         } else if (rec->base && rec->norm[d]) {
                             rin = build_norm(rec->base, rec->norm[d], nullptr, LLM_NORM_RMS, X);
                         } else {
@@ -3763,7 +3795,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ids_cont->flags |= (int32_t) LLAMA_MOE_STREAM_TENSOR_ROUTER_MARK;
                 ids_cont->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = il;
                 ids_cont->src[1] = cur_in;   // CONT reads only src[0]; the producer copies src[1] too, and it orders cur_in first
-                moe_pin(ids_cont, mstream->ne_mark_dev);   // the mark runs on the GPU of the marks (several GPUs)
+                moe_pin(ids_cont, mstream->ne_router_dev(il));   // the mark runs on its router's GPU, where its event is (several GPUs)
                 ggml_build_forward_expand(gf, ids_cont);
                 if (pred) {
                     ggml_build_forward_expand(gf, pred);
@@ -3773,13 +3805,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     ggml_build_forward_expand(gf, weights);
                     weights_expanded = true;
                 }
-                // --moe-stream-vram-parallel 1: the VRAM pool's device pass in this layer's GPU
+                // --moe-stream-vram-parallel 1 or 2 (this layer's pass moves, vp_in_launch): the VRAM pool's device pass in this layer's GPU
                 // launch, after the router producer ("router done") and the guess, so the GPU runs it while the CPU split - which
                 // starts from the router slot - computes the RAM experts. Its ids come from the layer's table on the GPU: row e of
                 // the table = the expert's place k times when held, else the zero slices z0 + 0 .. z0 + k - 1; get_rows of the
                 // router's k ids gives a k x k block whose diagonal is the device ids (pair j's own column, so no token names a slice
                 // twice). The join stays where it was: ffn_moe_out = the host's weighted sum + this pass's sum, after the CPU split.
-                if (mstream->vp_on() && mstream->vram_serves(il)) {
+                if (mstream->vp_in_launch(il) && mstream->vram_serves(il)) {
                     const bool vx_ok = !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps &&
                                        gate_exps && up_exps && type_op == LLM_FFN_SILU && !up_exps_s && !gate_exps_s &&
                                        !down_exps_s && !gate_up_exps_b;
@@ -3793,13 +3825,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     GGML_ASSERT(rows->ne[0] >= rows->ne[1] && "vram-parallel: the id table is narrower than the layer's k");
                     cb(rows, "ffn_moe_vp_rows", il);
                     ggml_tensor * diag = ggml_view_2d(ctx0, rows, 1, rows->ne[1], (rows->ne[0] + 1)*ggml_element_size(rows), 0);
-                    diag = ggml_reshape_2d(ctx0, ggml_cont(ctx0, diag), rows->ne[1], 1);       // [k, 1]: pair j's device id
+                    diag = ggml_cont(ctx0, diag);
+                    if (mstream->ne_router_dev(il) != mstream->pool_dev) {   // several GPUs: the pass on the pool's GPU, the ids copied there
+                        moe_pin(rows, mstream->pool_dev);
+                        moe_pin(diag, mstream->pool_dev);
+                    }
+                    diag = ggml_reshape_2d(ctx0, diag, rows->ne[1], 1);       // [k, 1]: pair j's device id
                     cb(diag, "ffn_moe_topk_vram", il);
                     vram_out_early = build_vram_chain(diag, nullptr, nullptr, true);   // (absolute places)
                     ggml_build_forward_expand(gf, vram_out_early);
                 }
                 run_moe_window();   // the builder's window nodes, last
-            } else if (lm_phase != 2 && mstream->ps_wants(n_tokens) && mstream->ne_rd_layer_on(il) && !pred_p && mstream->vram_serves(il) &&
+            } else if (lm_phase != 2 && mstream->ps_wants(n_tokens) && mstream->vp_in_launch(il) && !pred_p && mstream->vram_serves(il) &&
                     (pred == nullptr || !(pred->flags & (int32_t) LLAMA_MOE_STREAM_TENSOR_GUESS_MARK)) &&
                     mstream->ps_fits(il, ids_cont, cur_in, pred, weights)) {
                 // --moe-stream-prompt-split 1: a CPU-wave prompt ubatch - the router mark hands the CPU split
@@ -3811,7 +3848,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ids_cont->src[1] = cur_in;   // the CPU split's other inputs, packed in this order (the producer stops at the first null)
                 ids_cont->src[2] = pred ? pred : weights;
                 ids_cont->src[3] = pred ? weights : nullptr;
-                moe_pin(ids_cont, mstream->ne_mark_dev);   // its guess source may come from the next layer's GPU: copied here, not moved there
+                moe_pin(ids_cont, mstream->ne_router_dev(il));   // its guess source may come from the next layer's GPU: copied here, not moved there
                 ggml_build_forward_expand(gf, ids_cont);
                 weights_expanded = true;   // (a source of the mark: computed before it)
                 const bool vx_ok = !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps &&
@@ -3829,7 +3866,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cb(rows, "ffn_moe_ps_rows", il);
                 ggml_tensor * diag = ggml_view_3d(ctx0, rows, 1, rows->ne[1], rows->ne[2], (rows->ne[0] + 1)*ggml_element_size(rows),
                                                   rows->nb[2], 0);                          // [1, k, n_tok]: pair (j, t)'s own column j
-                diag = ggml_reshape_2d(ctx0, ggml_cont(ctx0, diag), rows->ne[1], rows->ne[2]);   // [k, n_tok]: the device ids
+                diag = ggml_cont(ctx0, diag);
+                if (mstream->ne_router_dev(il) != mstream->pool_dev) {   // several GPUs: the pass on the pool's GPU, the ids copied there
+                    moe_pin(rows->view_src ? rows->view_src : rows, mstream->pool_dev);   // (the get_rows under the reshape)
+                    moe_pin(diag, mstream->pool_dev);
+                }
+                diag = ggml_reshape_2d(ctx0, diag, rows->ne[1], rows->ne[2]);   // [k, n_tok]: the device ids
                 cb(diag, "ffn_moe_topk_vram", il);
                 vram_out_early = build_vram_chain(diag, nullptr, nullptr, true);   // (absolute places)
                 ggml_build_forward_expand(gf, vram_out_early);

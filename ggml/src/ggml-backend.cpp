@@ -45,6 +45,7 @@
 // the hook-provided CPU splits that had to synchronize the GPU first (the graph-shape guard of async-h2d) are counted
 static bool                 g_ho_async_h2d_on = false;
 static std::atomic<int64_t> g_async_guard_syncs{0};
+static std::atomic<int64_t> g_async_multi_syncs{0};   // several GPUs: a CPU split waited for another GPU's pending async copies
 
 
 // backend buffer type
@@ -1652,6 +1653,7 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool alloc_failed; // the last ggml_backend_sched_alloc_graph split its graph and could not allocate it (ggml_backend_sched_alloc_graph_again may plan it again)
 
     int n_backends;
 
@@ -1703,6 +1705,7 @@ struct ggml_backend_sched {
     // A split input that a finished CPU split wrote into the GPU's pinned host
     // buffer is copied with an async H2D on the GPU split's own stream - no host wait (see ggml_backend_sched_async_host_input_ok)
     bool async_host_input;
+    int  n_async_gpus;    // the GPU backends of this scheduler (async_host_input's per-GPU rule with more than one)
     int  test_h2d_late;   // GGML_SCHED_TEST_H2D_LATE (test only): the async copies are enqueued after the split's graph
     // Per split, the GPU split that produced the inputs an input hook provides (-2 =
     // not looked up yet, -1 = not found), looked up once per graph split; valid until the graph is split again
@@ -1961,6 +1964,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+    sched->alloc_failed = false;
     sched->hook_src_valid = false;
     if (sched->copy_hook != NULL && sched->n_copies == 1) {   // a new graph is split
         sched->copy_hook(sched->copy_hook_user_data, NULL, NULL, NULL, NULL, -1, graph);
@@ -2726,9 +2730,11 @@ static bool ggml_backend_sched_async_host_input_ok(ggml_backend_t input_backend,
             ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_GPU) {
         return false;
     }
-    // CUDA only (upstream kept HIP / MUSA out of the same change, and Vulkan needs a sync between H2D copies and the graph)
+    // CUDA and the same backend built for AMD (HIP, "ROCm"): the copy is ordered on the split's stream there too. Upstream kept HIP
+    // out of the same change for a prompt-speed loss, not for correctness; MUSA is not taken, and Vulkan needs a sync between H2D
+    // copies and the graph
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(split_backend));
-    if (reg == NULL || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+    if (reg == NULL || (strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 && strcmp(ggml_backend_reg_name(reg), "ROCm") != 0)) {
         return false;
     }
     // A view of a user input (written by set_inputs, not by a CPU split) and host weights (op offload's expert copies) keep
@@ -2803,12 +2809,23 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
     ggml_backend_sched_moe_users moe_users;
     std::vector<int32_t> ids;
     std::vector<std::pair<struct ggml_tensor *, struct ggml_tensor *>> h2d_late;
-    int last_async_split = -1;   // the last split of this compute that received an async H2D copy
-    // A host synchronize of that split's backend finishes the copy too: nothing is left for the guard
+    // Per backend: the last split of this compute that received an async H2D copy on that backend's stream (-1: none pending). With one
+    // GPU only that GPU's entry is ever set (the guard's rule as before); with several GPUs a CPU split waits for every GPU with a copy
+    // still pending before it writes the CPU compute buffer, unless the input hook's event (later on that same GPU) covers it
+    int last_async_split[GGML_SCHED_MAX_BACKENDS];
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        last_async_split[b] = -1;
+    }
+    // A host synchronize of a backend finishes its copies too: nothing is left for the guard there
     auto async_synced = [&](ggml_backend_t b) {
-        if (last_async_split >= 0 && b == sched->backends[sched->splits[last_async_split].backend_id]) {
-            last_async_split = -1;
+        const int id = ggml_backend_sched_backend_id(sched, b);
+        if (id >= 0) {
+            last_async_split[id] = -1;
         }
+    };
+    const bool async_multi = sched->async_host_input && sched->n_async_gpus > 1;
+    auto is_cpu_backend = [](ggml_backend_t b) {
+        return ggml_backend_dev_type(ggml_backend_get_device(b)) == GGML_BACKEND_DEVICE_TYPE_CPU;
     };
     std::vector<ggml_bitset_t> used_ids;
     std::vector<ggml_tensor *> hook_cpys;   // the input hook's copies of one split
@@ -2951,12 +2968,27 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
             // into its inputs first (the check runs before them) - could write the copy's source before the DMA
             // ran: synchronize that split's GPU first (counted; 0 on ordinary graphs, where the router of the next layer sits in the
             // split that reads the copy)
-            if (last_async_split >= 0 && ggml_backend_sched_hook_src_split(sched, split_id) < last_async_split) {
-                if constexpr (HO) { ho_t = ggml_time_us(); }
-                ggml_backend_synchronize(sched->backends[splits[last_async_split].backend_id]);
-                if constexpr (HO) { ho_wait(ho_r, HO_W_GUARD, ho_t); }
-                g_async_guard_syncs.fetch_add(1);
-                last_async_split = -1;
+            // (with several GPUs: also every GPU with a copy pending whose split is not the hook's - an event on another GPU does not
+            // cover it; a covered one is done once the hook has waited, so it is cleared)
+            int hook_src = -2;
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (last_async_split[b] < 0) {
+                    continue;
+                }
+                if (hook_src == -2) {
+                    hook_src = ggml_backend_sched_hook_src_split(sched, split_id);
+                }
+                const int  src_b     = hook_src >= 0 ? splits[hook_src].backend_id : -1;
+                const bool other_gpu = src_b >= 0 && src_b != b && !is_cpu_backend(sched->backends[src_b]);
+                if (hook_src < last_async_split[b] || other_gpu) {
+                    if constexpr (HO) { ho_t = ggml_time_us(); }
+                    ggml_backend_synchronize(sched->backends[b]);
+                    if constexpr (HO) { ho_wait(ho_r, HO_W_GUARD, ho_t); }
+                    g_async_guard_syncs.fetch_add(1);
+                    last_async_split[b] = -1;
+                } else if (async_multi) {
+                    last_async_split[b] = -1;
+                }
             }
             if constexpr (HO) { ho_t = ggml_time_us(); }
             const int64_t t0_hook = prof ? ggml_time_us() : 0;
@@ -2966,6 +2998,21 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 ggml_prof_add(GGML_PROF_SYNC, ggml_time_us() - t0_hook);
             }
             if constexpr (HO) { if (inputs_provided) { ho_wait(ho_r, HO_W_HOOK, ho_t); } }
+        }
+
+        // Several GPUs: a CPU split that the hook does not provide writes the CPU compute buffer (its input copies, its compute) - every
+        // GPU with an async copy still pending (whose source may be in that buffer) is waited for first
+        if (async_multi && !inputs_provided && is_cpu_backend(split_backend)) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (last_async_split[b] < 0) {
+                    continue;
+                }
+                if constexpr (HO) { ho_t = ggml_time_us(); }
+                ggml_backend_synchronize(sched->backends[b]);
+                if constexpr (HO) { ho_wait(ho_r, HO_W_GUARD, ho_t); }
+                g_async_multi_syncs.fetch_add(1);
+                last_async_split[b] = -1;
+            }
         }
 
         // copy the input tensors to the split backend
@@ -3005,7 +3052,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_impl(ggml_backend_sche
                 } else {
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                 }
-                last_async_split = split_id;
+                last_async_split[split_backend_id] = split_id;
                 if constexpr (HO) { ho_copy(ho_r, HO_C_ASYNC_H2D, ho_t); }   // (its own kind)
                 ggml_prof_add(GGML_PROF_COPY, ggml_time_us() - t0_cpy);
             } else {
@@ -3353,6 +3400,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched->async_host_input) {
         fprintf(stderr, "ggml_backend_sched: async-h2d: hook-provided CPU splits that had to synchronize the GPU first (the "
                 "graph-shape guard): %lld\n", (long long) g_async_guard_syncs.load());
+        if (sched->n_async_gpus > 1) {
+            fprintf(stderr, "ggml_backend_sched: async-h2d with %d GPUs: CPU splits not provided by the hook that synchronized a GPU with a "
+                    "copy still queued first: %lld\n", sched->n_async_gpus, (long long) g_async_multi_syncs.load());
+        }
     }
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
@@ -3376,6 +3427,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->alloc_failed = false;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -3420,9 +3472,29 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     ggml_backend_sched_split_graph(sched, graph);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
+        sched->alloc_failed = true;
         return false;
     }
 
+    sched->is_alloc = true;
+
+    return true;
+}
+
+bool ggml_backend_sched_alloc_graph_again(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (sched->is_alloc) {
+        return true;
+    }
+    if (!sched->alloc_failed) {
+        return false;   // (no graph split by a failed ggml_backend_sched_alloc_graph: a reset, a reserve or a successful allocation came since)
+    }
+
+    if (!ggml_backend_sched_alloc_splits(sched)) {
+        return false;
+    }
+
+    sched->alloc_failed = false;
     sched->is_alloc = true;
 
     return true;
@@ -3482,6 +3554,11 @@ bool ggml_backend_sched_get_async_host_input(ggml_backend_sched_t sched) {
 void ggml_backend_sched_set_async_host_input(ggml_backend_sched_t sched, bool on) {
     GGML_ASSERT(sched);
     sched->async_host_input = on && sched->n_copies == 1;
+    sched->n_async_gpus     = 0;
+    for (int b = 0; b < sched->n_backends; b++) {
+        const enum ggml_backend_dev_type t = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b]));
+        sched->n_async_gpus += t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU ? 1 : 0;
+    }
     g_ho_async_h2d_on = g_ho_async_h2d_on || sched->async_host_input;
     static const int late = getenv("GGML_SCHED_TEST_H2D_LATE") ? atoi(getenv("GGML_SCHED_TEST_H2D_LATE")) : 0;
     sched->test_h2d_late = sched->async_host_input ? late : 0;

@@ -483,6 +483,10 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
     }
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
+        // A short row (small_k, see MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK) fits one warp: one warp per block, several rows per block
+        if (small_k && ncols_dst == 1) {
+            return 1;
+        }
         // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
         // pressure and lookup table contention at higher thread counts.
@@ -592,6 +596,19 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
     }
 }
 
+// RDNA4, one column, rows whose K loop needs at most one warp's lanes (the down projection of small MoE experts, e.g. K = 512):
+// the table's 8 warps on one row leave all but the first lanes idle and the kernel time follows the number of blocks, so such rows
+// run one warp per block with this many rows per block. GGML_HIP_MMVQ_SHORT_ROWS=0 turns it off (the table's shape).
+#define MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK 8
+
+static bool mmvq_rdna4_short_rows_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_HIP_MMVQ_SHORT_ROWS");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -614,6 +631,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             default:
                 return 1;
         }
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA4 && small_k && ncols_dst == 1) {
+        return MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK;
     }
     return 1;
 }
@@ -1234,6 +1254,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 (is_nvidia_pascal_older && std::find(slow_pascal.begin(), slow_pascal.end(), type) != slow_pascal.end()) ||
                 GGML_CUDA_CC_IS_RDNA(cc)) {
             use = false;
+        }
+
+        // RDNA4: the whole row in one warp's lanes, and only whole blocks of rows (the kernel's row check is not exact with ids)
+        if (table_id == MMVQ_PARAMETERS_RDNA4 && c_ncols_dst == 1 && mmvq_rdna4_short_rows_on()) {
+            use = blocks_per_row_x * (qi/vdr) <= warp_size && nrows_x % MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK == 0;
         }
 
         return use;

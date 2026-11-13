@@ -2487,7 +2487,16 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // the routed experts (with the expert streaming's guesses g, or none) plus the gated shared expert (shexp: built
+        // before the routed experts for the guess; nullptr: built here)
         ggml_tensor * build_layer_ffn(
+                    ggml_tensor * cur,
+                            int   il,
+      const llm_graph_moe_guess * g     = nullptr,
+                    ggml_tensor * shexp = nullptr);
+
+        // the shared expert times its sigmoid gate (nullptr when the layer has none)
+        ggml_tensor * build_layer_shexp(
                     ggml_tensor * cur,
                             int   il);
 

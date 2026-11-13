@@ -351,6 +351,11 @@ extern "C" {
 
     // Allocate and compute graph on the backend scheduler
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
+    // After a failed ggml_backend_sched_alloc_graph (e.g. once the buffers' limits were changed): plan and allocate the same graph again
+    // without splitting it again. The split already pointed the graph's nodes at the scheduler's input copies, so the graph must never be
+    // passed to ggml_backend_sched_alloc_graph a second time: build it again instead. false (nothing done) when the scheduler's last graph
+    // was not one that ggml_backend_sched_alloc_graph failed to allocate (a reset, a reserve or a split came since)
+    GGML_API bool                 ggml_backend_sched_alloc_graph_again(ggml_backend_sched_t sched); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);

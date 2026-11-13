@@ -4,8 +4,10 @@
 The output is a normal GGUF with the same tensors in the same order with the same bytes and the same
 metadata as the input, plus:
 
-  general.alignment = 4096          every tensor (so every routed-expert slice) starts on a 4096 boundary,
-                                    which is what O_DIRECT reads need
+  general.alignment = 4096          every tensor starts on a 4096 boundary; with expert slices that are
+                                    multiples of 512 (every common quant) each slice is then on a sector
+                                    boundary, which is what direct (O_DIRECT) reads need. A drive that needs
+                                    4096 reads a slice that is not a 4096-multiple through a copy
   tokenwing.format                  "tokenwing model v1"
   tokenwing.sums.*                  FNV-1a 64-bit checksums of sample experts, checked by --moe-stream-verify
   tokenwing.blob.<name>.offset/size optional extra data appended after the last tensor (4096-aligned):
@@ -13,6 +15,11 @@ metadata as the input, plus:
 
 The trailing data keeps the file a valid GGUF: other programs ignore the bytes after the last tensor.
 Run the engine on it with --moe-stream model.
+
+A split GGUF (MODEL-00001-of-0000N.gguf ...) whose routed experts are all in its first file is converted file 1 only: the output
+must be named OUT-00001-of-0000N.gguf, keeps the split keys, and the other files are used as they are - the tool puts a link
+OUT-0000k-of-0000N.gguf next to the output for each of them (a symbolic link, else a hard link), so the loader finds them. A split
+model with experts in other files has to be merged first (llama-gguf-split --merge).
 
 The checksums are, for every MoE layer, those of the first, the middle (n_expert // 2) and the last expert's
 gate, up and down slice, in that order (9 values per layer, tokenwing.sums.values; the layers are in
@@ -41,6 +48,7 @@ import gguf  # noqa: E402
 from gguf.constants import GGUFValueType  # noqa: E402
 
 IO_ALIGN = 4096
+SLICE_ALIGN = 512   # the smallest sector a drive has: every expert slice must be a multiple of it
 FORMAT_KEY = "tokenwing.format"
 FORMAT_VALUE = "tokenwing model v1"
 SUMS_LAYERS_KEY = "tokenwing.sums.layers"
@@ -57,7 +65,7 @@ CORRECTION_MAGIC = b"TWCORR01"
 PROJS = ("gate", "up", "down")
 EXPS_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
 MERGED_RE = re.compile(r"^blk\.(\d+)\.ffn_gate_up_exps\.weight$")
-SHARD_RE = re.compile(r"^.+-\d{5}-of-\d{5}\.gguf$")
+SHARD_RE = re.compile(r"^(.+)-(\d{5})-of-(\d{5})\.gguf$")
 CHUNK = 32 << 20
 
 
@@ -153,8 +161,8 @@ def find_experts(reader):
             problems.append(f"{t.name}: {t.n_bytes} bytes do not divide into {n_expert} experts")
             continue
         slice_bytes = t.n_bytes // n_expert
-        if slice_bytes % IO_ALIGN != 0:
-            problems.append(f"{t.name}: an expert slice is {slice_bytes} bytes, not a multiple of {IO_ALIGN}")
+        if slice_bytes % SLICE_ALIGN != 0:
+            problems.append(f"{t.name}: an expert slice is {slice_bytes} bytes, not a multiple of {SLICE_ALIGN}")
         layers.setdefault(il, {})[proj] = (n_expert, slice_bytes)
         tensors.setdefault(il, {})[proj] = t
     if problems:
@@ -173,14 +181,67 @@ def find_experts(reader):
     return layers, tensors
 
 
-def check_split(path, reader):
-    if SHARD_RE.match(Path(path).name):
-        raise Refuse(f"{path} looks like one shard of a split GGUF. A TokenWing model file is one file: "
-                     "merge the shards first (llama-gguf-split --merge)")
+def shard_name(path, k, count):
+    """The name the loader looks for: file k (1-based) of `count` next to `path` (which ends in -00001-of-NNNNN.gguf)."""
+    m = SHARD_RE.match(Path(path).name)
+    return str(Path(path).with_name(f"{m.group(1)}-{k:05d}-of-{count:05d}.gguf"))
+
+
+def check_split(path, reader, out_path):
+    """Returns [] for a model in one file, or the paths of files 2..N of a split model whose routed experts are all in file 1."""
     f = reader.fields.get("split.count")
-    if f is not None and int(f.contents()) > 1:
-        raise Refuse(f"{path} is one shard of a split GGUF (split.count = {int(f.contents())}). A TokenWing model file is one file: "
-                     "merge the shards first (llama-gguf-split --merge)")
+    count = int(f.contents()) if f is not None else 1
+    m = SHARD_RE.match(Path(path).name)
+    if count <= 1:
+        if m:
+            raise Refuse(f"{path} is named like one file of a split GGUF but has no split.count: rename it or merge the shards")
+        return []
+    no = reader.fields.get("split.no")
+    if m is None or int(m.group(2)) != 1 or int(m.group(3)) != count or no is None or int(no.contents()) != 0:
+        raise Refuse(f"{path} is one file of a split GGUF (split.count = {count}): give the first one, named ...-00001-of-{count:05d}.gguf")
+    om = SHARD_RE.match(Path(out_path).name)
+    if om is None or int(om.group(2)) != 1 or int(om.group(3)) != count:
+        raise Refuse(f"the model is split into {count} files, so the output's name must end in -00001-of-{count:05d}.gguf "
+                     f"(the loader finds the other files by it), for example {Path(out_path).stem}-00001-of-{count:05d}.gguf")
+    others = []
+    for k in range(2, count + 1):
+        sp = shard_name(path, k, count)
+        if not os.path.isfile(sp):
+            raise Refuse(f"file {k} of the split model is missing: {sp}")
+        try:
+            r = gguf.GGUFReader(sp)
+        except (ValueError, OSError) as e:
+            raise Refuse(f"{sp} cannot be read as a GGUF file: {e}")
+        kno = r.fields.get("split.no")
+        if kno is None or int(kno.contents()) != k - 1:
+            raise Refuse(f"{sp} does not say it is file {k} of the split model (split.no)")
+        exps = [t.name for t in r.tensors if EXPS_RE.match(t.name) or MERGED_RE.match(t.name)]
+        if exps:
+            raise Refuse(f"{sp} holds routed experts too ({exps[0]} ...): the engine streams from one file, so merge the shards "
+                         "first (llama-gguf-split --merge)")
+        others.append(sp)
+    return others
+
+
+def link_others(others, out_path, count):
+    """Puts OUT-0000k-of-NNNNN.gguf next to the output for every other file of the split model: a symbolic link, else a hard link.
+    A file already there is kept when it is that file."""
+    for k, sp in enumerate(others, start=2):
+        dst = shard_name(out_path, k, count)
+        if os.path.lexists(dst):
+            if os.path.exists(dst) and os.path.samefile(dst, sp):
+                print(f"{dst}: already {sp}", flush=True)
+                continue
+            raise Refuse(f"{dst} exists and is not {sp}: move it away first")
+        try:
+            os.symlink(sp, dst)
+            print(f"{dst}: a symbolic link to {sp}", flush=True)
+        except OSError as e1:
+            try:
+                os.link(sp, dst)
+                print(f"{dst}: a hard link to {sp}", flush=True)
+            except OSError as e2:
+                raise Refuse(f"cannot place {dst} next to the output ({e1}; {e2}): copy or link {sp} there yourself")
 
 
 def check_blob(name, path):
@@ -358,9 +419,25 @@ def check_output(src_path, out_path, src_reader, layers, sums, blobs, blob_files
     print(f"check: done in {time.time() - t0:.1f} s", flush=True)
 
 
+def check_others(out_path, others, reader):
+    """The loader's view of a converted split model: the other files are found next to the output and are the model's own."""
+    n_split = len(others) + 1
+    n_tensors = len(reader.tensors)
+    for k, sp in enumerate(others, start=2):
+        dst = shard_name(out_path, k, n_split)
+        if not (os.path.exists(dst) and os.path.samefile(dst, sp)):
+            raise Refuse(f"check failed: {dst} is not {sp}")
+        n_tensors += len(gguf.GGUFReader(dst).tensors)
+    f = reader.fields.get("split.tensors.count")
+    if f is not None and int(f.contents()) != n_tensors:
+        raise Refuse(f"check failed: the files hold {n_tensors} tensors, split.tensors.count says {int(f.contents())}")
+    print(f"check: files 2..{n_split} found next to the output and identical to the model's; {n_tensors} tensors in all, as "
+          f"split.tensors.count says", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Make a TokenWing model file (one GGUF to stream the experts from) out of a GGUF.")
-    ap.add_argument("model", help="the model's GGUF (one file, not a split one)")
+    ap.add_argument("model", help="the model's GGUF (one file, or the first file of a split model whose experts are all in it)")
     ap.add_argument("-o", "--output", required=True, help="the file to write (written as OUTPUT.tmp, renamed when complete)")
     ap.add_argument("--correction", help="a TokenWing correction file to append (used by --moe-stream-correction model)")
     ap.add_argument("--vram-list", help="a 'tokenwing vram-experts v1' JSON to append (used by --moe-stream-vram-experts-file model)")
@@ -392,14 +469,18 @@ def main():
             reader = gguf.GGUFReader(src)
         except (ValueError, OSError) as e:
             raise Refuse(f"{src} cannot be read as a GGUF file: {e}")
-        check_split(src, reader)
+        others = check_split(src, reader, out_path)
+        n_split = len(others) + 1
         if reader.endianess != gguf.GGUFEndian.LITTLE:
             raise Refuse("a big-endian GGUF cannot be converted")
         arch = reader.get_field(gguf.Keys.General.ARCHITECTURE).contents()
         layers, ltensors = find_experts(reader)
         n_expert = {n for projs in layers.values() for n, _ in projs.values()}
+        n_4k = sum(1 for projs in layers.values() for _, sb in projs.values() if sb % IO_ALIGN != 0)
         print(f"{src}: arch {arch}, {len(reader.tensors)} tensors, {len(layers)} MoE layers, {sorted(n_expert)} experts per layer; "
-              f"every expert slice is a multiple of {IO_ALIGN} bytes", flush=True)
+              f"every expert slice is a multiple of {SLICE_ALIGN} bytes"
+              + (f" ({n_4k} of {3 * len(layers)} are not multiples of {IO_ALIGN}: a drive that needs {IO_ALIGN}-byte direct "
+                 f"reads reads those through a copy)" if n_4k else f" and of {IO_ALIGN}"), flush=True)
 
         offsets = {il: {p: ltensors[il][p].data_offset for p in PROJS} for il in layers}
         print(f"checksums of the first, middle and last expert of every layer ({n_jobs} processes) ...", flush=True)
@@ -419,6 +500,11 @@ def main():
                 blobs[name] = (pos, blob_sizes[name])
                 pos = align_up(pos + blob_sizes[name])
         w = build_writer(reader, arch, layers, sums, blobs)
+
+        if others:
+            print(f"split model: file 1 of {n_split} holds every routed expert and is converted; the other files are used as they are",
+                  flush=True)
+            link_others(others, out_path, n_split)
 
         free = shutil.disk_usage(os.path.dirname(out_path) or ".").free
         need = pos + (1 << 20)
@@ -460,6 +546,8 @@ def main():
 
         if not args.no_check:
             check_output(src, out_path, reader, layers, sums, blobs, blob_files, n_jobs)
+            if others:
+                check_others(out_path, others, reader)
     except Refuse as e:
         print(f"make_model_file: {e}", file=sys.stderr)
         if os.path.exists(tmp_path):

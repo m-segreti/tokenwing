@@ -889,7 +889,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 // the other archs (Qwen3.x ... tied-embedding check first) with their ports. bailingmoe3 marks it only
 // when the file has a separate output.weight (a tied table would be read in full by every word) - the accounting and the plan test that too
 static bool llama_arch_marks_token_embd_lazy(llm_arch a) {
-    return a == LLM_ARCH_BAILINGMOE3 || a == LLM_ARCH_FLINT;   // Flint (its own output.weight, flint.cpp)
+    return a == LLM_ARCH_BAILINGMOE3 || a == LLM_ARCH_FLINT ||   // Flint (its own output.weight, flint.cpp)
+           a == LLM_ARCH_QWEN4EXP;                               // qwen4exp (the same test in qwen4exp.cpp)
+}
+
+// The other tables outside the layers whose create_tensor marks them TENSOR_READ_LAZY: the per-layer token table of qwen4exp (its
+// n-gram table, tens of GiB, often a file of its own) and of gemma4. Only the rows a token uses are read, from the mapping; the
+// table is never held in RAM. Must agree with the arch's create_tensor flags (gemma3n loads the same tensor in full)
+static bool llama_arch_marks_tensor_lazy(llm_arch a, const char * name) {
+    return strcmp(name, "per_layer_token_embd.weight") == 0 && (a == LLM_ARCH_QWEN4EXP || a == LLM_ARCH_GEMMA4);
 }
 
 // AUTO lazy mode falls back to OFF when any device cannot mmap (iGPUs, #28160). The loader and
@@ -1547,7 +1555,17 @@ struct llama_moe_stream_srv_terms {
     int64_t stage   = 0;   // the in-call checkpoints' staging (--ctx-checkpoints + 1 snapshots), kept
 };
 
-static llama_moe_stream_srv_terms llama_moe_stream_srv_compute(const llama_hparams & hp, const llama_moe_stream_srv & srv) {
+// The bytes per token, on one attention layer, of a sparse-attention indexer's own cache (llama_memory_hybrid_idx, which
+// create_memory builds for qwen4exp: one key row of indexer_head_size x the k-pool row's slots per token, in the K cache type, no
+// V); 0 for a model without one. The KV cache sizes below add it on the layers that have it (the attention layers)
+static int64_t llama_moe_stream_idx_row(const llama_hparams & hp, llm_arch arch, ggml_type tk) {
+    if (arch != LLM_ARCH_QWEN4EXP || hp.indexer_head_size == 0) {
+        return 0;
+    }
+    return (int64_t) ggml_row_size(tk, (int64_t) hp.indexer_head_size*(hp.indexer_kpool > 0 ? hp.indexer_kpool_row : 1));
+}
+
+static llama_moe_stream_srv_terms llama_moe_stream_srv_compute(const llama_hparams & hp, llm_arch arch, const llama_moe_stream_srv & srv) {
     llama_moe_stream_srv_terms t;
     const uint32_t n_seq     = srv.n_seq > 0 ? srv.n_seq : 1;
     const uint32_t n_ctx     = srv.n_ctx > 0 ? srv.n_ctx : hp.n_ctx_train;
@@ -1563,7 +1581,8 @@ static llama_moe_stream_srv_terms llama_moe_stream_srv_compute(const llama_hpara
             any_recr = true;
             continue;
         }
-        const int64_t kv_row = (int64_t) ggml_row_size(tk, hp.n_embd_k_gqa(il)) + (int64_t) ggml_row_size(tv, hp.n_embd_v_gqa(il));
+        const int64_t kv_row = (int64_t) ggml_row_size(tk, hp.n_embd_k_gqa(il)) + (int64_t) ggml_row_size(tv, hp.n_embd_v_gqa(il)) +
+                llama_moe_stream_idx_row(hp, arch, tk);   // (the indexer's rows are saved with the state too)
         if (hp.is_swa(il) && !srv.swa_full) {
             // the window cannot be rolled back. A sequence's state writes only the cells inside the window
             // (llama_kv_cache::state_write skips the SWA-masked ones), n_swa per layer - not n_swa + n_ubatch, the cache's size;
@@ -1587,7 +1606,8 @@ static llama_moe_stream_srv_terms llama_moe_stream_srv_compute(const llama_hpara
 
 // One layer's KV cache rows or recurrent state for the context the model is loaded for (llama_model_params' moe_stream_ctx*), at
 // the sizes llama_kv_cache, llama_kv_cache_iswa and llama_memory_recurrent allocate for the plain, SWA and hybrid layouts; the
-// whole-layer VRAM check charges it to the layer's device. Caches of their own (an indexer's keys, a compressor's state) are not counted
+// whole-layer VRAM check charges it to the layer's device. A sparse-attention indexer's own cache (qwen4exp) is counted with its layer;
+// other caches of their own (a compressor's state) are not
 static int64_t llama_moe_stream_layer_ctx_bytes(const llama_hparams & hp, llm_arch arch, uint32_t il, const llama_model_params & p) {
     const bool     unified   = (p.moe_stream_ctx_flags & 1) != 0;
     const bool     swa_full  = (p.moe_stream_ctx_flags & 2) != 0;
@@ -1616,7 +1636,8 @@ static int64_t llama_moe_stream_layer_ctx_bytes(const llama_hparams & hp, llm_ar
     const uint32_t kv_size = swa ? GGML_PAD(std::min(n_ctx_seq, hp.n_swa*(unified ? n_seq : 1) + n_ubatch), 256) : n_ctx_seq;
     const int64_t  k = (int64_t) ggml_row_size((ggml_type) p.moe_stream_ctx_type_k, hp.n_embd_k_gqa(il));
     const int64_t  v = hp.is_mla() ? 0 : (int64_t) ggml_row_size((ggml_type) p.moe_stream_ctx_type_v, hp.n_embd_v_gqa(il));   // (MLA: V is a view of K)
-    return (k + v)*(int64_t) kv_size*(int64_t) n_stream;
+    const int64_t  idx = swa ? 0 : llama_moe_stream_idx_row(hp, arch, (ggml_type) p.moe_stream_ctx_type_k);   // the indexer cache: as long as the KV cache
+    return (k + v + idx)*(int64_t) kv_size*(int64_t) n_stream;
 }
 
 // the bytes to add to the non-pool memory for it (0 when it fits in the reserve's headroom), and the start-up line
@@ -1974,6 +1995,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     continue;
                 }
 
+                // Any other table the arch reads lazily (the same decision as the loader's: lazy mode, size): neither RAM nor VRAM of
+                // ours. Counted, a 27 GiB n-gram table left no room for the pools (CPU) or filled the GPU's weight sum (-ngl)
+                if (il < 0 && llama_arch_marks_tensor_lazy(arch, tn_name) && ml.lazy.add(tn_name, it.second.tensor, nullptr)) {
+                    fprintf(stderr, "%s: %s (%.1f MiB) is read lazily - mapped from the file, only the rows a token uses are read, "
+                            "not counted as memory of ours\n", __func__, tn_name, (double) tn_bytes/1048576.0);
+                    continue;
+                }
+
                 if (llama_moe_stream_is_exps(tn_name) && !nextn) {
                     continue;
                 }
@@ -2053,10 +2082,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // A server's snapshots and its state-file restore buffer, inside the reserve's headroom
             int64_t srv_bytes = 0;
             if (params.moe_stream_srv) {
-                srv_bytes = llama_moe_stream_srv_extra(llama_moe_stream_srv_compute(hparams, *params.moe_stream_srv),
+                srv_bytes = llama_moe_stream_srv_extra(llama_moe_stream_srv_compute(hparams, arch, *params.moe_stream_srv),
                         *params.moe_stream_srv, __func__);
                 other_bytes += srv_bytes;
-                np_srv_need = llama_moe_stream_srv_compute(hparams, *params.moe_stream_srv).need;
+                np_srv_need = llama_moe_stream_srv_compute(hparams, arch, *params.moe_stream_srv).need;
             }
             if (params.moe_stream_nonpool) {   // from the record, or the fixed reserve without one
                 np_planned = llama_moe_stream_np_bytes(*params.moe_stream_nonpool, llama_moe_stream_sidecar_arg(params.moe_stream, ml.file_paths[0]).c_str(),
@@ -2370,7 +2399,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_follow_margin   = (uint32_t) params.moe_stream_vram_follow_margin;
         p1.vram_follow_fixed    = params.moe_stream_vram_follow_fixed == 1;
         p1.vram_follow_pinned   = params.moe_stream_vram_follow_pinned == 1;
-        p1.vram_parallel        = params.moe_stream_vram_parallel == 1;
+        p1.vram_parallel        = params.moe_stream_vram_parallel >= 1;
+        p1.vram_parallel_cross  = params.moe_stream_vram_parallel == 2;
         p1.vram_copyback        = params.moe_stream_vram_copyback == 1;
         p1.async_h2d            = params.moe_stream_async_h2d == 1;
         p1.elastic              = params.moe_stream_elastic == 1;
@@ -2387,6 +2417,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_lend_prompt     = params.moe_stream_vram_lend_prompt != 0;
         p1.vram_lend_short      = std::max(1, params.moe_stream_vram_lend_short);
         p1.timing               = params.moe_stream_timing == 1;
+        p1.out_check            = std::max(0, params.moe_stream_out_check);
         p1.nonpool              = params.moe_stream_nonpool != nullptr;
         p1.wl_devs              = std::move(wl_devs);
         p1.wl_dev_of            = std::move(wl_dev_of);
@@ -3642,8 +3673,8 @@ bool llama_moe_stream_get_plan(
                 return false;
             }
             mb->load_hparams(ml);
-            plan_srv_bytes = llama_moe_stream_srv_extra(llama_moe_stream_srv_compute(mb->hparams, *srv), *srv, __func__);
-            plan_srv_need  = llama_moe_stream_srv_compute(mb->hparams, *srv).need;
+            plan_srv_bytes = llama_moe_stream_srv_extra(llama_moe_stream_srv_compute(mb->hparams, mb->arch, *srv), *srv, __func__);
+            plan_srv_need  = llama_moe_stream_srv_compute(mb->hparams, mb->arch, *srv).need;
         }
         const int64_t plan_np_bytes = nonpool ? llama_moe_stream_np_bytes(*nonpool, llama_moe_stream_sidecar_arg(sidecar_json, model_path).c_str(), plan_srv_need, plan_srv_bytes, __func__)
                                               : llama_moe_stream_other_reserve() + plan_srv_bytes;
@@ -4510,6 +4541,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_vram_lend_prompt =*/ 0,      // off (the prompt's GPU tensors in the compute buffer)
         /*.moe_stream_vram_lend_short  =*/ 64,     // prompt calls of <= 64 tokens in the real compute buffer
         /*.moe_stream_timing           =*/ 0,      // no timing work
+        /*.moe_stream_out_check        =*/ 16,     // every prompt call and every 16th reply call
         /*.moe_stream_vram_device      =*/ nullptr, // the first GPU holds the VRAM pool
         /*.moe_stream_gpu_layers_device =*/ nullptr, // whole layers' experts on their layer's own device
         /*.vocab_only                  =*/ false,

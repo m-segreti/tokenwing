@@ -1,10 +1,11 @@
 #include "moe-mark.cuh"
 
+#include <algorithm>
 #include <vector>
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
 
-// See moe-mark.cuh. One table per kind for the process (one engine registers, on one device);
+// See moe-mark.cuh. One table per kind for the process (one engine registers; each entry on its own device);
 // written at start-up and at teardown, read by the graph thread.
 struct ggml_cuda_moe_mark_entry {
     uint8_t        * slot     = nullptr;   // pinned
@@ -12,7 +13,19 @@ struct ggml_cuda_moe_mark_entry {
     uint32_t       * counter  = nullptr;   // pinned
     const uint32_t * expected = nullptr;   // pinned: the host's number of this call
     cudaEvent_t      ev       = nullptr;
+    int              device   = -1;        // the CUDA device whose stream runs the marked node (the event is created there)
+#if defined(GGML_USE_HIP)
+    cudaEvent_t      tmp      = nullptr;   // the point in the compute stream the side stream waits for (see below)
+#endif
 };
+
+#if defined(GGML_USE_HIP)
+// HIP refuses a sync of an event while the stream that last recorded it captures a graph, and the refused sync ends that
+// capture. The guess helper waits on a mark's event while the compute stream may capture the next graph, so a mark recorded
+// outside a capture goes through a side stream per device that first waits for the compute stream (a mark inside a capture
+// is an external record node, which HIP lets the host wait on)
+static cudaStream_t g_moe_mark_side[GGML_CUDA_MAX_DEVICES] = {};
+#endif
 
 struct ggml_cuda_moe_mark_kind_state {
     std::vector<ggml_cuda_moe_mark_entry> e;
@@ -23,7 +36,7 @@ struct ggml_cuda_moe_mark_kind_state {
 static ggml_cuda_moe_mark_kind_state g_moe_mark[GGML_CUDA_MOE_MARK_N];
 static uint32_t                      g_moe_mark_bits   = 0;
 static const void *                  g_moe_mark_owner  = nullptr;
-static int                           g_moe_mark_device = -1;
+static std::vector<int>              g_moe_mark_devices;       // every device with an entry (the sync after an aborted call)
 
 // the sources a mark copies (the node, then for a router mark its src[1..]), packed at 16-byte offsets
 #define MOE_MARK_MAX_SRC 4
@@ -86,13 +99,14 @@ static __global__ void k_moe_mark(const moe_mark_srcs s, int32_t * dst, const ui
 }
 
 bool ggml_cuda_moe_mark_register(const void * owner, int device, int32_t n_layers,
-                                 const ggml_cuda_moe_mark_table * tables, int n_tables, const char ** why) {
+                                 const ggml_cuda_moe_mark_table * tables, int n_tables, const int32_t * const * dev_of,
+                                 const char ** why) {
     if (g_moe_mark_owner != nullptr && g_moe_mark_owner != owner) {
         *why = "another model in this process already uses needed-early (one per process)";
         return false;
     }
     ggml_cuda_moe_mark_unregister(owner);
-    ggml_cuda_set_device(device);   // the events belong to the device whose stream records them
+    std::vector<int> devices;
     for (int k = 0; k < n_tables && k < GGML_CUDA_MOE_MARK_N; k++) {
         const ggml_cuda_moe_mark_table & t = tables[k];
         ggml_cuda_moe_mark_kind_state & st = g_moe_mark[k];
@@ -107,7 +121,18 @@ bool ggml_cuda_moe_mark_register(const void * owner, int device, int32_t n_layer
             e.cap      = t.caps[il];
             e.counter  = t.counters[il];
             e.expected = t.expected[il];
-            if (cudaEventCreateWithFlags(&e.ev, cudaEventDisableTiming) != cudaSuccess) {
+            e.device   = dev_of != nullptr && dev_of[k] != nullptr && dev_of[k][il] >= 0 ? dev_of[k][il] : device;
+            if (std::find(devices.begin(), devices.end(), e.device) == devices.end()) {
+                devices.push_back(e.device);
+            }
+            ggml_cuda_set_device(e.device);   // the event belongs to the device whose stream records it
+            if (cudaEventCreateWithFlags(&e.ev, cudaEventDisableTiming) != cudaSuccess
+#if defined(GGML_USE_HIP)
+                    || cudaEventCreateWithFlags(&e.tmp, cudaEventDisableTiming) != cudaSuccess
+                    || (g_moe_mark_side[e.device] == nullptr &&
+                        cudaStreamCreateWithFlags(&g_moe_mark_side[e.device], cudaStreamNonBlocking) != cudaSuccess)
+#endif
+                    ) {
                 (void) cudaGetLastError();
                 ggml_cuda_moe_mark_unregister(owner);
                 *why = "the GPU backend could not create the events";
@@ -118,9 +143,10 @@ bool ggml_cuda_moe_mark_register(const void * owner, int device, int32_t n_layer
         st.bit  = any ? t.flag_bit : 0;
         st.skip = t.skip_layer;
     }
-    g_moe_mark_owner  = owner;
-    g_moe_mark_device = device;
-    g_moe_mark_bits   = 0;
+    ggml_cuda_set_device(device);   // (the registration's device stays the current one, as before)
+    g_moe_mark_owner   = owner;
+    g_moe_mark_devices = devices;
+    g_moe_mark_bits    = 0;
     for (const auto & st : g_moe_mark) {
         g_moe_mark_bits |= st.bit;
     }
@@ -152,29 +178,42 @@ void ggml_cuda_moe_mark_unregister(const void * owner) {
             if (e.ev != nullptr) {
                 (void) cudaEventDestroy(e.ev);
             }
+#if defined(GGML_USE_HIP)
+            if (e.tmp != nullptr) {
+                (void) cudaEventDestroy(e.tmp);
+            }
+#endif
         }
         st.e.clear();
         st.bit  = 0;
         st.skip = -1;
     }
+#if defined(GGML_USE_HIP)
+    for (cudaStream_t & s : g_moe_mark_side) {
+        if (s != nullptr) {
+            (void) cudaStreamDestroy(s);
+            s = nullptr;
+        }
+    }
+#endif
     g_moe_mark_owner  = nullptr;
-    g_moe_mark_device = -1;
+    g_moe_mark_devices.clear();
 }
 
 uint32_t ggml_cuda_moe_mark_bits(void) {
     return g_moe_mark_bits;
 }
 
-// After a call aborted part-way, every producer kernel it enqueued has run before the next call's number is written
+// After a call aborted part-way, every producer kernel it enqueued (on any device with an entry) has run before the next call's
+// number is written
 bool ggml_cuda_moe_mark_sync(void) {
-    if (g_moe_mark_device < 0) {
-        return true;
-    }
-    ggml_cuda_set_device(g_moe_mark_device);
-    const cudaError_t err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        GGML_LOG_ERROR("%s: CUDA error %s\n", __func__, cudaGetErrorString(err));
-        return false;
+    for (const int d : g_moe_mark_devices) {
+        ggml_cuda_set_device(d);
+        const cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            GGML_LOG_ERROR("%s: CUDA error %s\n", __func__, cudaGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -217,11 +256,11 @@ void ggml_cuda_moe_mark_after(const ggml_cgraph * cgraph, int i0, int i1, cudaSt
             if (il < 0 || (size_t) il >= st.e.size() || st.e[il].slot == nullptr) {
                 GGML_ABORT("%s: node %s is marked for layer %d, which has no registered slot", __func__, node->name, il);
             }
-            if (device != g_moe_mark_device) {
-                GGML_ABORT("%s: node %s (layer %d) runs on CUDA%d, but needed-early's events belong to CUDA%d", __func__, node->name,
-                        il, device, g_moe_mark_device);
-            }
             ggml_cuda_moe_mark_entry & e = st.e[il];
+            if (device != e.device) {
+                GGML_ABORT("%s: node %s (layer %d) runs on CUDA%d, but its needed-early event belongs to CUDA%d", __func__, node->name,
+                        il, device, e.device);
+            }
             // the sources: the node itself; a router mark also copies its src[1..] (the other inputs of the layer's CPU split)
             moe_mark_srcs s = {};
             int64_t off = 0;
@@ -258,13 +297,20 @@ void ggml_cuda_moe_mark_after(const ggml_cgraph * cgraph, int i0, int i1, cudaSt
             if (capturing) {
                 CUDA_CHECK(cudaEventRecordWithFlags(e.ev, stream, cudaEventRecordExternal));
             } else {
+#if defined(GGML_USE_HIP)
+                CUDA_CHECK(cudaEventRecord(e.tmp, stream));
+                CUDA_CHECK(cudaStreamWaitEvent(g_moe_mark_side[e.device], e.tmp, 0));
+                CUDA_CHECK(cudaEventRecord(e.ev, g_moe_mark_side[e.device]));
+#else
                 CUDA_CHECK(cudaEventRecord(e.ev, stream));
+#endif
             }
         }
     }
 }
 
 // test only: see moe-mark.cuh
+#if !defined(GGML_USE_HIP)
 static __global__ void k_moe_test_spin(uint64_t ns) {
     uint64_t t0;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
@@ -283,12 +329,15 @@ bool ggml_cuda_moe_test_spin(cudaStream_t stream, int64_t us) {
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+#else // HIP: no %globaltimer register; the test delay does nothing (not exported)
+bool ggml_cuda_moe_test_spin(cudaStream_t, int64_t) { return false; }
+#endif
 
-#else // HIP / MUSA: no producer (the host-side stand-in stays: the register function is not exported)
+#else // MUSA: no producer (the host-side stand-in stays: the register function is not exported)
 
 bool ggml_cuda_moe_test_spin(cudaStream_t, int64_t) { return false; }
 
-bool ggml_cuda_moe_mark_register(const void *, int, int32_t, const ggml_cuda_moe_mark_table *, int, const char ** why) {
+bool ggml_cuda_moe_mark_register(const void *, int, int32_t, const ggml_cuda_moe_mark_table *, int, const int32_t * const *, const char ** why) {
     *why = "this GPU backend has no producer";
     return false;
 }

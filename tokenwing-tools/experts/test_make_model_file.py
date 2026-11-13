@@ -45,6 +45,35 @@ def write_gguf(path, slice_floats):
     w.close()
 
 
+def write_split(prefix, slice_floats, experts_in_second=False):
+    """A model in two files: file 1 = write_gguf's tensors, file 2 = one big table (and, if asked, a layer's experts)."""
+    rng = np.random.default_rng(2)
+    p1, p2 = Path(f"{prefix}-00001-of-00002.gguf"), Path(f"{prefix}-00002-of-00002.gguf")
+    n2 = 1 + (3 if experts_in_second else 0)
+    w = gguf.GGUFWriter(str(p1), "bailingmoe3")
+    w.add_uint32("bailingmoe3.block_count", 4)
+    w.add_custom_alignment(32)
+    w.add_uint16("split.no", 0)
+    w.add_uint16("split.count", 2)
+    w.add_int32("split.tensors.count", 1 + 2 * 4 + n2)
+    w.add_tensor("token_embd.weight", rng.standard_normal((3, 7)).astype(np.float32))
+    for il in (1, 2):
+        for p in ("gate", "up", "down"):
+            w.add_tensor(f"blk.{il}.ffn_{p}_exps.weight", rng.standard_normal((N_EXPERT, 2, slice_floats // 2)).astype(np.float32))
+        w.add_tensor(f"blk.{il}.attn_norm.weight", rng.standard_normal((9,)).astype(np.float32))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    w = gguf.GGUFWriter(str(p2), "bailingmoe3")
+    w.add_uint16("split.no", 1)
+    w.add_uint16("split.count", 2)
+    w.add_int32("split.tensors.count", 1 + 2 * 4 + n2)
+    w.add_tensor("per_layer_token_embd.weight", rng.standard_normal((11, 5)).astype(np.float32))
+    if experts_in_second:
+        for p in ("gate", "up", "down"):
+            w.add_tensor(f"blk.3.ffn_{p}_exps.weight", rng.standard_normal((N_EXPERT, 2, slice_floats // 2)).astype(np.float32))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+    return p1, p2
+
+
 def run(*args):
     return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)], capture_output=True, text=True)
 
@@ -88,12 +117,46 @@ def main():
             assert not (WORK / "x.out.gguf").exists()
 
         @case
+        def converts_a_split_model():
+            (WORK / "sp").mkdir()
+            p1, p2 = write_split(WORK / "sp" / "m", 2048)
+            o1 = WORK / "sp" / "o-00001-of-00002.gguf"
+            r = run(p1, "-o", o1, "--jobs", 1)
+            assert r.returncode == 0, r.stderr + r.stdout
+            assert "files 2..2 found next to the output" in r.stdout and "tensor bytes identical" in r.stdout, r.stdout
+            o2 = WORK / "sp" / "o-00002-of-00002.gguf"
+            assert os.path.samefile(o2, p2)
+            rd = gguf.GGUFReader(str(o1))
+            assert int(rd.fields["split.count"].contents()) == 2 and int(rd.fields["split.no"].contents()) == 0
+            assert all(t.data_offset % 4096 == 0 for t in rd.tensors) and "per_layer_token_embd.weight" not in [t.name for t in rd.tensors]
+            r = run(p1, "-o", WORK / "sp" / "o.gguf")
+            assert r.returncode == 1 and "-00001-of-00002.gguf" in r.stderr, r.stderr
+
+        @case
+        def refuses_experts_in_another_file():
+            (WORK / "sx").mkdir()
+            p1, _ = write_split(WORK / "sx" / "m", 2048, experts_in_second=True)
+            r = run(p1, "-o", WORK / "sx" / "o-00001-of-00002.gguf")
+            assert r.returncode == 1 and "holds routed experts too" in r.stderr, r.stderr
+            assert not (WORK / "sx" / "o-00001-of-00002.gguf").exists()
+
+        @case
         def refuses_unaligned_slices():
             odd = WORK / "odd.gguf"
             write_gguf(odd, 30)   # 120 bytes per slice
             r = run(odd, "-o", WORK / "odd.out.gguf")
-            assert r.returncode == 1 and "not a multiple of 4096" in r.stderr and "blk.1.ffn_gate_exps.weight" in r.stderr, r.stderr
+            assert r.returncode == 1 and "not a multiple of 512" in r.stderr and "blk.1.ffn_gate_exps.weight" in r.stderr, r.stderr
             assert not (WORK / "odd.out.gguf").exists() and not (WORK / "odd.out.gguf.tmp").exists()
+
+        @case
+        def accepts_sector_multiple_slices():
+            s512 = WORK / "s512.gguf"
+            write_gguf(s512, 384)   # 1536 bytes per slice: a multiple of 512, not of 4096
+            r = run(s512, "-o", WORK / "s512.out.gguf", "--jobs", 1)
+            assert r.returncode == 0, r.stderr + r.stdout
+            assert "are not multiples of 4096" in r.stdout and "tensor bytes identical" in r.stdout, r.stdout
+            rd = gguf.GGUFReader(str(WORK / "s512.out.gguf"))
+            assert all(t.data_offset % 4096 == 0 for t in rd.tensors)
 
         @case
         def refuses_a_wrong_blob():

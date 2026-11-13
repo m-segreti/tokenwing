@@ -1054,7 +1054,13 @@ struct llm_graph_rec_leads {
     ggml_tensor * gate   [MAX_D + 1] = { nullptr };
     ggml_tensor * norm   [MAX_D + 1] = { nullptr };
     ggml_tensor * probs_b[MAX_D + 1] = { nullptr };
+    // the guess input for layer il + d, built by the model (a model whose routers do not read "base normed with ffn_norm", e.g.
+    // hyper-connection models); null: base normed with norm[d]
+    ggml_tensor * in     [MAX_D + 1] = { nullptr };
 };
+
+// A model's own guess input for target layer X from its base (llm_graph_moe_guess::pred_base); see moe_guess_finish_in
+using llm_graph_guess_in_fn = std::function<ggml_tensor * (int X)>;
 
 // The guesses a model hands to build_moe_ffn for the expert streaming, built once in shared code for every
 // model (Ling's wiring, moved out of bailingmoe3.cpp). First call (moe_guess_routers): the routers 1-3 MoE layers ahead (the correction file's corrected
@@ -1293,11 +1299,16 @@ struct llm_graph_context {
     llm_graph_moe_guess moe_guess_routers(const llama_model & model, int il) const;
     void                moe_guess_finish(const llama_model & model, int il, ggml_tensor * ffn_inp, ggml_tensor * shared,
                                          llm_graph_moe_guess & g) const;
+    // the same for a model that builds its own base (residual + shared expert, in its own form; nullptr: no shared-expert
+    // guess) and, with guess_in, its own guess input per target layer (instead of the base normed with that layer's ffn_norm)
+    void                moe_guess_finish_in(const llama_model & model, int il, ggml_tensor * base,
+                                            const llm_graph_guess_in_fn & guess_in, llm_graph_moe_guess & g) const;
     llm_graph_moe_ws    moe_ws_begin() const;
     // after layer il's output `out` (residual added): a word-start source builds its guesses; ws_base = the MoE source's
     // pred_base (nullptr for a dense layer: its output is the base), ffn_in_n = its normed FFN input
     void                moe_ws_layer(const llama_model & model, int il, ggml_tensor * out, ggml_tensor * ws_base,
-                                     ggml_tensor * ffn_in_n, llm_graph_moe_ws & st) const;
+                                     ggml_tensor * ffn_in_n, llm_graph_moe_ws & st,
+                                     const llm_graph_guess_in_fn & guess_in = nullptr) const;
 
     ggml_tensor * build_ws_guess(
                      int   il,

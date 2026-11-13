@@ -21,6 +21,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -562,12 +563,18 @@ llama_context::llama_context(
                 gdev  = ggml_backend_get_device(gback);
                 gbuft = ggml_backend_get_default_buffer_type(gback);
             }
-            {   // the pool's tail needs one GPU backend, no pipeline copies (the scheduler's n_copies is 1) and op offload
+            {   // the pool's tail needs no pipeline copies (the scheduler's n_copies is 1), op offload, and every GPU prompt wave on the
+                // pool's GPU: one GPU, or with several the scheduler's op offload limited to the pool's GPU (sched_new)
+                // MOE_STREAM_TEST_MULTI_GPU_NO_TAIL=1 (test only): with several GPUs no tail (no tail waves, no copy-ahead)
                 int n_gpu_t = 0;
                 for (auto & backend : backends) {
                     n_gpu_t += ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
                 }
-                ms->tail_allowed = n_gpu_t == 1 && !cparams.pipeline_parallel && cparams.op_offload;
+                static const bool test_no_tail = getenv("MOE_STREAM_TEST_MULTI_GPU_NO_TAIL") && atoi(getenv("MOE_STREAM_TEST_MULTI_GPU_NO_TAIL")) != 0;
+                ms->n_gpu_ctx    = n_gpu_t;
+                ms->tail_test_mg = n_gpu_t > 1 && test_no_tail;
+                ms->tail_allowed = (n_gpu_t == 1 || (n_gpu_t > 1 && gback != nullptr && !ms->tail_test_mg)) && !cparams.pipeline_parallel &&
+                                   cparams.op_offload;
             }
             {   // the op scratch pool's size. 8 bytes per hidden element per ubatch row is a CALIBRATION on Ling-3.0-flash
                 // (18.0 KiB per row measured = 7.2-7.6 B per hidden element at -ub 2048, rounded up), not a derivation: the batch-sized users of the
@@ -907,7 +914,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
-    if (auto * ms = model.moe_stream(); ms && ms->pool_dev_set) {   // --moe-stream-vram-device: the prompt matmuls of the RAM pools on that GPU only
+    // --moe-stream-vram-device, or streamed layers with several GPUs: the prompt matmuls of the RAM pools on the pool's GPU only (without
+    // the flag that is the first GPU, where the offload went anyway; with it fixed, the pool's tail can take their copies)
+    if (auto * ms = model.moe_stream(); ms && (ms->pool_dev_set || (!ms->il_of_moe.empty() && sched_n_gpu() > 1))) {
         ggml_backend_sched_set_op_offload_backend(sched.get(), ms_pool_backend());
     }
     if (auto * ms = model.moe_stream()) {   // this context's prompt graphs may plan into lent pool places
@@ -1904,8 +1913,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (model.moe_stream() && (model.moe_stream()->ws_gpu || model.moe_stream()->p1.prompt_split)) {   // (prompt split: the split end)
             ggml_backend_sched_set_split_hook(sched.get(), llama_moe_stream_sched_split_hook, model.moe_stream());
         }
-        // One GPU backend and no pipeline parallelism (the scheduler's events), or it stays off
+        // No pipeline parallelism (the scheduler's events), or it stays off. With several GPUs the scheduler keeps a pending copy per GPU
+        // and waits for each before a CPU split writes the CPU compute buffer (MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D=1, test only: off there)
         if (model.moe_stream() && model.moe_stream()->p1.async_h2d) {
+            static const bool test_no_h2d = getenv("MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D") && atoi(getenv("MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D")) != 0;
             int n_gpu = 0;
             for (auto & backend : backends) {
                 n_gpu += ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
@@ -1922,14 +1933,31 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
                 }
             }
-            const bool ok = n_gpu == 1 && !cparams.pipeline_parallel && host_pinned;
+            const bool mg_off = n_gpu > 1 && test_no_h2d;
+            // Only builds made with CUDA 13 or newer (with the CUDA 12 runtime the copies made replies several times slower): a GPU
+            // backend that offers ggml_backend_cuda_async_h2d_ok says it (MOE_STREAM_TEST_OLD_CUDA=1, test only: answers no)
+            static const bool test_old_cuda = getenv("MOE_STREAM_TEST_OLD_CUDA") && atoi(getenv("MOE_STREAM_TEST_OLD_CUDA")) != 0;
+            bool old_cuda = false;
+            for (auto & backend : backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
+                ggml_backend_reg_t reg = ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU ? ggml_backend_dev_backend_reg(d) : nullptr;
+                auto fn = reg ? (bool (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_async_h2d_ok") : nullptr;
+                old_cuda = old_cuda || (fn != nullptr && (test_old_cuda || !fn()));
+            }
+            const bool ok = n_gpu >= 1 && !cparams.pipeline_parallel && host_pinned && !mg_off && !old_cuda;
             ggml_backend_sched_set_async_host_input(sched.get(), ok);
             static int said = -1;   // (printed again whenever the decision changes, e.g. for another context)
             if (said != (ok ? 1 : 0)) {
                 said = ok ? 1 : 0;
                 fprintf(stderr, "%s: async-h2d (--moe-stream-async-h2d 1): %s\n", __func__, ok
-                        ? "on - CPU -> GPU split inputs in the GPU's pinned host buffer go as async H2D copies on the GPU's stream"
-                        : format("off - it needs one GPU, no pipeline parallelism and the CPU compute buffer in the GPU's pinned "
+                        ? (n_gpu > 1 ? format("on - CPU -> GPU split inputs in the GPUs' pinned host buffer go as async H2D copies on each GPU's "
+                                              "stream; a CPU split waits for every GPU with a copy still queued (%d GPUs)", n_gpu).c_str()
+                                     : "on - CPU -> GPU split inputs in the GPU's pinned host buffer go as async H2D copies on the GPU's stream")
+                        : mg_off ? "off - TEST ONLY: MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D=1 with several GPUs"
+                        : old_cuda ? (test_old_cuda ? "off - this build uses CUDA 12 or older; the async copy needs a CUDA 13 build "
+                                                      "(TEST ONLY: MOE_STREAM_TEST_OLD_CUDA=1)"
+                                                    : "off - this build uses CUDA 12 or older; the async copy needs a CUDA 13 build")
+                        : format("off - it needs a GPU, no pipeline parallelism and the CPU compute buffer in the GPU's pinned "
                                  "host buffer (%d GPUs, pipeline parallel %d, pinned %d)", n_gpu, cparams.pipeline_parallel ? 1 : 0,
                                  host_pinned ? 1 : 0).c_str());
             }
@@ -1995,7 +2023,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         bool alloc_ok = ggml_backend_sched_alloc_graph(sched.get(), gf);
         // Never a failed graph - one whose plan did not fit lends (more), then the real compute buffer
         if (auto * ms_g = model.moe_stream(); !alloc_ok && ms_g && ms_g->lend_owner == this && ms_g->lend_on) {
-            alloc_ok = lend_alloc_retry(gf);
+            alloc_ok = lend_alloc_retry();
         }
         if (alloc_ok) {
             lend_gen_alloc = lend_gen;
@@ -2522,6 +2550,14 @@ void llama_context::lm_signal_done(int il_from, int il_to) {
         }
         ms->lm_layer_done(il, ev);
     }
+}
+
+int llama_context::sched_n_gpu() const {
+    int n = 0;
+    for (const auto & backend : backends) {
+        n += ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
+    }
+    return n;
 }
 
 ggml_backend_t llama_context::ms_pool_backend() const {
@@ -3623,6 +3659,41 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+
+        // A streamed model's output is checked for non-finite values (--moe-stream-out-check N: every prompt call and every Nth reply
+        // call; 0 = never), on 256 logits of the last output row: a wrong expert byte becomes NaN in every later row, and the call fails
+        // here with one line (its sequences' memory dropped, so nothing reuses it) instead of giving a wrong answer
+        if (auto * ms_o = model.moe_stream(); ms_o && t_logits && n_outputs > 0 && ms_o->out_check_due(ubatch.n_tokens > 1)) {
+            ggml_backend_t be_o = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+            const int64_t  nv   = t_logits->ne[0];
+            const int64_t  nr   = std::min<int64_t>(256, nv);
+            std::vector<float> lv((size_t) nr);
+            if (be_o != nullptr) {
+                const auto t_o0 = std::chrono::steady_clock::now();
+                ggml_backend_tensor_get_async(be_o, t_logits, lv.data(), (size_t) (n_outputs - 1)*t_logits->nb[1], (size_t) nr*sizeof(float));
+                ggml_backend_synchronize(be_o);
+                int64_t bad = 0;
+                for (const float v : lv) {
+                    bad += std::isfinite(v) ? 0 : 1;
+                }
+                const int kind = ubatch.n_tokens > 1 ? 0 : 1;
+                ms_o->out_checked[kind] += 1;
+                ms_o->out_us[kind]      += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t_o0).count();
+                if (bad > 0 || ms_o->out_test_nan) {
+                    LLAMA_LOG_ERROR("%s: the streamed model's output holds non-finite values (%lld of %lld logits of the call's last row are NaN / Inf%s) - "
+                            "the expert computation went wrong; this call fails instead of giving a wrong answer\n", __func__, (long long) bad,
+                            (long long) nr, ms_o->out_test_nan ? ", MOE_STREAM_TEST_OUT_NAN" : "");
+                    fprintf(stderr, "llama_moe_stream: the output check failed this call (NaN / Inf logits); its sequences' memory is dropped\n");
+                    ms_o->out_failed += 1;
+                    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                        for (int32_t q = 0; q < ubatch.n_seq_id[i]; q++) {
+                            memory->seq_rm(ubatch.seq_id[i][q], -1, -1);
+                        }
+                    }
+                    return -3;
+                }
+            }
+        }
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
@@ -4776,6 +4847,7 @@ void llama_context::lend_call_start(bool dec, int64_t T, int64_t kv) {
     auto * ms = model.moe_stream();
     lend_kv = kv;
     lend_T  = T;
+    lend_start_failed = false;
     if (dec) {
         lend_clear();
         return;
@@ -4805,6 +4877,7 @@ void llama_context::lend_call_start(bool dec, int64_t T, int64_t kv) {
     std::vector<ggml_backend_buffer_t> pcs;
     if (!ms->lend_lend(U, pcs)) {
         plain_no_grow();
+        lend_start_failed = true;
         ms->n_lend_fallback += 1;
         if (ms->n_lend_fallback <= 3) {
             fprintf(stderr, "%s: VRAM lending: a prompt call of %lld tokens at context %lld: the VRAM pool could not lend %.1f MiB%s - this call "
@@ -4825,15 +4898,17 @@ void llama_context::lend_call_start(bool dec, int64_t T, int64_t kv) {
 // real buffer could not grow. No lend in the middle of a call (only at a call's start; a mid-call lend crashed in the
 // forced-low test): this call's real buffer may grow (the pieces set stay), and later calls lend 25 % more (the
 // slack learns, up to 4x); last, the real buffer alone. One line each (the first few)
-bool llama_context::lend_alloc_retry(ggml_cgraph * gf) {
+bool llama_context::lend_alloc_retry() {
     auto * ms = model.moe_stream();
     static const bool test_no_grow = getenv("MOE_STREAM_TEST_LEND_NO_GROW") && atoi(getenv("MOE_STREAM_TEST_LEND_NO_GROW")) != 0;   // TEST ONLY
+    // the same split graph planned again (never split again: the failed allocation's split already pointed its nodes at the scheduler's
+    // input copies - a second split of it reads those as its own tensors, and the graph that reaches the GPU is not the allocated one)
     const auto again = [&]() {
-        ggml_backend_sched_reset(sched.get());
-        return ggml_backend_sched_alloc_graph(sched.get(), gf);
+        return ggml_backend_sched_alloc_graph_again(sched.get());
     };
     ms->n_lend_grow += 1;
     if (!test_no_grow) {   // 1. this call's real buffer may grow (the pieces set stay); later calls lend 25 % more
+        const size_t before = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[(size_t) lend_be]);
         if (!lend_bufs.empty()) {
             GGML_ASSERT(ggml_backend_sched_set_fixed_chunks(sched.get(), backend_ptrs[(size_t) lend_be], lend_bufs.data(), (int) lend_bufs.size(), true));
         } else {
@@ -4844,16 +4919,20 @@ bool llama_context::lend_alloc_retry(ggml_cgraph * gf) {
         if (again()) {
             ms->lend_slack = std::min(4.0, ms->lend_slack*1.25);
             if (ms->n_lend_grow <= 3) {
+                const size_t after = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[(size_t) lend_be]);
                 fprintf(stderr, "%s: VRAM lending: a graph's plan needed more than the lent places and the real buffer hold (the estimate was low%s) - "
-                        "the real compute buffer grew for this call; later calls lend %.2fx the plan\n", __func__,
-                        ms->lend_low != 1.0 ? ": TEST ONLY MOE_STREAM_TEST_LEND_LOW" : "", ms->lend_slack);
+                        "the real compute buffer grew by %.1f MiB for this call; later calls lend %.2fx the plan\n", __func__,
+                        ms->lend_low != 1.0 ? ": TEST ONLY MOE_STREAM_TEST_LEND_LOW" : "",
+                        after > before ? (after - before)/1048576.0 : 0.0, ms->lend_slack);
             }
             return true;
         }
     }
     // 2. the card is full (the real buffer cannot grow) and no lend happens in the middle of a call: the call ends cleanly - decode
     // returns 3 (the caller processes the prompt again; llama-server does, as for the layer-major retry guard) with the lend doubled for the next try;
-    // when the lend already was every place the pool can give, -2 (an error the caller reports; never an abort, never a loop)
+    // when no bigger lend can follow, -2 (an error the caller reports; never an abort, never a loop): the lend already was every place
+    // the pool can give, the call lends nothing (a reply word, a short call, or the pool could not lend at its start), or the lend
+    // factor is already at its largest - a caller that processes every ended call again (llama-server) would otherwise never stop
     std::vector<int32_t> cap(ms->vx_groups.size(), 0);
     int64_t all = 0;
     for (size_t g = 0; g < cap.size(); g++) {
@@ -4861,7 +4940,8 @@ bool llama_context::lend_alloc_retry(ggml_cgraph * gf) {
         cap[g] = std::max(0, ms->vx_groups[g].h_end() - st);
         all   += (int64_t) cap[g]*(int64_t) (ms->vx_groups[g].gate_up->nb[2] + ms->vx_groups[g].down->nb[2]);
     }
-    const bool at_max = !lend_bufs.empty() && lend_U == ms->lend_places_for(all, &cap);
+    const bool no_lend = lend_bufs.empty() && (ms->is_decode() || lend_T <= ms->p1.vram_lend_short || lend_start_failed);
+    const bool at_max  = no_lend || ms->lend_slack >= 64.0 || (!lend_bufs.empty() && lend_U == ms->lend_places_for(all, &cap));
     if (!at_max) {
         ms->lend_slack = std::min(64.0, ms->lend_slack*2.0);
         lend_again     = true;
@@ -4870,7 +4950,8 @@ bool llama_context::lend_alloc_retry(ggml_cgraph * gf) {
     if (ms->n_lend_fallback <= 5) {
         fprintf(stderr, "%s: VRAM lending: a graph's plan does not fit the lent places and the real compute buffer cannot grow%s - %s\n", __func__,
                 test_no_grow ? " (TEST ONLY: MOE_STREAM_TEST_LEND_NO_GROW)" : "",
-                at_max ? "the pool already lent all it can: the call fails (decode -2)" :
+                no_lend ? "this call cannot lend from the VRAM pool: the call fails (decode -2)" :
+                at_max  ? "no bigger lend is possible: the call fails (decode -2)" :
                 format("the call ends, decode returns 3 (the caller processes the prompt again) and lends %.2fx the plan", ms->lend_slack).c_str());
     }
     lend_clear();

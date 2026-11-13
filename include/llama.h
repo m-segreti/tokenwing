@@ -529,7 +529,8 @@ extern "C" {
         float        moe_stream_vram_follow_ratio;
         int32_t      moe_stream_vram_follow_margin, moe_stream_vram_follow_fixed, moe_stream_vram_follow_pinned;
         // The VRAM pool's device pass in the GPU launch of each layer that uses needed-early's GPU form, during the CPU experts
-        // (needs --moe-stream-vram-experts and --moe-stream-needed-early 1); 0 = off (the pass after the CPU experts)
+        // (needs --moe-stream-vram-experts and --moe-stream-needed-early 1); 0 = off (the pass after the CPU experts), 1 = in the layers whose
+        // router runs on the VRAM pool's GPU, 2 = also in the layers whose router runs on another GPU (the pass crosses to the pool's GPU)
         int32_t      moe_stream_vram_parallel;
         // An expert leaving VRAM follow's set is copied back GPU -> RAM into its layer's pool (an
         // empty slot, or a keep value above the pool's lowest), and held experts' picks count in the keep value (needs
@@ -565,6 +566,8 @@ extern "C" {
                                                 //      at start for one at the full context); longer ones lend (default 64)
         int32_t      moe_stream_timing;         // 1 = measure where a call's time goes (host compute, device kernels, copies, syncs) and
                                                 //      report it per word; costs a few clock reads and two CUDA events per graph
+        int32_t      moe_stream_out_check;      // a streamed model's output checked for NaN / Inf (256 logits of a call's last row):
+                                                //      N >= 1 = every prompt call and every Nth reply call, 0 = never (default 16)
         const char * moe_stream_vram_device;    // the GPU (a device name, e.g. "CUDA1") that holds the VRAM expert pool and takes the
                                                 //      prompt matmuls of the RAM pools; NULL = the first GPU of the model
         const char * moe_stream_gpu_layers_device; // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (LIST: layers and ranges a-b): their

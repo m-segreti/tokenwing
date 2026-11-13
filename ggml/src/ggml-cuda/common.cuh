@@ -1582,6 +1582,11 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+#if defined(GGML_USE_HIP)
+    // HIP: events are recorded on this stream, after a wait for the compute stream (see ggml_backend_cuda_event_record)
+    cudaStream_t ev_side_stream = nullptr;
+    cudaEvent_t  ev_side_tmp    = nullptr;
+#endif
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

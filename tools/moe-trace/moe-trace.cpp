@@ -394,11 +394,16 @@ int main(int argc, char ** argv) {
     const std::string prefix = tr.arch + ".";
 
     if (!meta_int(model, prefix + "expert_count", tr.n_expert) ||
-        !meta_int(model, prefix + "expert_used_count", tr.n_expert_used) ||
-        !meta_int(model, prefix + "expert_group_count", tr.n_expert_groups) ||
-        !meta_int(model, prefix + "expert_group_used_count", tr.n_group_used)) {
+        !meta_int(model, prefix + "expert_used_count", tr.n_expert_used)) {
         LOG_ERR("%s: the model is not an MoE model, expert metadata is missing\n", __func__);
         return 1;
+    }
+
+    // expert groups are optional: a model without the keys routes over all its experts (0 = no groups)
+    if (!meta_int(model, prefix + "expert_group_count", tr.n_expert_groups) ||
+        !meta_int(model, prefix + "expert_group_used_count", tr.n_group_used)) {
+        tr.n_expert_groups = 0;
+        tr.n_group_used    = 0;
     }
 
     // a model without leading dense blocks is all MoE
@@ -480,6 +485,12 @@ int main(int argc, char ** argv) {
 
     int n_decode = 0;
 
+    // Every prompt token is an output: a model narrows its last layer to the output rows before that layer's experts (the
+    // inp_out_ids crop), so with only the last token as an output the last MoE layer would route one row of each piece and the
+    // trace would have no ids for the others. The price is the logits of every prompt token of a piece (n_batch x n_vocab floats)
+    LOG_INF("%s: every prompt token is an output, so every MoE layer routes every row: %.1f MiB of logits per prompt piece of %d\n",
+            __func__, (double) std::min(n_batch, n_prompt)*n_vocab*sizeof(float)/1048576.0, std::min(n_batch, n_prompt));
+
     // the prompt, in pieces of n_batch so that the positions stay under our control
     for (int off = 0; off < n_prompt && !tr.failed; off += n_batch) {
         const int n = std::min(n_batch, n_prompt - off);
@@ -487,7 +498,7 @@ int main(int argc, char ** argv) {
         tool_batch_clear(batch);
 
         for (int i = 0; i < n; i++) {
-            tool_batch_add(batch, tokens[off + i], off + i, { 0 }, i == n - 1);
+            tool_batch_add(batch, tokens[off + i], off + i, { 0 }, true);
         }
 
         batch.n_tokens = n;

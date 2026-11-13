@@ -13,8 +13,10 @@
 // layer's CPU split, read by the scheduler's input hook).
 // Nothing is registered without the setting: the flag test is then one AND per dispatched node against a zero mask.
 //
-// NVIDIA only: the producer needs cudaEventRecordWithFlags / cudaEventRecordExternal, which the HIP and
-// MUSA vendor headers do not map; those builds compile empty stubs and export no register function, so the engine keeps the host producer.
+// NVIDIA and AMD (HIP): the slot, counter and call number are the GPU's pinned host buffer, which a kernel reaches by its host
+// address on both (HIP's default pinned allocation is fine-grained, so the system fence orders the data before the counter for the
+// host). The MUSA vendor header does not map cudaEventRecordWithFlags / cudaEventRecordExternal; that build compiles empty stubs and
+// exports no register function, so the engine keeps the host producer.
 
 // Copy-ahead (one copy set): a "done" mark copies nothing - only the counter: the copier learns that the node (a wave's
 // gate/up activation) has run, so the places whose gate/up parts it read are free.
@@ -34,15 +36,18 @@ struct ggml_cuda_moe_mark_table {
     const int64_t         * caps;
     uint32_t * const      * counters;
     const uint32_t * const * expected;
+    void * const          * devs;       // per layer: the ggml device its marked node runs on (null: the register's device); may be null
 };
 
 // owner: the engine that registers (one per process - a second one is refused). device: the CUDA device the marked
-// nodes run on (the events are created on it; a mark seen on another device aborts). Returns false with *why set.
+// nodes run on unless dev_of names another per layer (dev_of[k][il], k = the table; dev_of or an entry may be null). Each entry's
+// event is created on its device; a mark seen on another device than its entry's aborts. Returns false with *why set.
 bool ggml_cuda_moe_mark_register(const void * owner, int device, int32_t n_layers,
-                                 const ggml_cuda_moe_mark_table * tables, int n_tables, const char ** why);
+                                 const ggml_cuda_moe_mark_table * tables, int n_tables, const int32_t * const * dev_of,
+                                 const char ** why);
 // waits for layer il's event of the given kind; false (with a printed reason) when there is none or on a CUDA error
 bool ggml_cuda_moe_mark_wait(int32_t kind, int32_t il);
-// waits until the registered device has run everything enqueued (after an aborted call); false on a CUDA error
+// waits until every device with a registered entry has run everything enqueued (after an aborted call); false on a CUDA error
 bool ggml_cuda_moe_mark_sync(void);
 // removes every entry and destroys the events - only when owner registered them
 void ggml_cuda_moe_mark_unregister(const void * owner);

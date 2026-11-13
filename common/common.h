@@ -917,6 +917,7 @@ struct common_params {
     int32_t     moe_stream_vram_lend_prompt  = 0; // a prompt's big GPU tensors in lent VRAM pool places (0 = off, 1)
     int32_t     moe_stream_vram_lend_short   = 64; // prompt calls of at most N tokens in the real compute buffer
     int32_t     moe_stream_timing            = 0; // 1 = measure where a call's time goes (host, device, copies, syncs), report it per word
+    int32_t     moe_stream_out_check         = 16; // the output's NaN / Inf check: every prompt call + every Nth reply call, 0 = off
     std::string moe_stream_vram_device;           // the GPU that holds the VRAM expert pool, "" = the first GPU
     std::string moe_stream_gpu_layers_device;     // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (repeated flags joined with ';')
     int32_t     moe_stream_vram_follow_tick = 8;

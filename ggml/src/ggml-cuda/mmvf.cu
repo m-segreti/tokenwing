@@ -5,7 +5,8 @@
 #include "mmf.cuh"
 #include "convert.cuh"
 
-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+// x8: HIP, BF16, one column, no fusion - each thread reads 16 bytes (8 values) per step instead of 4 (see mmvf_hip_bf16_x8)
+template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, bool x8 = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
@@ -243,6 +244,26 @@ static __global__ void mul_mat_vec_f(
     } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
 //TODO: add support for ggml_cuda_mad for hip_bfloat162
 #if defined(GGML_USE_HIP)
+        if constexpr (x8) {
+            static_assert(ncols_dst == 1 && !has_fusion && !is_multi_token_id, "x8 is the plain one-column case");
+            GGML_UNUSED(y2);
+            const int4   * x8p = (const int4 *) x;
+            const float4 * y4  = (const float4 *) y;
+            for (int c = tid; c < ncols2/4; c += block_size) {
+                const int4   v  = x8p[c];
+                const float4 ya = y4[2*c + 0];
+                const float4 yb = y4[2*c + 1];
+                // a BF16 value is the upper half of its FP32 value
+                ggml_cuda_mad(sumf[0], __int_as_float((int) ((uint32_t) v.x << 16)),          ya.x);
+                ggml_cuda_mad(sumf[0], __int_as_float((int) ((uint32_t) v.x & 0xFFFF0000u)),  ya.y);
+                ggml_cuda_mad(sumf[0], __int_as_float((int) ((uint32_t) v.y << 16)),          ya.z);
+                ggml_cuda_mad(sumf[0], __int_as_float((int) ((uint32_t) v.y & 0xFFFF0000u)),  ya.w);
+                ggml_cuda_mad(sumf[0], __int_as_float((int) ((uint32_t) v.z << 16)),          yb.x);
+                ggml_cuda_mad(sumf[0], __int_as_float((int) ((uint32_t) v.z & 0xFFFF0000u)),  yb.y);
+                ggml_cuda_mad(sumf[0], __int_as_float((int) ((uint32_t) v.w << 16)),          yb.z);
+                ggml_cuda_mad(sumf[0], __int_as_float((int) ((uint32_t) v.w & 0xFFFF0000u)),  yb.w);
+            }
+        } else {
         const int * x2 = (const int *) x;
         const int * gate_x2 = nullptr;
         if constexpr (has_fusion) {
@@ -275,6 +296,7 @@ static __global__ void mul_mat_vec_f(
                     }
                 }
             }
+        }
         }
 #else
         const nv_bfloat162 * x2 = (const nv_bfloat162 *) x;
@@ -397,11 +419,25 @@ static void mul_mat_vec_f_switch_fusion(
         const int64_t stride_row, const int64_t stride_col_y, const int64_t stride_col_dst,
         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const cudaStream_t stream) {
+        const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const cudaStream_t stream,
+        const bool x8 = false) {
 
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+#if defined(GGML_USE_HIP)
+    if constexpr (std::is_same_v<T, nv_bfloat16> && ncols_dst == 1 && !is_multi_token_id) {
+        if (x8 && !has_fusion) {
+            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, false, true>, launch_params,
+                x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+#else
+    GGML_UNUSED(x8);
+#endif // defined(GGML_USE_HIP)
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
@@ -420,6 +456,18 @@ static void mul_mat_vec_f_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 
 }
+
+#if defined(GGML_USE_HIP)
+// HIP: a one-column BF16 matrix-vector product (the MoE router) reads x 16 bytes per thread and step instead of 4: the 4-byte
+// loop's dependent steps left an RDNA GPU waiting on memory. GGML_HIP_MMVF_BF16_X8=0 turns it off.
+static bool mmvf_hip_bf16_x8_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_HIP_MMVF_BF16_X8");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+#endif // defined(GGML_USE_HIP)
 
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
@@ -458,6 +506,16 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
+    // HIP, BF16, one column: 16-byte loads where every row, channel and sample start of x is 16-byte aligned and y's are too
+    bool x8 = false;
+#if defined(GGML_USE_HIP)
+    if constexpr (std::is_same_v<T, nv_bfloat16> && ncols_dst == 1 && !is_multi_token_id) {
+        x8 = !has_fusion && mmvf_hip_bf16_x8_on() && ncols % 8 == 0 &&
+             stride_row % 8 == 0 && stride_channel_x % 8 == 0 && stride_sample_x % 8 == 0 && ((uintptr_t) x) % 16 == 0 &&
+             stride_channel_y % 4 == 0 && stride_sample_y % 4 == 0 && ((uintptr_t) y) % 16 == 0;
+    }
+#endif // defined(GGML_USE_HIP)
+
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
@@ -466,49 +524,49 @@ void launch_mul_mat_vec_f_cuda(
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 32, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream, x8);
         } break;
         case   64: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 64, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream, x8);
         } break;
         case   96: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 96, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream, x8);
         } break;
         case  128: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 128, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream, x8);
         } break;
         case  160: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 160, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream, x8);
         } break;
         case  192: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 192, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream, x8);
         } break;
         case  224: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 224, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream, x8);
         } break;
         case  256: {
             mul_mat_vec_f_switch_fusion<T, type_acc, ncols_dst, 256, is_multi_token_id>
                 (x, y, ids, fusion, dst, ncols/2, nchannels_y_fd, stride_row, stride_col_y/2, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream);
+                 sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, stream, x8);
         } break;
         default:
             GGML_ABORT("fatal error");
