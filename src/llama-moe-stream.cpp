@@ -2997,23 +2997,31 @@ llama_moe_stream::llama_moe_stream(
         const size_t n_ids_b  = n_ids*sizeof(int32_t);
 
         pred_input_vec_mem   = (float *)   moe_aligned_alloc_n((n_vec_b + 63) & ~(size_t) 63, 64);
+        pred_input_vec2_mem  = (float *)   moe_aligned_alloc_n((n_vec_b + 63) & ~(size_t) 63, 64);
         pred_input_guess_mem = (int32_t *) moe_aligned_alloc_n((n_ids_b + 63) & ~(size_t) 63, 64);
 
-        if (!pred_input_vec_mem || !pred_input_guess_mem) {
-            fprintf(stderr, "llama_moe_stream: --moe-stream-pred-input is off: cannot allocate %.0f MiB\n", (double) (n_vec_b + n_ids_b)/1048576.0);
+        if (!pred_input_vec_mem || !pred_input_vec2_mem || !pred_input_guess_mem) {
+            fprintf(stderr, "llama_moe_stream: --moe-stream-pred-input is off: cannot allocate %.0f MiB\n", (double) (n_vec_b*2 + n_ids_b)/1048576.0);
             moe_aligned_free(pred_input_vec_mem);   pred_input_vec_mem   = nullptr;
+            moe_aligned_free(pred_input_vec2_mem);  pred_input_vec2_mem  = nullptr;
             moe_aligned_free(pred_input_guess_mem); pred_input_guess_mem = nullptr;
             pred_input_path.clear();
             break;
         }
 
         memset(pred_input_vec_mem,   0, n_vec_b);
+        memset(pred_input_vec2_mem,  0, n_vec_b);
         memset(pred_input_guess_mem, 0, n_ids_b);
 
         pred_input_vec_ctx = ggml_init({ ggml_tensor_overhead(), nullptr, /* no_alloc = */ true });
         pred_input_vec_t   = ggml_new_tensor_1d(pred_input_vec_ctx, GGML_TYPE_F32, (int64_t) n_vec);
         pred_input_vec_buf = ggml_backend_cpu_buffer_from_ptr(pred_input_vec_mem, n_vec_b);
         ggml_backend_tensor_alloc(pred_input_vec_buf, pred_input_vec_t, pred_input_vec_mem);
+
+        pred_input_vec2_ctx = ggml_init({ ggml_tensor_overhead(), nullptr, /* no_alloc = */ true });
+        pred_input_vec2_t   = ggml_new_tensor_1d(pred_input_vec2_ctx, GGML_TYPE_F32, (int64_t) n_vec);
+        pred_input_vec2_buf = ggml_backend_cpu_buffer_from_ptr(pred_input_vec2_mem, n_vec_b);
+        ggml_backend_tensor_alloc(pred_input_vec2_buf, pred_input_vec2_t, pred_input_vec2_mem);
 
         pred_input_guess_ctx = ggml_init({ ggml_tensor_overhead(), nullptr, /* no_alloc = */ true });
         pred_input_guess_t   = ggml_new_tensor_1d(pred_input_guess_ctx, GGML_TYPE_I32, (int64_t) n_ids);
@@ -3848,6 +3856,15 @@ llama_moe_stream::~llama_moe_stream() {
     if (rec_rlogit_buf) { ggml_backend_buffer_free(rec_rlogit_buf); }   // TEST ONLY flag
     if (rec_rlogit_ctx) { ggml_free(rec_rlogit_ctx); }
     moe_aligned_free(rec_rlogit_mem);
+    if (pred_input_vec_buf)   { ggml_backend_buffer_free(pred_input_vec_buf); }
+    if (pred_input_vec2_buf)  { ggml_backend_buffer_free(pred_input_vec2_buf); }
+    if (pred_input_guess_buf) { ggml_backend_buffer_free(pred_input_guess_buf); }
+    if (pred_input_vec_ctx)   { ggml_free(pred_input_vec_ctx); }
+    if (pred_input_vec2_ctx)  { ggml_free(pred_input_vec2_ctx); }
+    if (pred_input_guess_ctx) { ggml_free(pred_input_guess_ctx); }
+    moe_aligned_free(pred_input_vec_mem);
+    moe_aligned_free(pred_input_vec2_mem);
+    moe_aligned_free(pred_input_guess_mem);
 
     // The VRAM expert pool - its zero-slice entries in the CUDA backend's table first (the table holds the pointers),
     // then the device buffers (a model freed and loaded again must not leak VRAM or fill the 16-entry table)
@@ -12863,6 +12880,10 @@ static void maybe_append_pred_input(llama_moe_stream * mgr, llama_moe_stream_lay
 
     mgr->pred_input_out_vec.insert(mgr->pred_input_out_vec.end(),
                                    mgr->pred_input_vec_mem, mgr->pred_input_vec_mem + n_rows*n_embd);
+    if (mgr->pred_input_vec2_used && mgr->pred_input_vec2_mem) {
+        mgr->pred_input_out_vec2.insert(mgr->pred_input_out_vec2.end(),
+                                        mgr->pred_input_vec2_mem, mgr->pred_input_vec2_mem + n_rows*n_embd);
+    }
     mgr->pred_input_out_guess.insert(mgr->pred_input_out_guess.end(),
                                      mgr->pred_input_guess_mem, mgr->pred_input_guess_mem + n_rows*k);
     mgr->pred_input_out_real.resize((size_t) (w_ix + 1)*n_rows*k, 0);
@@ -14163,6 +14184,9 @@ void llama_moe_stream::print_stats() const {
         };
 
         dump(".vec.f32",   pred_input_out_vec.data(),   pred_input_out_vec.size()*sizeof(float));
+        if (pred_input_vec2_used && !pred_input_out_vec2.empty()) {
+            dump(".vec2.f32", pred_input_out_vec2.data(), pred_input_out_vec2.size()*sizeof(float));
+        }
         dump(".guess.i32", pred_input_out_guess.data(), pred_input_out_guess.size()*sizeof(int32_t));
         dump(".real.i32",  pred_input_out_real.data(),  pred_input_out_real.size()*sizeof(int32_t));
         dump(".rows.i64",  pred_input_rows.data(),      pred_input_rows.size()*sizeof(int64_t));
@@ -14171,6 +14195,9 @@ void llama_moe_stream::print_stats() const {
         js += format("  \"format\": \"layer-ahead guess router input v1\",\n");
         js += format("  \"prefix\": \"%s\",\n", base.c_str());
         js += format("  \"vec_file\": \"%s.vec.f32\",\n", base.c_str());
+        if (pred_input_vec2_used && !pred_input_out_vec2.empty()) {
+            js += format("  \"vec2_file\": \"%s.vec2.f32\",\n", base.c_str());
+        }
         js += format("  \"guess_file\": \"%s.guess.i32\",\n", base.c_str());
         js += format("  \"real_file\": \"%s.real.i32\",\n", base.c_str());
         js += format("  \"rows_file\": \"%s.rows.i64\",\n", base.c_str());

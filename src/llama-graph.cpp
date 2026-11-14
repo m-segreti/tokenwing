@@ -2427,8 +2427,8 @@ void llm_graph_context::moe_guess_finish_in(const llama_model & model, int il, g
     }
     if (g.want_shared && base) {
         g.pred_base = base;
-        // The model's own guess input, or the base normed with the next layer's gain. A corrected pair's norm weight is the
-        // ones (the gain is inside W'); a model with its own guess input has no ffn_norm, so the correction file refuses it
+        // The model's own guess input, or the base normed with the next layer's gain. On a model with ffn_norm, a corrected
+        // pair's norm weight is the ones (the gain is inside W'); on a model with its own guess input, W' = W_X + Bt reads guess_in directly
         g.pred_in   = guess_in ? guess_in(il + 1)
                     : build_norm(g.pred_base, mstream->corr_unit(il + 1, 1) ? mstream->corr_unit(il + 1, 1) : model.layers[il + 1].ffn_norm,
                             nullptr, LLM_NORM_RMS, il + 1);
@@ -3657,6 +3657,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                             mstream->pred_input_vec_offset(il)*sizeof(float));
 
                     ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, pred_cur), vdst));
+
+                    if (rec && rec->in[2] && mstream->pred_input_vec2_tensor()) {
+                        mstream->mark_pred_input_vec2();
+                        ggml_tensor * v2dst = ggml_view_2d(ctx0, mstream->pred_input_vec2_tensor(),
+                                (int64_t) mstream->n_embd, 1, (int64_t) mstream->n_embd*sizeof(float),
+                                mstream->pred_input_vec_offset(il)*sizeof(float));
+
+                        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, rec->in[2]), v2dst));
+                    }
 
                     ggml_tensor * gtop = ggml_cont(ctx0, build_moe_topk(pred_probs, pred_logits,
                                 exp_probs_b_next, n_expert, n_expert_used, msl->pred_il,

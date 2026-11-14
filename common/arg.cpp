@@ -3604,10 +3604,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-pred-input"}, "PREFIX",
         "record the vector the next layer's router is run on - with --moe-stream-pred-shared 1 the normed "
-        "residual plus this layer's shared expert output, which is what the engine's guess actually sees - "
-        "for 1 generated word in --moe-stream-pred-input-every, every streamed layer, plus that layer's guess "
-        "and the predicted layer's real experts, as PREFIX.{vec.f32,guess.i32,real.i32,rows.i64,json}. It "
-        "only copies vectors the graph already computes, so it does not change the run. Default off",
+        "residual plus this layer's shared expert output (or the hyper-connection FFN mix on models without ffn_norm), "
+        "which is what the engine's guess actually sees - for 1 generated word in --moe-stream-pred-input-every, every "
+        "streamed layer, plus that layer's guess and the predicted layer's real experts, as "
+        "PREFIX.{vec.f32,guess.i32,real.i32,rows.i64,json} (plus PREFIX.vec2.f32 when the graph also builds a separate "
+        "lead-2 guess input). It only copies vectors the graph already computes, so it does not change the run. Default off",
         [](common_params & params, const std::string & value) {
             params.moe_stream_pred_input = value;
         }
@@ -4181,12 +4182,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-correction"}, "FNAME",
-        "the trained correction file of the router-trick guess (tokenwing-tools/correction/make_correction.py, built for Ling 3.0 Flash). "
-        "For each (layer, lead) pair in the file the guess is made with W' = W_X*g_X + Bt instead of W_X (same product, same cost); "
-        "the matrices are allocated on the routers' own devices at model load, so a later --moe-stream-vram-free sees them as used "
-        "VRAM. Needs --moe-stream-pred-shared 1. A damaged file, another model or quant, or a setting it does not fit = the plain guess "
-        "and one line saying why, never an abort. The word `model` takes the correction appended to a TokenWing model file "
-        "(make_model_file.py --correction); a model file without one gives the plain guess and one line "
+        "the trained correction file of the router-trick guess (tokenwing-tools/correction/make_correction.py). "
+        "For each (layer, lead) pair in the file the guess is made with W' = W_X*g_X + Bt (or W' = W_X + Bt on hyper-connection "
+        "models without ffn_norm) instead of W_X (same product, same cost); the matrices are allocated on the routers' own devices "
+        "at model load, so a later --moe-stream-vram-free sees them as used VRAM. Needs --moe-stream-pred-shared 1. The model's "
+        "router tensors may be F32, BF16 or F16 (BF16 and F16 are converted to F32 at load); the selection bias is hashed into the "
+        "file's model check whenever the model has it and is required only for `bailingmoe3`. A damaged file, another model or quant, "
+        "or a setting it does not fit = the plain guess and one line saying why, never an abort. The word `model` takes the correction "
+        "appended to a TokenWing model file (make_model_file.py --correction); a model file without one gives the plain guess and one line "
         "(default: unset = the plain guess)",
         [](common_params & params, const std::string & value) {
             params.moe_stream_correction = value;

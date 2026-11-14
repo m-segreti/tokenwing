@@ -109,12 +109,14 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
                 h.arch.c_str(), h.n_layer, h.n_expert, h.n_embd, arch.c_str(), hp.n_layer() + hp.n_layer_nextn, hp.n_expert, hp.n_embd));
     }
     // the router tensors of the covered layers, in this order: ffn_gate_inp.weight (F32, BF16 or F16), exp_probs_b.bias (F32; hashed whenever the model has it,
-    // required for bailingmoe3), ffn_norm.weight (F32); correction_file.py follows the same rule
+    // required for bailingmoe3), and ffn_norm.weight (F32) or hc_ffn_norm.weight (F32, hyper-connection models without ffn_norm); correction_file.py follows the same rule
+    bool has_hc_norm = false;
     {
         sha256_t st;
         sha256_init(&st);
         std::vector<unsigned char> tmp;
-        for (int32_t X : h.layers) {
+        for (size_t li = 0; li < h.layers.size(); li++) {
+            const int32_t X = h.layers[li];
             if (X < 0 || (size_t) X >= model.layers.size()) {
                 return refuse(format("another model: the file covers layer %d, this model has %zu layers", X, model.layers.size()));
             }
@@ -132,28 +134,37 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
             } else if (arch == "bailingmoe3") {
                 return refuse(format("another model or quant: layer %d has no F32 bias tensor", X));
             }
-            if (L.ffn_norm == nullptr || L.ffn_norm->type != GGML_TYPE_F32 || L.ffn_norm->buffer == nullptr) {
+            const bool layer_hc = L.ffn_norm == nullptr && L.hc_ffn_norm != nullptr;
+            if (li == 0) {
+                has_hc_norm = layer_hc;
+            } else if (layer_hc != has_hc_norm) {
+                return refuse(format("another model or quant: layer %d norm kind differs from layer %d", X, h.layers[0]));
+            }
+            const ggml_tensor * norm_t = has_hc_norm ? L.hc_ffn_norm : L.ffn_norm;
+            if (norm_t == nullptr || norm_t->type != GGML_TYPE_F32 || norm_t->buffer == nullptr) {
                 return refuse(format("another model or quant: layer %d has no F32 norm tensor", X));
             }
-            hash_tensor(&st, L.ffn_norm, tmp);
+            hash_tensor(&st, norm_t, tmp);
         }
         unsigned char dig[SHA256_DIGEST_SIZE];
         sha256_final(&st, dig);
         if (hex32(dig) != h.router_sha256) {
             return refuse(format("another model or quant: the sha256 of the router tensors differs (file %s.., model %s..) - this check covers ONLY blk.X.ffn_gate_inp.weight, "
-                    "exp_probs_b.bias and ffn_norm.weight of the %zu layers %d..%d (plus the architecture and sizes); the experts and the other weights are not compared",
-                    h.router_sha256.substr(0, 12).c_str(), hex32(dig).substr(0, 12).c_str(), h.layers.size(),
-                    h.layers.empty() ? -1 : h.layers.front(), h.layers.empty() ? -1 : h.layers.back()));
+                    "exp_probs_b.bias and %s of the %zu layers %d..%d (plus the architecture and sizes); the experts and the other weights are not compared",
+                    h.router_sha256.substr(0, 12).c_str(), hex32(dig).substr(0, 12).c_str(), has_hc_norm ? "hc_ffn_norm.weight" : "ffn_norm.weight",
+                    h.layers.size(), h.layers.empty() ? -1 : h.layers.front(), h.layers.empty() ? -1 : h.layers.back()));
         }
     }
     const auto t_checked = std::chrono::steady_clock::now();
     if (ms.rec_on() || ms.pred_input_vec_tensor() != nullptr) {
-        fprintf(stderr, "llama_moe_correction: NOTE: --moe-stream-record / --moe-stream-pred-input record the CORRECTED guess (the logits of a corrected pair, "
-                "and a guess input without the gain): such a recording is not training data for tokenwing-tools/correction/make_correction.py\n");
+        fprintf(stderr, "llama_moe_correction: NOTE: --moe-stream-record / --moe-stream-pred-input record the CORRECTED guess (the logits of a corrected pair%s): "
+                "such a recording is not training data for tokenwing-tools/correction/make_correction.py\n",
+                has_hc_norm ? "" : ", and a guess input without the gain");
     }
 
     // which pairs does this run's guess use?  target streamed; source streamed or a word-start source; lead within the lookahead
     const int64_t n_embd = hp.n_embd, n_exp = hp.n_expert;
+    const int64_t norm_elems = has_hc_norm ? n_embd * (int64_t) std::max<uint32_t>(1, hp.dsv4_hc_mult) : n_embd;
     const size_t  nb = (size_t) n_embd * n_exp * sizeof(float);
     std::vector<const llama_moe_corr_pair *> use;
     size_t skipped_unused = 0, skipped_shape = 0;
@@ -165,11 +176,12 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
             continue;
         }
         const llama_layer & L = model.layers[p.target];
+        const ggml_tensor * norm_t = has_hc_norm ? L.hc_ffn_norm : L.ffn_norm;
         const bool ok_gate_type = L.ffn_gate_inp != nullptr &&
             (L.ffn_gate_inp->type == GGML_TYPE_F32 || L.ffn_gate_inp->type == GGML_TYPE_BF16 || L.ffn_gate_inp->type == GGML_TYPE_F16);
-        if (!ok_gate_type || L.ffn_norm == nullptr || L.ffn_gate_inp->buffer == nullptr || L.ffn_norm->buffer == nullptr ||
+        if (!ok_gate_type || norm_t == nullptr || L.ffn_gate_inp->buffer == nullptr || norm_t->buffer == nullptr ||
             L.ffn_gate_inp->ne[0] != n_embd || L.ffn_gate_inp->ne[1] != n_exp ||
-            L.ffn_norm->type != GGML_TYPE_F32 || ggml_nelements(L.ffn_norm) != n_embd) {
+            norm_t->type != GGML_TYPE_F32 || ggml_nelements(norm_t) != norm_elems) {
             skipped_shape++;
             continue;
         }
@@ -179,7 +191,7 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
         return refuse("no pair of the file is a guess this run makes");
     }
 
-    // one context + buffer per buffer type of the routers (the matrices), one per buffer type of the norms (the ones)
+    // one context + buffer per buffer type of the routers (the matrices), one per buffer type of the norms (the ones, when ffn_norm is folded)
     std::map<ggml_backend_buffer_type_t, std::vector<const llama_moe_corr_pair *>> by_buft;
     std::map<ggml_backend_buffer_type_t, std::vector<int32_t>>                      units_by_buft;
     {
@@ -187,7 +199,7 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
         for (const llama_moe_corr_pair * p : use) {
             const llama_layer & L = model.layers[p->target];
             by_buft[ggml_backend_buffer_get_type(L.ffn_gate_inp->buffer)].push_back(p);
-            if (seen.insert(p->target).second) {
+            if (!has_hc_norm && seen.insert(p->target).second) {
                 units_by_buft[ggml_backend_buffer_get_type(L.ffn_norm->buffer)].push_back(p->target);
             }
         }
@@ -242,8 +254,8 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
         }
     }
 
-    // the fold: W' = W_X * g_X + Bt (float32, one multiply and one add per element), done in the ONE pass that reads and hashes the payload: each wanted
-    // pair's bytes are folded and uploaded the moment they are complete; the hash of the whole payload decides at the end, and a mismatch discards everything
+    // the fold: W' = W_X * g_X + Bt (or W' = W_X + Bt on hyper-connection models without ffn_norm), done in the ONE pass that reads and hashes the payload:
+    // each wanted pair's bytes are folded and uploaded the moment they are complete; the hash of the whole payload decides at the end, and a mismatch discards everything
     std::vector<float> Wx((size_t) n_embd * n_exp), out(Wx.size()), g((size_t) n_embd);
     std::vector<uint16_t> Wx_half;
     std::map<const llama_moe_corr_pair *, ggml_tensor *> tensor_of;
@@ -270,15 +282,23 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
                 ggml_fp16_to_fp32_row((const ggml_fp16_t *) Wx_half.data(), Wx.data(), (int64_t) Wx.size());
             }
         }
-        ggml_backend_tensor_get(L.ffn_norm, g.data(), 0, (size_t) n_embd * sizeof(float));
+        if (!has_hc_norm) {
+            ggml_backend_tensor_get(L.ffn_norm, g.data(), 0, (size_t) n_embd * sizeof(float));
+        }
         const float * Bt = (const float *) data;
         for (int64_t e = 0; e < n_exp; e++) {
             const float * wr = Wx.data() + (size_t) e * n_embd;
             const float * br = Bt + (size_t) e * n_embd;
             float *       o  = out.data() + (size_t) e * n_embd;
-            for (int64_t i2 = 0; i2 < n_embd; i2++) {
-                const float prod = wr[i2] * g[(size_t) i2];
-                o[i2] = prod + br[i2];
+            if (has_hc_norm) {
+                for (int64_t i2 = 0; i2 < n_embd; i2++) {
+                    o[i2] = wr[i2] + br[i2];
+                }
+            } else {
+                for (int64_t i2 = 0; i2 < n_embd; i2++) {
+                    const float prod = wr[i2] * g[(size_t) i2];
+                    o[i2] = prod + br[i2];
+                }
             }
         }
         ggml_backend_tensor_set(tensor_of[&p], out.data(), 0, nb);
@@ -289,9 +309,10 @@ void llama_moe_correction::load(const llama_model & model, const llama_moe_strea
     n_bytes = total;
     const auto t1 = std::chrono::steady_clock::now();
     fprintf(stderr, "llama_moe_correction: %s: %zu of the file's %zu pairs are guesses this run makes (%zu not: layer / lead not streamed here%s), "
-            "folded W' = W_X*g_X + Bt on the routers' own buffers: %s, %.1f MiB in all; file checked (header, payload sha256 in the same single read as the fold, router-tensor identity %s) in %.1f s, "
+            "folded W' = %s on the routers' own buffers: %s, %.1f MiB in all; file checked (header, payload sha256 in the same single read as the fold, router-tensor identity %s) in %.1f s, "
             "read + folded in %.1f s; gate: %s\n", path.c_str(), use.size(), h.pairs.size(), skipped_unused,
-            skipped_shape ? format(", %zu with another router type / shape", skipped_shape).c_str() : "", buft_names.c_str(), (double) total/1048576.0,
+            skipped_shape ? format(", %zu with another router type / shape", skipped_shape).c_str() : "",
+            has_hc_norm ? "W_X + Bt" : "W_X*g_X + Bt", buft_names.c_str(), (double) total/1048576.0,
             h.arch.c_str(), std::chrono::duration<double>(t_checked - t0).count(), std::chrono::duration<double>(t1 - t_checked).count(),
             h.gate_rule.empty() ? "-" : h.gate_rule.c_str());
 }

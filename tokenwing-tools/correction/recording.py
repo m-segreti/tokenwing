@@ -16,8 +16,13 @@ class Rec:
         self.pos = {L: a for a, L in enumerate(self.layers)}
         r = m["router"]
         self.G, self.GU = r["n_expert_groups"], r["n_group_used"]
-        b = r["bias"]
-        self.bias = np.array(json.loads(b) if isinstance(b, str) else b, dtype=np.float32)  # [Ls, E]
+        self.gating = r.get("gating", "sigmoid")
+        self.gating_id = r.get("gating_id", 2 if self.gating == "sigmoid" else (1 if self.gating == "softmax" else 0))
+        b = json.loads(r["bias"]) if isinstance(r["bias"], str) else r["bias"]
+        if b is None or all(row is None for row in b):
+            self.bias = np.zeros((self.Ls, self.E), dtype=np.float32)
+        else:
+            self.bias = np.array([row if row is not None else np.zeros(self.E, dtype=np.float32) for row in b], dtype=np.float32)  # [Ls, E]
         W, Ls, E, K = self.W, self.Ls, self.E, self.K
         self.truth = np.fromfile(d + "/truth.i32", np.int32).reshape(W, Ls, K)
         self.tres = np.fromfile(d + "/truth_res.u8", np.uint8).reshape(W, Ls, K)
@@ -48,25 +53,38 @@ class Rec:
         return np.unpackbits(self.res[:, :, lead_idx, :], axis=-1, bitorder="little").astype(bool)
 
     def scores(self, di, ok_out=False):
-        """sigmoid(logit)+bias for lead index di; rows with NaN logits (source not streamed) -> ok False"""
+        """router score for lead index di; rows with NaN logits (source not streamed) -> ok False"""
         lg = np.asarray(self.logits[:, :, di, :], dtype=np.float32)
         ok = ~np.isnan(lg).any(-1)
-        sc = 1.0 / (1.0 + np.exp(-np.nan_to_num(lg))) + self.bias[None, :, :]
+        x = np.nan_to_num(lg)
+        if self.gating == "softmax":
+            xm = x - np.max(x, axis=-1, keepdims=True)
+            ex = np.exp(xm)
+            sc = ex / np.sum(ex, axis=-1, keepdims=True) + self.bias[None, :, :]
+        elif self.gating_id == 3:
+            sp = np.where(x > 20.0, x, np.log1p(np.exp(np.clip(x, -80.0, 20.0))))
+            sc = np.sqrt(np.maximum(sp, 0.0)) + self.bias[None, :, :]
+        else:
+            sc = 1.0 / (1.0 + np.exp(-x)) + self.bias[None, :, :]
         return (sc, ok) if ok_out else sc
 
     def ranking(self, sc, n=None):
-        """expert order of the router's own selection for scores sc [..., E]: the experts of the best GU groups (group
-        score = sum of the top 2), best first; the other experts follow, never inside the 'kept' ranks.
+        """expert order of the router's own selection for scores sc [..., E]: when grouped, the experts of the best GU groups
+        (group score = sum of the top 2), best first, with the other experts following outside the kept ranks; otherwise plain descending order.
         returns order [..., n] (n default E) and kept [..., E] bool"""
         G, GU, E = self.G, self.GU, self.E
-        g = sc.reshape(*sc.shape[:-1], G, E // G)
-        gs = np.sort(g, axis=-1)[..., -2:].sum(-1)
-        keep = np.argsort(-gs, axis=-1)[..., :GU]
-        kg = np.zeros(gs.shape, bool)
-        np.put_along_axis(kg, keep, True, axis=-1)
-        kept = np.repeat(kg, E // G, axis=-1)
-        masked = np.where(kept, sc, -np.inf)
-        order = np.argsort(-masked, axis=-1)
+        if G > 1 and 0 < GU < G:
+            g = sc.reshape(*sc.shape[:-1], G, E // G)
+            gs = np.sort(g, axis=-1)[..., -2:].sum(-1)
+            keep = np.argsort(-gs, axis=-1)[..., :GU]
+            kg = np.zeros(gs.shape, bool)
+            np.put_along_axis(kg, keep, True, axis=-1)
+            kept = np.repeat(kg, E // G, axis=-1)
+            masked = np.where(kept, sc, -np.inf)
+            order = np.argsort(-masked, axis=-1)
+        else:
+            kept = np.ones(sc.shape, bool)
+            order = np.argsort(-sc, axis=-1)
         if n is not None:
             order = order[..., :n]
         return order, kept

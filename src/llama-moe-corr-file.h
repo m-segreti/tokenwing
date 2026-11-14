@@ -30,8 +30,8 @@ struct llama_moe_corr_header {
     int64_t     n_layer  = -1;
     int64_t     n_expert = 0;
     int64_t     n_embd   = 0;
-    std::vector<int32_t> layers;        // the target layers the router hash covers (ffn_gate_inp.weight, exp_probs_b.bias, ffn_norm.weight each)
-    std::string router_sha256;          // hex, over those tensors' raw F32 bytes in that order
+    std::vector<int32_t> layers;        // the target layers the router hash covers (ffn_gate_inp.weight, exp_probs_b.bias, and ffn_norm.weight or hc_ffn_norm.weight each)
+    std::string router_sha256;          // hex, over those tensors' raw bytes in that order
     uint64_t    payload_start = 0;
     uint64_t    file_size     = 0;
     std::string payload_sha256;
