@@ -5045,9 +5045,9 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
             }
         }
 
-        const iovec   mv  = { buf, want };
         const int64_t moff = off - (off % (int64_t) MOE_STREAM_ALIGN);
 #ifdef _WIN32
+        const iovec   mv  = { buf, want };
         const ssize_t got = moe_win32_preadv_raw(f->file_id(), &mv, 1, moff);
 #else
         const ssize_t got = pread(f->file_id(), buf, want, (off_t) moff);
