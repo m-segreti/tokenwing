@@ -52,6 +52,8 @@ inline void moe_tt(const char * tag, long long arg = 0) {
     }
 }
 
+bool llama_moe_stream_dev_is_uma(ggml_backend_dev_t dev);
+
 // SSD streaming of MoE routed expert weights
 //
 // Streamed layers do not materialize their ffn_{gate,up,down}_exps tensors: the routed experts
@@ -230,6 +232,11 @@ struct llama_moe_stream_p1 {
     // --moe-stream-async-h2d 1 - CPU -> GPU split inputs in the GPU's pinned host buffer as async
     // H2D copies on the GPU's stream, no host wait (llama-context turns it on in the scheduler: one GPU, no pipeline parallelism)
     bool        async_h2d            = false;
+    int64_t     vram_chunk           = 0;       // --moe-stream-vram-chunk SIZE (1 = auto <= 2 GiB, > 1 = bytes, 0 = off)
+    bool        uma                  = false;   // --moe-stream-uma 1
+    ggml_backend_dev_t uma_dev       = nullptr; // active unified-memory GPU device selected at model load
+    bool        hip_mmvq             = false;   // --moe-stream-hip-mmvq 1
+    int32_t     hip_sync             = 0;       // --moe-stream-hip-sync N (1 = auto 400 us, > 1 = us, 0 = off)
     // Elastic RAM and moving slot shares (both off = fixed, equal pools)
     bool        elastic              = false;
     int64_t     ram_margin           = (int64_t) 500 << 20;
@@ -534,8 +541,10 @@ struct llama_moe_stream_layer {
     // under mtx and by the device ids op inside a graph. A held expert never gets a RAM slot, a read or a guess.
     std::vector<int32_t>  vx_slot;    // [n_expert], empty when the feature is off
     std::vector<int32_t>  vx_list;    // the first N experts of the list file, in list order
-    int32_t               vx_group = -1;   // index into llama_moe_stream::vx_groups, -1 = no VRAM experts
-    int32_t               vx_li    = -1;   // this layer's index in its group (its slice of the group's vp_table)
+    int32_t               vx_group = -1;     // index into llama_moe_stream::vx_groups, -1 = no VRAM experts
+    int32_t               vx_li    = -1;     // this layer's index in its group (its slice of the group's vp_table)
+    int32_t               vx_fmt_group = -1; // parent format index across chunked sub-groups
+    int32_t               vx_fmt_li    = -1; // this layer's ordinal within its parent format group
     bool                  vp_built = false;   // the last one-token graph built this layer's device pass in its launch
     std::vector<int32_t>  vx_seen;    // remap scratch: the distinct VRAM-held experts of a call
     bool vx_held(int32_t e) const { return !vx_slot.empty() && vx_slot[e] >= 0; }
@@ -1086,7 +1095,8 @@ struct llama_moe_stream {
     struct vx_group_t {
         ggml_type     t_gate = GGML_TYPE_COUNT, t_down = GGML_TYPE_COUNT;
         int64_t       ne_gate[2] = {0, 0}, ne_down[2] = {0, 0};
-        int32_t       n_real    = 0;          // N x layers of the group; the zero slices are [n_real, n_real + n_zero)
+        int32_t       fmt_group = 0;          // parent format group index across chunked sub-groups
+        int32_t       n_real    = 0;          // sum of held places across layers of this sub-group; zero slices are [z_end(), z_end() + n_zero_g)
         // Copy-ahead, one zero block: the tail group's places are [tail: n_tail | held: n_real | zero slices] -
         // the zero slices at the tensor's end for every reader (replies, the id tables, the CUDA zero table, the prompt zero skip); a graph
         // whose waves run through the (emptied) tail reads the views [p0, end), which start after the tail. Other groups: [held | zero]
@@ -1240,7 +1250,10 @@ struct llama_moe_stream {
     static int64_t offload_min1() { return std::max<int64_t>(1, offload_min_batch()); }
     bool     onewave_host(int64_t u) const { return tail_onewave_host && u >= offload_min1() && n_waves(u) == 1 &&
                                                     !(ca_one_wave && gpu_waves > 0 && u >= (int64_t) gpu_waves); }   // (those take tail waves)
-    bool tail_hook_ready() const { return tail_preset && !vx_groups.empty() && vx_groups[0].gate_up != nullptr && vx_groups[0].down != nullptr; }
+    bool tail_hook_ready() const {
+        return tail_preset && (size_t) tail_group < vx_groups.size() &&
+               vx_groups[(size_t) tail_group].gate_up != nullptr && vx_groups[(size_t) tail_group].down != nullptr;
+    }
     bool     tail_real    = false;   // llama_context: the graph being split will run (not a reserve): the tail must be vacated now
     int32_t  tail_n = 0, tail_first = 0, tail_group = 0;   // places, the first one, its pool group
     // The tail grows by lm_tail_ext places for a layer-major call's per-call tensors (llama_context asks for
@@ -3087,6 +3100,14 @@ struct llama_moe_stream {
     // GPU waves, or the whole-pool copy of a one-wave ubatch that waits for no read (a GPU machine with the tail
     // off, --moe-stream-gpu-waves 0, 2+ GPUs, elastic / shares). No GPU: always the CPU. (The threshold is the CUDA / Vulkan / Metal / SYCL
     // one, ne[2] >= GGML_OP_OFFLOAD_MIN_BATCH; the one-word rule assumes the same)
+    bool    uma_active          = false; // --moe-stream-uma 1 active on a unified-memory device
+    bool    uma_gpu_pool        = false; // shared/per-layer RAM pool buffer is zero-copy mapped onto uma_dev
+    bool    uma_fallback_warned = false; // printed once if zero-copy GPU pool wrapping falls back to host CPU pool
+    size_t  uma_pool_align      = 0;     // pool base & byte-size alignment used (65536 B when uma_active)
+    ggml_backend_dev_t uma_dev = nullptr;
+    ggml_backend_t     uma_backend = nullptr; // llama_context: active UMA GPU backend for wave > 0 slot barrier
+    int32_t mark_spin_test_us = 0;     // TEST ONLY (MOE_STREAM_TEST_MARK_SPIN_US): host counter spin-poll window
+    std::atomic<int64_t> n_mark_spin_hits{0};
     bool    graph_op_offload = true;   // llama_context, before every compute (true until it says: the safe side)
     // --moe-stream-cpu-down-scale: whether a layer's down-input scale step (#30861) can be left out of the graph being built.
     // The down matmul must certainly run on the CPU: no GPU device; or not a GPU wave and the scheduler cannot move it to a GPU (op
@@ -3096,7 +3117,7 @@ struct llama_moe_stream {
     // x / 2^n gives the same integers and a block scale 2^n smaller, all exact, and the output times 2^n is the same float - the scale
     // is exactly 2^n while expf(n ln2) is (n <= 12 with glibc: every row's max |x| <= 2^22). A q8_0 down (fp16 block scale) keeps it.
     bool down_scale_skip(ggml_type down_type, int64_t n_rows, bool gpu_wave, bool op_offload) const {
-        if (!p1.cpu_down_scale || ggml_get_type_traits_cpu(down_type)->vec_dot_type != GGML_TYPE_Q8_K) {
+        if (uma_gpu_pool || !p1.cpu_down_scale || ggml_get_type_traits_cpu(down_type)->vec_dot_type != GGML_TYPE_Q8_K) {
             return false;
         }
         if (!el_has_gpu) {
@@ -3111,6 +3132,9 @@ struct llama_moe_stream {
     int64_t              ds_built_skip = 0, ds_built_keep = 0;
     int64_t graph_chunk      = 0;      // llama_context: a layer-major expert graph's chunk rows, 0 = none
     bool experts_on_cpu(int64_t n_tok) const {
+        if (uma_gpu_pool) {
+            return false;
+        }
         if (!el_has_gpu || !graph_op_offload) {
             return true;
         }

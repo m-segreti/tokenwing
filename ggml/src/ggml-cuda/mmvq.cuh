@@ -8,6 +8,10 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 bool ggml_cuda_moe_zero_register(const void * pool, int first_zero);
 bool ggml_cuda_moe_zero_unregister(const void * pool);
 
+#if defined(GGML_USE_HIP)
+void ggml_hip_set_mmvq_rdna(bool on);
+#endif
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);

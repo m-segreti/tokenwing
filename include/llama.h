@@ -573,6 +573,14 @@ extern "C" {
         const char * moe_stream_gpu_layers_device; // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (LIST: layers and ranges a-b): their
                                                 //      experts on DEV whatever device holds the layer; NULL = on the layer's own device.
                                                 //      The layers themselves come from moe_stream_gpu_layers_list (common fills it)
+        int64_t      moe_stream_vram_chunk;     // max byte size per VRAM expert pool buffer group (1 = auto <= 2 GiB, > 1 = cap in bytes,
+                                                //      0 = off / one group per format)
+        int32_t      moe_stream_uma;            // 1 = unified-memory zero-copy streaming on integrated / Apple Silicon GPUs (single RAM
+                                                //      budget, 64 KiB-aligned zero-copy pool mapping, no duplicate VRAM pool), 0 = off
+        int32_t      moe_stream_hip_mmvq;       // 1 = RDNA2/RDNA3/RDNA3.5/RDNA4 1-warp & 2-warp short-row MMVQ + RDNA3.5 multi-warp tables
+                                                //      under ROCm/HIP, 0 = off
+        int32_t      moe_stream_hip_sync;       // ROCm/HIP CPU-GPU handoff spin-poll before kernel wait (1 = auto 400 us, > 1 = spin window
+                                                //      in us, 0 = off)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

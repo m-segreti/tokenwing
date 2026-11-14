@@ -60,6 +60,11 @@ uint32_t ggml_cuda_moe_mark_bits(void);
 // GGML_CUDA_MOE_MARK_IDS=1: true when this node's router mark copies the ids itself - the node is then not computed
 bool ggml_cuda_moe_mark_takes_node(const ggml_tensor * node);
 
+#if defined(GGML_USE_HIP)
+void    ggml_hip_set_sync_spin_us(int32_t spin_us);
+int32_t ggml_hip_get_sync_spin_us(void);
+#endif
+
 // TEST ONLY (MOE_STREAM_TEST_VF_PLACE_CHECK): one thread spins for us microseconds of GPU time on stream,
 // so the work queued after it comes that much later. NVIDIA only (%globaltimer); false elsewhere.
 bool ggml_cuda_moe_test_spin(cudaStream_t stream, int64_t us);

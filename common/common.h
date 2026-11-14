@@ -920,6 +920,10 @@ struct common_params {
     int32_t     moe_stream_out_check         = 16; // the output's NaN / Inf check: every prompt call + every Nth reply call, 0 = off
     std::string moe_stream_vram_device;           // the GPU that holds the VRAM expert pool, "" = the first GPU
     std::string moe_stream_gpu_layers_device;     // whole MoE layers per GPU, "DEV=LIST;DEV=LIST" (repeated flags joined with ';')
+    int64_t     moe_stream_vram_chunk        = 0; // max bytes per VRAM expert pool buffer group (1 = auto <= 2 GiB, 0 = off)
+    int32_t     moe_stream_uma               = 0; // unified-memory zero-copy streaming mode (0 = off, 1)
+    int32_t     moe_stream_hip_mmvq          = 0; // RDNA2/3/3.5/4 short-row & RDNA3.5 multi-warp MMVQ under ROCm/HIP (0 = off, 1)
+    int32_t     moe_stream_hip_sync          = 0; // ROCm/HIP CPU-GPU handoff spin window in us (1 = auto 400 us, 0 = off)
     int32_t     moe_stream_vram_follow_tick = 8;
     int32_t     moe_stream_vram_follow_swaps = 64;
     int32_t     moe_stream_vram_follow_recent = 256;

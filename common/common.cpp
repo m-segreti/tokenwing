@@ -1919,6 +1919,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_out_check            = params.moe_stream_out_check;
     mparams.moe_stream_vram_device          = params.moe_stream_vram_device.empty() ? NULL : params.moe_stream_vram_device.c_str();
     mparams.moe_stream_gpu_layers_device    = params.moe_stream_gpu_layers_device.empty() ? NULL : params.moe_stream_gpu_layers_device.c_str();
+    mparams.moe_stream_vram_chunk           = params.moe_stream_vram_chunk;
+    mparams.moe_stream_uma                  = params.moe_stream_uma;
+    mparams.moe_stream_hip_mmvq             = params.moe_stream_hip_mmvq;
+    mparams.moe_stream_hip_sync             = params.moe_stream_hip_sync;
     mparams.moe_stream_vram_follow_tick     = params.moe_stream_vram_follow_tick;
     mparams.moe_stream_vram_follow_swaps    = params.moe_stream_vram_follow_swaps;
     mparams.moe_stream_vram_follow_recent   = params.moe_stream_vram_follow_recent;

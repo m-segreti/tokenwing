@@ -103,12 +103,15 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GB10
 };
 
+template <bool hip_rdna_opt = false>
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #if defined(RDNA4)
     return MMVQ_PARAMETERS_RDNA4;
 #elif defined(RDNA3_0)
     return MMVQ_PARAMETERS_RDNA3_0;
-#elif defined(RDNA2) || defined(RDNA3_5)
+#elif defined(RDNA3_5)
+    return hip_rdna_opt ? MMVQ_PARAMETERS_RDNA3_0 : MMVQ_PARAMETERS_RDNA2;
+#elif defined(RDNA2)
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
@@ -121,11 +124,11 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
 #endif
 }
 
-static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+static __host__ mmvq_parameter_table_id get_device_table_id(int cc, bool hip_rdna_opt = false) {
     if (GGML_CUDA_CC_IS_RDNA4(cc)) {
         return MMVQ_PARAMETERS_RDNA4;
     }
-    if (GGML_CUDA_CC_IS_RDNA3_0(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA3_0(cc) || (hip_rdna_opt && GGML_CUDA_CC_IS_RDNA3_5(cc))) {
         return MMVQ_PARAMETERS_RDNA3_0;
     }
     if (GGML_CUDA_CC_IS_RDNA2(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) {
@@ -483,9 +486,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
     }
     if (table_id == MMVQ_PARAMETERS_RDNA4) {
-        // A short row (small_k, see MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK) fits one warp: one warp per block, several rows per block
+        // Short rows (small_k, see MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK): 1 warp (or 2 warps when halve_iters) and 8 rows per block
         if (small_k && ncols_dst == 1) {
-            return 1;
+            return halve_iters ? 2 : 1;
         }
         // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
@@ -511,6 +514,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         return 1;
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
+        if (small_k && ncols_dst == 1) {
+            return halve_iters ? 2 : 1;
+        }
         // RDNA3 (W7900): stricter whitelist than RDNA4.
         // Q2_K / Q5_K / IQ4_XS regress in full quant sweeps.
         if (ncols_dst == 1) {
@@ -528,6 +534,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 default:
                     return 1;
             }
+        }
+        return 1;
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA2) {
+        if (small_k && ncols_dst == 1) {
+            return halve_iters ? 2 : 1;
         }
         return 1;
     }
@@ -609,6 +621,22 @@ static bool mmvq_rdna4_short_rows_on() {
     return on;
 }
 
+#if defined(GGML_USE_HIP)
+static std::atomic<bool> g_hip_mmvq_rdna_opt{false};
+
+void ggml_hip_set_mmvq_rdna(bool on) {
+    g_hip_mmvq_rdna_opt.store(on, std::memory_order_relaxed);
+}
+
+static bool ggml_hip_mmvq_rdna_on() {
+    static const bool env_on = [] {
+        const char * e = getenv("GGML_HIP_MMVQ_RDNA");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return env_on || g_hip_mmvq_rdna_opt.load(std::memory_order_relaxed);
+}
+#endif
+
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -632,7 +660,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 return 1;
         }
     }
-    if (table_id == MMVQ_PARAMETERS_RDNA4 && small_k && ncols_dst == 1) {
+    if ((table_id == MMVQ_PARAMETERS_RDNA4 || table_id == MMVQ_PARAMETERS_RDNA3_0 || table_id == MMVQ_PARAMETERS_RDNA2) &&
+            small_k && ncols_dst == 1) {
         return MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK;
     }
     return 1;
@@ -648,7 +677,7 @@ struct ggml_cuda_moe_zero_entry {
     const void * pool;
     int32_t      first_zero;
 };
-#define GGML_CUDA_MOE_ZERO_MAX 16
+#define GGML_CUDA_MOE_ZERO_MAX 64
 static __constant__ ggml_cuda_moe_zero_entry g_moe_zero[GGML_CUDA_MOE_ZERO_MAX];
 static __constant__ int                      g_moe_zero_n;
 static ggml_cuda_moe_zero_entry              g_moe_zero_host[GGML_CUDA_MOE_ZERO_MAX];
@@ -683,8 +712,8 @@ bool ggml_cuda_moe_zero_unregister(const void * pool) {
     return false;
 }
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false>
-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool hip_rdna_opt = false>
+__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id<hip_rdna_opt>(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -700,7 +729,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
     constexpr int vdr = get_vdr_mmvq(type);
-    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id<hip_rdna_opt>();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -1126,7 +1155,7 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool hip_rdna_opt = false>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1141,7 +1170,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, hip_rdna_opt>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1152,7 +1181,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, hip_rdna_opt>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1211,7 +1240,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const int device = ggml_cuda_get_device();
     const int                     cc        = ggml_cuda_info().devices[device].cc;
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
-    const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
+#if defined(GGML_USE_HIP)
+    const bool hip_rdna_opt = ggml_hip_mmvq_rdna_on() && GGML_CUDA_CC_IS_RDNA(cc);
+#else
+    constexpr bool hip_rdna_opt = false;
+#endif
+    const mmvq_parameter_table_id table_id  = get_device_table_id(cc, hip_rdna_opt && ncols_dst == 1);
 
     const bool has_ids = ids != nullptr;
 
@@ -1256,12 +1290,24 @@ static void mul_mat_vec_q_switch_ncols_dst(
             use = false;
         }
 
-        // RDNA4: the whole row in one warp's lanes, and only whole blocks of rows (the kernel's row check is not exact with ids)
-        if (table_id == MMVQ_PARAMETERS_RDNA4 && c_ncols_dst == 1 && mmvq_rdna4_short_rows_on()) {
+        // RDNA4 default (and RDNA2/RDNA3/RDNA3.5 when hip_rdna_opt is enabled): whole row in one warp's lanes, whole 8-row blocks
+        if ((table_id == MMVQ_PARAMETERS_RDNA4 || hip_rdna_opt) && c_ncols_dst == 1 && mmvq_rdna4_short_rows_on()) {
             use = blocks_per_row_x * (qi/vdr) <= warp_size && nrows_x % MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK == 0;
         }
 
         return use;
+    };
+
+    const auto should_use_rdna_2warp_short = [&](int c_ncols_dst) {
+#if defined(GGML_USE_HIP)
+        if (hip_rdna_opt && c_ncols_dst == 1 && mmvq_rdna4_short_rows_on() && nrows_x % MMVQ_RDNA4_SHORT_ROWS_PER_BLOCK == 0) {
+            const int iters = blocks_per_row_x * (qi/vdr);
+            return iters > warp_size && iters <= 2 * warp_size;
+        }
+#else
+        GGML_UNUSED(c_ncols_dst);
+#endif
+        return false;
     };
 
     // Whether doubling nwarps pays off on the ncols_dst == 1 path, where K sets the K loop trip count.
@@ -1302,31 +1348,51 @@ static void mul_mat_vec_q_switch_ncols_dst(
             static constexpr int c_ncols_dst = 1;
 
             // Tag types keep the flags compile-time, so __launch_bounds__ matches what is launched.
-            const auto launch = [&](auto small_k_tag, auto halve_iters_tag) {
-                constexpr bool c_small_k = decltype(small_k_tag)::value;
+            const auto launch = [&](auto small_k_tag, auto halve_iters_tag, auto rdna_opt_tag) {
+                constexpr bool c_small_k  = decltype(small_k_tag)::value;
+                constexpr bool c_rdna_opt = decltype(rdna_opt_tag)::value;
                 // Types the table does not promote would compile a second, identical kernel.
                 constexpr bool c_promoted =
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, true) !=
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_GB10, false, false);
 
-                constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
+                constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && (c_small_k || c_promoted);
 
                 const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst + (fusion.shared_up != nullptr),
                                                                               nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
-                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters>(
+                mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_rdna_opt>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
             };
 
+#if defined(GGML_USE_HIP)
+            const auto launch_hip = [&](auto small_k_tag, auto halve_iters_tag) {
+                if (hip_rdna_opt) {
+                    launch(small_k_tag, halve_iters_tag, std::true_type{});
+                } else {
+                    launch(small_k_tag, halve_iters_tag, std::false_type{});
+                }
+            };
             if (should_use_small_k(c_ncols_dst)) {
-                launch(std::true_type{},  std::false_type{});
+                launch_hip(std::true_type{},  std::false_type{});
+            } else if (should_use_rdna_2warp_short(c_ncols_dst)) {
+                launch_hip(std::true_type{},  std::true_type{});
             } else if (should_halve_iters()) {
-                launch(std::false_type{}, std::true_type{});
+                launch_hip(std::false_type{}, std::true_type{});
             } else {
-                launch(std::false_type{}, std::false_type{});
+                launch_hip(std::false_type{}, std::false_type{});
             }
+#else
+            if (should_use_small_k(c_ncols_dst)) {
+                launch(std::true_type{},  std::false_type{}, std::false_type{});
+            } else if (should_halve_iters()) {
+                launch(std::false_type{}, std::true_type{},  std::false_type{});
+            } else {
+                launch(std::false_type{}, std::false_type{}, std::false_type{});
+            }
+#endif
         } break;
         case 2: {
             constexpr int c_ncols_dst = 2;
