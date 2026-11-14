@@ -1,7 +1,54 @@
 #include "moe-mark.cuh"
 
 #include <algorithm>
+#include <atomic>
 #include <vector>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
+#if defined(GGML_USE_HIP)
+static std::atomic<int32_t> g_hip_sync_spin_us{0};
+
+void ggml_hip_set_sync_spin_us(int32_t spin_us) {
+    const int32_t eff = spin_us == 1 ? 400 : std::max<int32_t>(0, spin_us);
+    g_hip_sync_spin_us.store(eff, std::memory_order_relaxed);
+}
+
+int32_t ggml_hip_get_sync_spin_us(void) {
+    static const int32_t env_us = []() -> int32_t {
+        const char * v = getenv("GGML_HIP_SYNC_SPIN_US");
+        if (v == nullptr) {
+            return -1;
+        }
+        const int a = atoi(v);
+        return a == 1 ? 400 : std::max(0, a);
+    }();
+    return env_us >= 0 ? env_us : g_hip_sync_spin_us.load(std::memory_order_relaxed);
+}
+
+static inline void ggml_hip_spin_pause(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#endif
+}
+
+// acquire load of a 32-bit word the GPU writes into pinned host memory (the same two forms as the engine's own helper)
+static inline uint32_t ggml_hip_load_acquire_u32(const uint32_t * p) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    const uint32_t v = *static_cast<const volatile uint32_t *>(p);
+    std::atomic_signal_fence(std::memory_order_acquire);
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+    std::atomic_thread_fence(std::memory_order_acquire);
+#endif
+    return v;
+#else
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#endif
+}
+#endif
 
 #if !defined(GGML_USE_MUSA)
 
@@ -160,7 +207,29 @@ bool ggml_cuda_moe_mark_wait(int32_t kind, int32_t il) {
                 kind == GGML_CUDA_MOE_MARK_DONE ? "\"gate/up done\"" : "\"guess done\"");
         return false;
     }
-    const cudaError_t err = cudaEventSynchronize(g_moe_mark[kind].e[il].ev);
+    const ggml_cuda_moe_mark_entry & e = g_moe_mark[kind].e[il];
+#if defined(GGML_USE_HIP)
+    // k_moe_mark issues __threadfence_system() before writing *e.counter = want into fine-grained pinned host memory.
+    // Bounded user-space polling avoids Linux HSA futex/ioctl sleep latency (~200-500 us/layer) when the mark finishes soon.
+    const int32_t spin_us = ggml_hip_get_sync_spin_us();
+    if (spin_us > 0 && e.counter != nullptr && e.expected != nullptr) {
+        const uint32_t want = *((const volatile uint32_t *) e.expected);
+        if (ggml_hip_load_acquire_u32(e.counter) == want) {
+            return true;
+        }
+        const int64_t t0 = ggml_time_us();
+        for (uint32_t it = 0;; ++it) {
+            ggml_hip_spin_pause();
+            if (ggml_hip_load_acquire_u32(e.counter) == want) {
+                return true;
+            }
+            if ((it & 15u) == 15u && ggml_time_us() - t0 >= (int64_t) spin_us) {
+                break;
+            }
+        }
+    }
+#endif
+    const cudaError_t err = cudaEventSynchronize(e.ev);
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: layer %d: CUDA error %s\n", __func__, il, cudaGetErrorString(err));
         return false;

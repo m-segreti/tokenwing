@@ -3138,7 +3138,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ggml_n_dims(weights) <= 3 && weights->ne[0] == 1 && weights->ne[1] == experts->ne[1] &&
                 weights->ne[2] == experts->ne[2] && (int64_t) hparams.n_expert_used(il) <= experts->ne[1] &&
                 il >= 0 && (size_t) il < mstream->p1.wsum_cpu_tail.size() && mstream->p1.wsum_cpu_tail[il] &&
-                !mstream->vram_serves(il) && llama_moe_wsum_weights_on_host(down_exps)) {
+                !mstream->uma_gpu_pool && !mstream->vram_serves(il) && llama_moe_wsum_weights_on_host(down_exps)) {
             bool on_cpu = true;
             if (cparams.op_offload) {
                 for (int b = 0; b < ggml_backend_sched_get_n_backends(sched) && on_cpu; b++) {

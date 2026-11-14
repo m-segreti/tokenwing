@@ -1860,15 +1860,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // More than one GPU: the device names of --moe-stream-vram-device and --moe-stream-gpu-layers-device, resolved against this
         // model's GPUs (--device decides which and in what order). A name that is not one of them falls back, with one line each
         std::string gpu_names;
-        ggml_backend_dev_t first_gpu = nullptr;
+        ggml_backend_dev_t first_gpu  = nullptr;
+        ggml_backend_dev_t first_igpu = nullptr;
         int n_gpu_devs = 0;
         for (const auto & dv : devices) {
             const auto t = ggml_backend_dev_type(dv.dev);
             if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 gpu_names += format("%s%s", gpu_names.empty() ? "" : ",", ggml_backend_dev_name(dv.dev));
                 n_gpu_devs++;
-                first_gpu = first_gpu == nullptr && t == GGML_BACKEND_DEVICE_TYPE_GPU ? dv.dev : first_gpu;
+                first_gpu  = first_gpu  == nullptr && t == GGML_BACKEND_DEVICE_TYPE_GPU  ? dv.dev : first_gpu;
+                first_igpu = first_igpu == nullptr && t == GGML_BACKEND_DEVICE_TYPE_IGPU ? dv.dev : first_igpu;
             }
+        }
+        if (first_gpu == nullptr) {
+            first_gpu = first_igpu;
         }
         const auto gpu_by_name = [&](const std::string & n, bool igpu_ok) -> ggml_backend_dev_t {
             for (const auto & dv : devices) {
@@ -1882,7 +1887,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_t ms_pool_dev = first_gpu;
         bool ms_pool_dev_set = false;
         if (params.moe_stream_vram_device && params.moe_stream_vram_device[0]) {
-            if (ggml_backend_dev_t d = gpu_by_name(params.moe_stream_vram_device, /* igpu_ok = */ false)) {
+            if (ggml_backend_dev_t d = gpu_by_name(params.moe_stream_vram_device, /* igpu_ok = */ true)) {
                 ms_pool_dev     = d;
                 ms_pool_dev_set = true;
             } else {
@@ -2066,6 +2071,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (corr_gpu + corr_ram > 0) {
                     fprintf(stderr, "%s: the correction file's tensors are counted in the weight plan: %.1f MiB on the GPU side, %.1f MiB in RAM (%s)\n",
                             __func__, (double) corr_gpu/1048576.0, (double) corr_ram/1048576.0, params.moe_stream_correction);
+                }
+            }
+
+            if (params.moe_stream_uma == 1) {
+                for (const auto & d : devices) {
+                    if (llama_moe_stream_dev_is_uma(d.dev)) {
+                        const int64_t uma_w = gpu_weight_dev[d.dev];
+                        if (uma_w > 0) {
+                            other_bytes += uma_w;
+                            fprintf(stderr, "%s: unified-memory mode (--moe-stream-uma 1): %.2f GiB of non-expert weights on %s counted in the shared RAM budget\n",
+                                    __func__, (double) uma_w/1024.0/1024.0/1024.0, ggml_backend_dev_name(d.dev));
+                        }
+                        break;
+                    }
                 }
             }
 
@@ -2403,6 +2422,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.vram_parallel_cross  = params.moe_stream_vram_parallel == 2;
         p1.vram_copyback        = params.moe_stream_vram_copyback == 1;
         p1.async_h2d            = params.moe_stream_async_h2d == 1;
+        p1.vram_chunk           = std::max<int64_t>(0, params.moe_stream_vram_chunk);
+        p1.uma                  = params.moe_stream_uma == 1;
+        if (p1.uma) {
+            for (const auto & d : devices) {
+                if (llama_moe_stream_dev_is_uma(d.dev)) {
+                    p1.uma_dev = d.dev;
+                    break;
+                }
+            }
+        }
+        p1.hip_mmvq             = params.moe_stream_hip_mmvq == 1;
+        p1.hip_sync             = std::max(0, params.moe_stream_hip_sync);
         p1.elastic              = params.moe_stream_elastic == 1;
         p1.ram_margin           = params.moe_stream_ram_margin > 0 ? params.moe_stream_ram_margin : (int64_t) 500 << 20;
         p1.ram_margin_set       = params.moe_stream_ram_margin > 0;
@@ -4545,6 +4576,10 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_vram_device      =*/ nullptr, // the first GPU holds the VRAM pool
         /*.moe_stream_gpu_layers_device =*/ nullptr, // whole layers' experts on their layer's own device
         /*.quant_plugin                =*/ nullptr,
+        /*.moe_stream_vram_chunk       =*/ 0,      // off (one buffer group per format)
+        /*.moe_stream_uma              =*/ 0,      // off (discrete RAM / VRAM pools)
+        /*.moe_stream_hip_mmvq         =*/ 0,      // off
+        /*.moe_stream_hip_sync         =*/ 0,      // off
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

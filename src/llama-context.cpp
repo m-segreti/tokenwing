@@ -580,16 +580,28 @@ llama_context::llama_context(
             ggml_backend_dev_t         gdev  = nullptr;
             ggml_backend_buffer_type_t gbuft = nullptr;
             ggml_backend_t             gback = ms_pool_backend();   // the GPU of the VRAM pool (--moe-stream-vram-device, else the first GPU)
+            if (gback == nullptr && !backends.empty() && getenv("MOE_STREAM_TEST_VRAM_ON_CPU") && atoi(getenv("MOE_STREAM_TEST_VRAM_ON_CPU")) != 0) {
+                gback = backends.back().get();   // TEST ONLY: exercise vx_setup / chunked VRAM pools / vram_follow on CPU-only hosts
+            }
             if (gback != nullptr) {
                 gdev  = ggml_backend_get_device(gback);
                 gbuft = ggml_backend_get_default_buffer_type(gback);
+            }
+            if (ms->uma_active && ms->uma_dev != nullptr) {
+                for (auto & backend : backends) {
+                    if (ggml_backend_get_device(backend.get()) == ms->uma_dev) {
+                        ms->uma_backend = backend.get();
+                        break;
+                    }
+                }
             }
             {   // the pool's tail needs no pipeline copies (the scheduler's n_copies is 1), op offload, and every GPU prompt wave on the
                 // pool's GPU: one GPU, or with several the scheduler's op offload limited to the pool's GPU (sched_new)
                 // MOE_STREAM_TEST_MULTI_GPU_NO_TAIL=1 (test only): with several GPUs no tail (no tail waves, no copy-ahead)
                 int n_gpu_t = 0;
                 for (auto & backend : backends) {
-                    n_gpu_t += ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
+                    const auto dt = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+                    n_gpu_t += (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) ? 1 : 0;
                 }
                 static const bool test_no_tail = getenv("MOE_STREAM_TEST_MULTI_GPU_NO_TAIL") && atoi(getenv("MOE_STREAM_TEST_MULTI_GPU_NO_TAIL")) != 0;
                 ms->n_gpu_ctx    = n_gpu_t;
@@ -717,7 +729,7 @@ llama_context::llama_context(
                     const ggml_backend_dev_t next = il + 1 < n_trunk ? model.dev_layer(il + 1) : model.dev_output();
                     const int k = model.dev_layer(il) != cpu_dev ? 1
                                 : next != cpu_dev ? 2
-                                : !(dsrc->buffer && ggml_backend_buffer_is_host(dsrc->buffer)) ? 3
+                                : (ms->uma_gpu_pool || !(dsrc->buffer && ggml_backend_buffer_is_host(dsrc->buffer))) ? 3
                                 : ms->vram_serves((int32_t) il) ? 4 : 0;
                     cnt[k]++;
                     why[k] += (why[k].empty() ? "" : ",") + std::to_string(il);
@@ -774,6 +786,9 @@ llama_context::~llama_context() {
     }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (auto * ms = model.moe_stream(); ms != nullptr) {
+        ms->uma_backend = nullptr;
+    }
     for (auto ev : lm_evs) {   // the per-layer events of the window's signals
         if (ev) {
             ggml_backend_event_free(ev);
@@ -1947,7 +1962,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             static const bool test_no_h2d = getenv("MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D") && atoi(getenv("MOE_STREAM_TEST_MULTI_GPU_NO_ASYNC_H2D")) != 0;
             int n_gpu = 0;
             for (auto & backend : backends) {
-                n_gpu += ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
+                const auto dt = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+                n_gpu += (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) ? 1 : 0;
             }
             // Inputs can qualify only when the CPU backend's compute buffer type is the GPU's pinned host buffer type
             bool host_pinned = false;
@@ -1955,7 +1971,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 if (ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                     for (auto & backend : backends) {
                         ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
-                        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        const auto dt = ggml_backend_dev_type(d);
+                        if (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                             host_pinned = host_pinned || backend_buft[b] == ggml_backend_dev_host_buffer_type(d);
                         }
                     }
@@ -1968,7 +1985,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             bool old_cuda = false;
             for (auto & backend : backends) {
                 ggml_backend_dev_t d = ggml_backend_get_device(backend.get());
-                ggml_backend_reg_t reg = ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU ? ggml_backend_dev_backend_reg(d) : nullptr;
+                const auto dt = ggml_backend_dev_type(d);
+                ggml_backend_reg_t reg = (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU)
+                    ? ggml_backend_dev_backend_reg(d) : nullptr;
                 auto fn = reg ? (bool (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_async_h2d_ok") : nullptr;
                 old_cuda = old_cuda || (fn != nullptr && (test_old_cuda || !fn()));
             }
@@ -2583,7 +2602,8 @@ void llama_context::lm_signal_done(int il_from, int il_to) {
 int llama_context::sched_n_gpu() const {
     int n = 0;
     for (const auto & backend : backends) {
-        n += ggml_backend_dev_type(ggml_backend_get_device(backend.get())) == GGML_BACKEND_DEVICE_TYPE_GPU ? 1 : 0;
+        const auto dt = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+        n += (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU) ? 1 : 0;
     }
     return n;
 }
@@ -2592,7 +2612,9 @@ ggml_backend_t llama_context::ms_pool_backend() const {
     const auto * ms = ctx_moe_stream();
     for (const auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-        if (ms != nullptr && ms->pool_dev != nullptr ? dev == ms->pool_dev : ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        const auto dt = ggml_backend_dev_type(dev);
+        if (ms != nullptr && ms->pool_dev != nullptr ? dev == ms->pool_dev
+                : (dt == GGML_BACKEND_DEVICE_TYPE_GPU || dt == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
             return backend.get();
         }
     }
@@ -5947,7 +5969,7 @@ bool llama_context::cc_reserve(size_t n_keep) {
         cc_host.clear();
         for (auto & be : backends) {   // pinned memory of the first GPU: the device-to-host copies then run without a host wait
             ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
-            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            if (dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
                 if (ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(dev)) {
                     cc_buf.reset(ggml_backend_buft_alloc_buffer(hbt, need));
                     if (cc_buf) {

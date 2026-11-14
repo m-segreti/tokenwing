@@ -4496,6 +4496,62 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-stream-vram-chunk"}, "SIZE",
+        "with --moe-stream-vram-experts / --moe-stream-vram-free: partition each format's VRAM expert pool across contiguous layer "
+        "sub-groups so every sub-group buffer and tensor stays within SIZE and the device's storage-buffer range (1 or auto = 2GiB, "
+        "SIZE > 1 = explicit cap such as 1536MiB, default: 0 = off, one group per format)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_stream_vram_chunk = 1;
+            } else {
+                const int64_t v = moe_stream_parse_size(value);
+                if (v < 0) {
+                    throw std::invalid_argument("--moe-stream-vram-chunk must be >= 0");
+                }
+                params.moe_stream_vram_chunk = v;
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-uma"}, "0|1",
+        "with --moe-stream on unified-memory GPUs (integrated APUs / iGPUs and Apple Silicon Metal): size pools from one shared "
+        "system RAM budget, skip the duplicate VRAM expert pool, and map 64 KiB-aligned RAM expert pools directly onto the GPU "
+        "without host-to-device weight copies (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-uma must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_uma = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-hip-mmvq"}, "0|1",
+        "under ROCm/HIP on AMD RDNA GPUs: enable 1-warp and 2-warp rows_per_block=8 short-row quantized matmul-vec dispatch across "
+        "RDNA2, RDNA3, RDNA3.5, and RDNA4, and use multi-warp RDNA3 tables on RDNA3.5 (default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-hip-mmvq must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_hip_mmvq = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-stream-hip-sync"}, "N",
+        "under ROCm/HIP: user-space spin-poll window in microseconds on fine-grained completion counters and stream events before "
+        "blocking in hipEventSynchronize / hipStreamSynchronize (1 = auto 400 us, > 1 = explicit us, default: 0 = off)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                LOG_WRN("--moe-stream-hip-sync must be >= 0: %d -> 0\n", value);
+                value = 0;
+            }
+            params.moe_stream_hip_sync = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-gpu-skip-zero"}, "0|1",
         "with --moe-stream-vram-experts: the GPU's one-token expert matmul writes 0 for the pairs that name one of the VRAM "
         "pool's all-zero slices instead of reading them (exactly the same output, less GPU memory traffic) (default: 0)",

@@ -3034,6 +3034,34 @@ static void ggml_cuda_prof_flush(void);
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+#if defined(GGML_USE_HIP)
+    const int32_t spin_us = ggml_hip_get_sync_spin_us();
+    if (spin_us > 0) {
+        cudaError_t q = cudaStreamQuery(cuda_ctx->stream());
+        if (q == cudaSuccess) {
+            ggml_cuda_prof_flush();
+            return;
+        }
+        if (q == cudaErrorNotReady) {
+            const int64_t t0 = ggml_time_us();
+            for (uint32_t it = 0;; ++it) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#elif defined(__aarch64__)
+                asm volatile("yield" ::: "memory");
+#endif
+                q = cudaStreamQuery(cuda_ctx->stream());
+                if (q == cudaSuccess) {
+                    ggml_cuda_prof_flush();
+                    return;
+                }
+                if (q != cudaErrorNotReady || ((it & 7u) == 7u && ggml_time_us() - t0 >= (int64_t) spin_us)) {
+                    break;
+                }
+            }
+        }
+    }
+#endif
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
     ggml_cuda_prof_flush();   // the device time of the graphs still in flight
 
@@ -7061,6 +7089,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_moe_zero_unregister") == 0) {
         return (void *)ggml_cuda_moe_zero_unregister;
     }
+#if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_hip_set_mmvq_rdna") == 0) {
+        return (void *)ggml_hip_set_mmvq_rdna;
+    }
+    if (strcmp(name, "ggml_backend_hip_set_sync_spin_us") == 0) {
+        return (void *)ggml_hip_set_sync_spin_us;
+    }
+#endif
     return nullptr;
 }
 

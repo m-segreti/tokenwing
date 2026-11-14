@@ -151,8 +151,10 @@ using json = nlohmann::json;
 
 static const char * MOE_STREAM_FORMAT = "tokenwing expert sidecar v1";
 
-// page-aligned allocation: O_DIRECT needs an aligned destination, and ggml buffers are only
-// 32-byte aligned
+static constexpr size_t MOE_STREAM_UMA_ALIGN = 65536;
+
+// aligned allocation of n bytes at align (a power of two): page-aligned pools (O_DIRECT needs an aligned destination, and ggml
+// buffers are only 32-byte aligned), 64 KiB-aligned unified-memory pools, 64-byte-aligned small tables
 static void * moe_aligned_alloc_n(size_t n, size_t align) {
 #ifdef _WIN32
     return _aligned_malloc(n, align);
@@ -175,6 +177,25 @@ static void moe_aligned_free(void * p) {
 
 static void * moe_aligned_alloc(size_t n) {
     return moe_aligned_alloc_n(n, MOE_STREAM_ALIGN);
+}
+
+bool llama_moe_stream_dev_is_uma(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+    const enum ggml_backend_dev_type dt = ggml_backend_dev_type(dev);
+    if (dt == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+        return true;
+    }
+    if (dt == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(dev, &props);
+        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "Metal") == 0 && props.caps.buffer_from_host_ptr) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // The same, but 2 MiB-aligned and madvise(MADV_HUGEPAGE)d. Transparent huge pages only
@@ -2107,6 +2128,27 @@ llama_moe_stream::llama_moe_stream(
     // they are given: the budget below is only the fallback.
     const int64_t mem_available = moe_stream_mem_available();
 
+    const int test_uma_mode = getenv("MOE_STREAM_TEST_UMA") ? atoi(getenv("MOE_STREAM_TEST_UMA")) : 0;
+    const bool test_uma = test_uma_mode != 0;
+    if (const char * ms_spin = getenv("MOE_STREAM_TEST_MARK_SPIN_US")) {
+        mark_spin_test_us = std::max<int32_t>(0, atoi(ms_spin));
+    }
+    uma_dev = p1.uma_dev;
+    if (test_uma_mode == 2 && uma_dev == nullptr) {   // TEST ONLY: exercise zero-copy buffer_from_host_ptr UMA pool path on CPU
+        uma_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    if (p1.uma) {
+        if (uma_dev != nullptr || test_uma) {
+            uma_active     = true;
+            uma_pool_align = MOE_STREAM_UMA_ALIGN;
+            fprintf(stderr, "%s: --moe-stream-uma 1: unified-memory mode active (%s, %zu B pool alignment)\n",
+                    __func__, uma_dev != nullptr ? ggml_backend_dev_name(uma_dev) : "TEST ONLY: MOE_STREAM_TEST_UMA",
+                    uma_pool_align);
+        } else {
+            fprintf(stderr, "%s: --moe-stream-uma 1: no unified-memory GPU device found, using standard host pools\n", __func__);
+        }
+    }
+
     // per-layer sidecar blocks. The MTP/nextn blocks are in the sidecar but are not part of the
     // decode graph, so they get no pool: without speculative decoding they are never computed.
     const int32_t nextn_base = (int32_t) (mi.n_layer_all - mi.n_layer_nextn);
@@ -2412,6 +2454,24 @@ llama_moe_stream::llama_moe_stream(
                 fprintf(stderr, "%s: no VRAM to fit whole MoE layers into (%lld bytes free after the model, the KV "
                         "cache and the compute buffers), keeping none on the GPU\n",
                         __func__, (long long) vram);
+            } else if (uma_active) {
+                const std::vector<int32_t> hot = order_layers();
+                int64_t total_moe = 0;
+                for (const int32_t il : hot) {
+                    total_moe += (int64_t) n_expert*(int64_t) blocks[il].block_bytes;
+                }
+                const int64_t uma_room = mem_available > 0
+                        ? std::max<int64_t>(0, (int64_t) mem_available - std::max<int64_t>(0, ram_free) - other_bytes)
+                        : vram;
+                const int64_t fit_room = std::min(vram, uma_room);
+                if (total_moe > 0 && total_moe <= fit_room) {
+                    sel = hot;
+                    fprintf(stderr, "%s: --moe-stream-uma 1: all %zu MoE layers (%lld MiB) fit in unified memory (%lld MiB free), keeping all resident\n",
+                            __func__, sel.size(), (long long) (total_moe >> 20), (long long) (fit_room >> 20));
+                } else {
+                    fprintf(stderr, "%s: --moe-stream-uma 1: whole routed MoE set (%lld MiB) exceeds unified memory room (%lld MiB), keeping 0 automatic whole layers so unified RAM serves streamed expert slots\n",
+                            __func__, (long long) (total_moe >> 20), (long long) (fit_room >> 20));
+                }
             } else {
                 const std::vector<int32_t> hot = order_layers();
 
@@ -2568,9 +2628,14 @@ llama_moe_stream::llama_moe_stream(
         if (!gpu_layers.empty()) {
             std::string list;
             size_t n_left = 0;
+            int64_t wl_uma_bytes = 0;
             for (const int32_t il : gpu_layers) {
                 list += list.empty() ? "" : ", ";
                 list += std::to_string(il);
+                wl_uma_bytes += (int64_t) n_expert*(int64_t) blocks[il].block_bytes;
+            }
+            if (uma_active && wl_uma_bytes > 0) {
+                other_bytes += wl_uma_bytes;
             }
             for (const uint8_t h : have) {
                 n_left += h ? 1 : 0;
@@ -3366,6 +3431,28 @@ llama_moe_stream::llama_moe_stream(
     } else if (p1.gpu_share_q8) {
         fprintf(stderr, "%s: --moe-stream-gpu-share-q8 1: no CUDA / ROCm backend, ignored\n", __func__);
     }
+    ggml_backend_reg_t rocm_reg = ggml_backend_reg_by_name("ROCm");
+    if (rocm_reg != nullptr) {
+        auto * set_mmvq = (void (*)(bool)) ggml_backend_reg_get_proc_address(rocm_reg, "ggml_backend_hip_set_mmvq_rdna");
+        if (set_mmvq != nullptr) {
+            set_mmvq(p1.hip_mmvq);
+        } else if (p1.hip_mmvq) {
+            fprintf(stderr, "%s: --moe-stream-hip-mmvq 1: this ROCm backend does not support RDNA MMVQ tuning, ignored\n", __func__);
+        }
+        auto * set_spin = (void (*)(int32_t)) ggml_backend_reg_get_proc_address(rocm_reg, "ggml_backend_hip_set_sync_spin_us");
+        if (set_spin != nullptr) {
+            set_spin(p1.hip_sync);
+        } else if (p1.hip_sync > 0) {
+            fprintf(stderr, "%s: --moe-stream-hip-sync %d: this ROCm backend does not support sync spin-polling, ignored\n", __func__, p1.hip_sync);
+        }
+    } else {
+        if (p1.hip_mmvq) {
+            fprintf(stderr, "%s: --moe-stream-hip-mmvq 1: no ROCm backend, ignored\n", __func__);
+        }
+        if (p1.hip_sync > 0) {
+            fprintf(stderr, "%s: --moe-stream-hip-sync %d: no ROCm backend, ignored\n", __func__, p1.hip_sync);
+        }
+    }
 
     if (n_streamed == 0) {
         return;  // every layer is in VRAM: no pools to fill, so no thread has anything to do
@@ -3884,14 +3971,19 @@ llama_moe_stream::~llama_moe_stream() {
         tailw_tg.clear();
     }
 
-    // the buffers do not own their memory, free it after they are gone
+    // Unregister host pool addresses before destroying backend buffers (host_buft UMA pools own their memory inside bufs)
+    for (size_t i = 0; i < pool_mem.size(); i++) {
+        unregister_pool(pool_mem[i]);
+    }
     bufs.clear();
     for (ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
     for (size_t i = 0; i < pool_mem.size(); i++) {
-        unregister_pool(pool_mem[i]);   // (the pointer is still the allocation base)
-        if (i < pool_fresh.size() && pool_fresh[i]) {
+        const uint8_t fk = i < pool_fresh.size() ? pool_fresh[i] : 0;
+        if (fk == 2) {
+            continue;   // owned and freed by bufs.clear() above (host_buft zero-copy pool)
+        } else if (fk == 1) {
             el_os_free_fresh(pool_mem[i], pool_size[i]);
         } else {
             moe_aligned_free(pool_mem[i]);
@@ -4267,21 +4359,92 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
     ggml_tensor * pool = ggml_new_tensor_3d(ctx, meta->type, meta->ne[0], meta->ne[1], el_cap + n_zero);   // el_cap = n_slots when off
     ggml_set_name(pool, (name + ".stream_pool").c_str());
 
-    const size_t nbytes = ggml_nbytes(pool);
+    const size_t nbytes      = ggml_nbytes(pool);
+    const size_t pad_tail    = uma_active ? ggml_row_size(pool->type, 512) : 0;
+    const size_t alloc_bytes = uma_active ? GGML_PAD(nbytes + pad_tail, uma_pool_align) : nbytes;
 
-    bool fresh = false;   // with elastic RAM / slot shares the pools are fresh memory (the OS layer), so untouched slots read zero with no RAM
-    // With the window the pool is the OS layer's fresh memory too (Windows: only the slots in use + the zero block committed)
-    void * mem = hugepages ? moe_hugepage_alloc(nbytes) : (el_on || sh_on || win_on || zero_block_free(hugepages || pin))
-               ? el_os_alloc_fresh(nbytes, fresh, win_on && !(el_on || sh_on) ? ((size_t) n_slots + n_zero)*nb_expert : SIZE_MAX)
-               : moe_aligned_alloc(nbytes);
+    bool                  fresh       = false;   // with elastic RAM / slot shares the pools are fresh memory (the OS layer), so untouched slots read zero with no RAM
+    uint8_t               fresh_kind  = 0;       // 0 = moe_aligned_free, 1 = el_os_free_fresh, 2 = owned by bufs (host_buft zero-copy)
+    bool                  uma_wrapped = false;
+    void *                mem         = nullptr;
+    ggml_backend_buffer_t buf         = nullptr;
 
-    if (!mem) {
-        throw std::runtime_error(format("failed to allocate %zu bytes for the expert pool of '%s'", nbytes, name.c_str()));
+    if (uma_active && !hugepages && !(el_on || sh_on || win_on) && !cpu_repack && n_repacked_blocks == 0 && uma_dev != nullptr) {
+        bool dev_op_ok = false;
+        ggml_context * pctx = ggml_init({ /* .mem_size = */ 5*ggml_tensor_overhead(), /* .mem_buffer = */ nullptr, /* .no_alloc = */ true });
+        if (pctx != nullptr) {
+            ggml_tensor * s0  = ggml_new_tensor_3d(pctx, pool->type, pool->ne[0], pool->ne[1], pool->ne[2]);
+            ggml_tensor * s1  = ggml_new_tensor_3d(pctx, GGML_TYPE_F32, pool->ne[0], n_expert_used, 1);
+            ggml_tensor * ids = ggml_new_tensor_2d(pctx, GGML_TYPE_I32, n_expert_used, 1);
+            ggml_tensor * mmi = ggml_mul_mat_id(pctx, s0, s1, ids);
+            dev_op_ok = ggml_backend_dev_supports_op(uma_dev, mmi);
+            ggml_free(pctx);
+        }
+        if (dev_op_ok) {
+            ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(uma_dev);
+            if (hbuft != nullptr && ggml_backend_dev_supports_buft(uma_dev, hbuft)) {
+                ggml_backend_buffer_t zbuf = ggml_backend_buft_alloc_buffer(hbuft, alloc_bytes);
+                void * zptr = zbuf != nullptr ? ggml_backend_buffer_get_base(zbuf) : nullptr;
+                if (zptr != nullptr && ((uintptr_t) zptr % MOE_STREAM_ALIGN) == 0) {
+                    mem         = zptr;
+                    buf         = zbuf;
+                    fresh_kind  = 2;
+                    uma_wrapped = true;
+                } else if (zbuf != nullptr) {
+                    ggml_backend_buffer_free(zbuf);
+                }
+            }
+            if (!uma_wrapped) {
+                ggml_backend_dev_props props{};
+                ggml_backend_dev_get_props(uma_dev, &props);
+                if (props.caps.buffer_from_host_ptr) {
+                    mem = moe_aligned_alloc_n(alloc_bytes, uma_pool_align);
+                    if (mem != nullptr) {
+                        ggml_backend_buffer_t zbuf = ggml_backend_dev_buffer_from_host_ptr(uma_dev, mem, alloc_bytes, alloc_bytes);
+                        if (zbuf != nullptr) {
+                            buf         = zbuf;
+                            fresh_kind  = 0;
+                            uma_wrapped = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!uma_wrapped && !uma_fallback_warned) {
+            uma_fallback_warned = true;
+            fprintf(stderr, "%s: --moe-stream-uma 1: %s cannot map '%s' (%s) as a zero-copy GPU expert pool (%s), using host CPU pool\n",
+                    __func__, ggml_backend_dev_name(uma_dev), name.c_str(), ggml_type_name(pool->type),
+                    !dev_op_ok ? "MUL_MAT_ID unsupported for this shape or type" : "zero-copy host buffer import unavailable");
+        }
+    } else if (uma_active && uma_dev != nullptr && !uma_fallback_warned && (hugepages || el_on || sh_on || win_on || cpu_repack || n_repacked_blocks > 0)) {
+        uma_fallback_warned = true;
+        fprintf(stderr, "%s: --moe-stream-uma 1: zero-copy GPU pool wrapping skipped (%s), keeping unified-memory host CPU pools\n",
+                __func__, (cpu_repack || n_repacked_blocks > 0) ? "repacked CPU layout" : "hugepages or elastic/window pools");
     }
 
-    if (((uintptr_t) mem) % (hugepages ? MOE_STREAM_HUGE_ALIGN : MOE_STREAM_ALIGN)) {
-        if (fresh) { el_os_free_fresh(mem, nbytes); } else { moe_aligned_free(mem); }
-        throw std::runtime_error("expert pool allocation is not page-aligned");
+    // With the window the pool is the OS layer's fresh memory too (Windows: only the slots in use + the zero block committed)
+    if (mem == nullptr) {
+        mem = hugepages ? moe_hugepage_alloc(alloc_bytes) : (el_on || sh_on || win_on || zero_block_free(hugepages || pin))
+            ? el_os_alloc_fresh(alloc_bytes, fresh, win_on && !(el_on || sh_on) ? ((size_t) n_slots + n_zero)*nb_expert : SIZE_MAX)
+            : moe_aligned_alloc_n(alloc_bytes, uma_active ? uma_pool_align : MOE_STREAM_ALIGN);
+        if (fresh) {
+            fresh_kind = 1;
+        }
+    }
+
+    if (!mem) {
+        throw std::runtime_error(format("failed to allocate %zu bytes for the expert pool of '%s'", alloc_bytes, name.c_str()));
+    }
+
+    const size_t req_align = hugepages ? MOE_STREAM_HUGE_ALIGN
+                           : (uma_active && fresh_kind == 0 && !fresh) ? uma_pool_align : MOE_STREAM_ALIGN;
+    if (((uintptr_t) mem) % req_align) {
+        if (buf) { ggml_backend_buffer_free(buf); }
+        if (fresh_kind == 1) { el_os_free_fresh(mem, alloc_bytes); } else if (fresh_kind == 0) { moe_aligned_free(mem); }
+        throw std::runtime_error("expert pool allocation is not sufficiently aligned");
+    }
+    if (alloc_bytes > nbytes && !fresh) {
+        memset((char *) mem + nbytes, 0, alloc_bytes - nbytes);
     }
     if (!fresh) {   // not known fresh: every slot may hold RAM (the empty-slot count never counts it as still to come) and is not
                     // known zero (except the zero block, written below)
@@ -4313,54 +4476,63 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
     // CPU_REPACK buffer is all it takes; the sidecar stays plain and the read repacks into the slot.
     // A type or shape with no repacked kernel on this CPU (IQ4_XS has none on x86) gets the
     // plain buffer and the default behaviour.
-    ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(mem, nbytes);
-
-    if (!buf) {
-        if (fresh) { el_os_free_fresh(mem, nbytes); } else { moe_aligned_free(mem); }   // fresh memory is an mmap now in every mode
-        throw std::runtime_error(format("failed to wrap the expert pool of '%s'", name.c_str()));
-    }
-
     bool plugin_repack = false;   // this pool's slots hold the quant plugin's layout
-    if (cpu_repack || n_repacked_blocks > 0) {
-        ggml_backend_buffer_t rbuf = ggml_backend_cpu_repack_buffer_from_ptr(mem, nbytes);
+    if (uma_wrapped) {
+        if (ggml_backend_tensor_alloc(buf, pool, ggml_backend_buffer_get_base(buf)) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buf);
+            if (fresh_kind == 0) { moe_aligned_free(mem); }
+            throw std::runtime_error(format("failed to initialize unified-memory tensor for '%s'", name.c_str()));
+        }
+        uma_gpu_pool = true;
+    } else {
+        buf = ggml_backend_cpu_buffer_from_ptr(mem, nbytes);
 
-        if (rbuf) {
-            ggml_backend_buffer_init_tensor(rbuf, pool);   // sets pool->extra to the repack traits
+        if (!buf) {
+            if (fresh_kind == 1) { el_os_free_fresh(mem, alloc_bytes); } else if (fresh_kind == 0) { moe_aligned_free(mem); }
+            throw std::runtime_error(format("failed to wrap the expert pool of '%s'", name.c_str()));
+        }
 
-            if (pool->extra) {
-                ggml_backend_buffer_free(buf);
-                buf = rbuf;
-                cpu_repack_on = true;
-                // A plain layer still has to be converted on the way in; a repacked one does not
-                convert_on_read = cpu_repack;
-            } else {
-                ggml_backend_buffer_free(rbuf);   // no repacked kernel for this type/shape
+        if (cpu_repack || n_repacked_blocks > 0) {
+            ggml_backend_buffer_t rbuf = ggml_backend_cpu_repack_buffer_from_ptr(mem, nbytes);
 
-                // A quant plugin's format may have its own in-slot layout (repack_expert_slot). Only a plugin type, and only
-                // when the plugin has no GPU kernel for it: nothing says a GPU kernel reads that layout, and the engine
-                // copies RAM slots to a GPU in several places. Such a pool then counts as repacked like a built-in one
-                // (cpu_repack_on), so the same rules keep its slots on the CPU.
-                const bool ext_type = pool->type >= GGML_TYPE_EXT0 && pool->type <= GGML_TYPE_EXT5;
-                const ggml_quant_plugin_api * qapi = cpu_repack && ext_type ? ggml_quant_plugin_get() : nullptr;
-                const bool gpu_kernel = ext_type && (ggml_quant_plugin_has_cuda(pool->type, false) || ggml_quant_plugin_has_cuda(pool->type, true));
-                if (qapi && qapi->repack_expert_slot && !gpu_kernel &&
-                        qapi->repack_expert_slot((int32_t) pool->type, nullptr, nullptr, pool->ne[0], pool->ne[1]) == 0) {
-                    plugin_repack    = true;
-                    plugin_repack_on = true;
-                    cpu_repack_on    = true;
-                    convert_on_read  = true;
-                } else if (n_repacked_blocks > 0) {
-                    throw std::runtime_error(format(
-                                "the sidecar is stored in the '%s' layout but this CPU has no repacked "
-                                "kernel for %s of this shape, so its weights cannot be read at all",
-                                sidecar_layout.c_str(), ggml_type_name(pool->type)));
+            if (rbuf) {
+                ggml_backend_buffer_init_tensor(rbuf, pool);   // sets pool->extra to the repack traits
+
+                if (pool->extra) {
+                    ggml_backend_buffer_free(buf);
+                    buf = rbuf;
+                    cpu_repack_on = true;
+                    // A plain layer still has to be converted on the way in; a repacked one does not
+                    convert_on_read = cpu_repack;
+                } else {
+                    ggml_backend_buffer_free(rbuf);   // no repacked kernel for this type/shape
+
+                    // A quant plugin's format may have its own in-slot layout (repack_expert_slot). Only a plugin type, and only
+                    // when the plugin has no GPU kernel for it: nothing says a GPU kernel reads that layout, and the engine
+                    // copies RAM slots to a GPU in several places. Such a pool then counts as repacked like a built-in one
+                    // (cpu_repack_on), so the same rules keep its slots on the CPU.
+                    const bool ext_type = pool->type >= GGML_TYPE_EXT0 && pool->type <= GGML_TYPE_EXT5;
+                    const ggml_quant_plugin_api * qapi = cpu_repack && ext_type ? ggml_quant_plugin_get() : nullptr;
+                    const bool gpu_kernel = ext_type && (ggml_quant_plugin_has_cuda(pool->type, false) || ggml_quant_plugin_has_cuda(pool->type, true));
+                    if (qapi && qapi->repack_expert_slot && !gpu_kernel &&
+                            qapi->repack_expert_slot((int32_t) pool->type, nullptr, nullptr, pool->ne[0], pool->ne[1]) == 0) {
+                        plugin_repack    = true;
+                        plugin_repack_on = true;
+                        cpu_repack_on    = true;
+                        convert_on_read  = true;
+                    } else if (n_repacked_blocks > 0) {
+                        throw std::runtime_error(format(
+                                    "the sidecar is stored in the '%s' layout but this CPU has no repacked "
+                                    "kernel for %s of this shape, so its weights cannot be read at all",
+                                    sidecar_layout.c_str(), ggml_type_name(pool->type)));
+                    }
                 }
             }
         }
-    }
 
-    pool->buffer = buf;
-    pool->data   = (uint8_t *) mem;
+        pool->buffer = buf;
+        pool->data   = (uint8_t *) mem;
+    }
 
     // --moe-stream-gpu-waves sends the waves' expert matmuls to the device, which needs the pool
     // copied there, and a CPU_REPACK buffer type cannot be copied (no cpy_tensor). With a repacked pool
@@ -4396,7 +4568,7 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
     }
 #endif
 #ifdef _WIN32
-    if (!(el_on || sh_on || win_on) && !VirtualLock(mem, lock_bytes)) {
+    if (!(el_on || sh_on || win_on || fresh_kind == 2) && !VirtualLock(mem, lock_bytes)) {   // (a GPU host buffer is pinned already)
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -4405,7 +4577,7 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         }
     }
 #else
-    if (!(el_on || sh_on || win_on) && mlock(mem, lock_bytes) != 0) {   // (the window returns / moves pages too)
+    if (!(el_on || sh_on || win_on || fresh_kind == 2) && mlock(mem, lock_bytes) != 0) {   // (the window returns / moves pages too; a GPU host buffer is pinned already)
         static bool warned = false;
 
         if (!warned) {
@@ -4429,8 +4601,8 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
     ctxs.push_back(ctx);
     bufs.push_back(buf);
     pool_mem.push_back(mem);
-    pool_size.push_back(nbytes);
-    pool_fresh.push_back(fresh ? 1 : 0);
+    pool_size.push_back(alloc_bytes);
+    pool_fresh.push_back(fresh_kind);
     // The CPU backend waits on this pool. It gets the whole allocation and one slice's bytes,
     // because the op's src0 is a tensor that points *into* the allocation and the match has to be by
     // range: an equality lookup on the allocation pointer silently matches nothing.
@@ -8915,7 +9087,26 @@ bool llama_moe_stream::rd_input_hook(ggml_backend_t split_backend, int n_inputs,
     }
     const int64_t t0  = ggml_time_us();
     uint32_t *    ctr = rd_counter(il);
+    bool          spun_ready = false;
     if (moe_atomic_load_acquire_u32(ctr) == ne_call_seq) {
+        spun_ready = true;
+    } else if (mark_spin_test_us > 0) {
+        const int64_t deadline = t0 + mark_spin_test_us;
+        for (;;) {
+            for (int k = 0; k < 32; k++) {
+                if (moe_atomic_load_acquire_u32(ctr) == ne_call_seq) {
+                    spun_ready = true;
+                    n_mark_spin_hits.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                std::this_thread::yield();
+            }
+            if (spun_ready || ggml_time_us() >= deadline) {
+                break;
+            }
+        }
+    }
+    if (spun_ready) {
         n_rd_ready += 1;
     } else {
         n_rd_event += 1;
@@ -9051,6 +9242,30 @@ void llama_moe_stream::ne_wait_posted(std::unique_lock<std::mutex> & lock) {
         if (moe_atomic_load_acquire_u32(&ne_counter(il)) == ne_call_seq) {
             (src ? n_ws_gpu_ready : n_ne_ready) += 1;
             return;
+        }
+        if (mark_spin_test_us > 0) {
+            const uint32_t want = ne_call_seq;
+            lock.unlock();
+            const int64_t deadline = ggml_time_us() + mark_spin_test_us;
+            bool spun = false;
+            for (;;) {
+                for (int k = 0; k < 32; k++) {
+                    if (moe_atomic_load_acquire_u32(&ne_counter(il)) == want) {
+                        spun = true;
+                        n_mark_spin_hits.fetch_add(1, std::memory_order_relaxed);
+                        break;
+                    }
+                    std::this_thread::yield();
+                }
+                if (spun || ggml_time_us() >= deadline) {
+                    break;
+                }
+            }
+            lock.lock();
+            if (spun) {
+                (src ? n_ws_gpu_ready : n_ne_ready) += 1;
+                return;
+            }
         }
         (src ? n_ws_gpu_event : n_ne_event) += 1;
         lock.unlock();
@@ -9228,7 +9443,7 @@ int llama_moe_stream::n_waves_base(int64_t n_tok) const {
 }
 
 bool llama_moe_stream::defer_wait(int64_t n_tok, bool multi) const {
-    if (!overlap || cpu_repack_on.load() || multi) {
+    if (!overlap || cpu_repack_on.load() || multi || uma_gpu_pool) {
         return false;
     }
 
@@ -11367,6 +11582,11 @@ void llama_moe_stream::win_print_stats() const {
 
 void llama_moe_stream::remap(llama_moe_stream_layer & sl, const int32_t * ids, const int32_t * pred,
         int64_t n, int64_t n_tok, int32_t wave, int32_t * out_slots, int64_t t_op0) {
+    if (uma_gpu_pool && wave > 0 && uma_backend != nullptr) {
+        // In a multi-wave ubatch on a zero-copy unified-memory pool, wave w's remap op does not depend on wave w-1's
+        // expert matmuls: wait for wave w-1's GPU reads of this layer's slots to finish before unpinning and refilling them.
+        ggml_backend_synchronize(uma_backend);
+    }
     if (psplit_test_borrow > 0 && wave == 0 && !decode_phase && n_tok > 1 && !il_of_moe.empty() && sl.il == il_of_moe[0]) {
         std::vector<int32_t> got;   // TEST ONLY: as the VRAM side would - once per prompt call, before any streamed layer's op of it
         bool first;
@@ -14575,15 +14795,21 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     if (vx_ready) {
         return true;
     }
+    if (uma_active) {
+        vx_flags_off("unified-memory mode (--moe-stream-uma 1) shares physical RAM with the GPU without a duplicate VRAM pool");
+        return false;
+    }
     if (dev == nullptr || buft == nullptr) {
         vx_flags_off("no GPU device");
         return false;
     }
     // VRAM follow's two needs are checked here, before the tail is decided (the tail needs VRAM follow): a backend without a
     // device-wide wait or a second instance runs the pool without VRAM follow (a fixed set, no tail)
+    const bool test_vram_cpu = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                               getenv("MOE_STREAM_TEST_VRAM_ON_CPU") && atoi(getenv("MOE_STREAM_TEST_VRAM_ON_CPU")) != 0;
     if (p1.vram_follow) {
         ggml_backend_reg_t xr = ggml_backend_dev_backend_reg(dev);
-        const bool has_sync = xr && ggml_backend_reg_get_proc_address(xr, "ggml_backend_cuda_device_sync") != nullptr;
+        const bool has_sync = test_vram_cpu || (xr && ggml_backend_reg_get_proc_address(xr, "ggml_backend_cuda_device_sync") != nullptr);
         ggml_backend_t probe = has_sync ? ggml_backend_dev_init(dev, nullptr) : nullptr;
         if (probe != nullptr) {
             ggml_backend_free(probe);
@@ -14601,7 +14827,9 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     vx_auto = p1.vram_free > 0;
     vx_dev  = dev;
 
-    // 1. the groups: one pool per (type, shape) of the streamed layers' experts (Ling: one)
+    // 1. the format groups: one format group per (type, shape) of the streamed layers' experts (Ling: one); when
+    // --moe-stream-vram-chunk is active, step 2 splits oversized format groups into contiguous layer sub-groups in vx_groups.
+    std::vector<vx_group_t> fmt_groups;
     vx_groups.clear();
     for (const int32_t il : il_of_moe) {
         llama_moe_stream_layer * sl = layers[il].get();
@@ -14618,26 +14846,30 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     (long long) u->ne[0], (long long) u->ne[1]).c_str());
             return false;
         }
-        int32_t gi = -1;
-        for (size_t i = 0; i < vx_groups.size(); i++) {
-            const auto & G = vx_groups[i];
+        int32_t fi = -1;
+        for (size_t i = 0; i < fmt_groups.size(); i++) {
+            const auto & G = fmt_groups[i];
             if (G.t_gate == g->type && G.ne_gate[0] == g->ne[0] && G.ne_gate[1] == g->ne[1] &&
                 G.t_down == d->type && G.ne_down[0] == d->ne[0] && G.ne_down[1] == d->ne[1]) {
-                gi = (int32_t) i;
+                fi = (int32_t) i;
                 break;
             }
         }
-        if (gi < 0) {
+        if (fi < 0) {
             vx_group_t G;
             G.t_gate = g->type; G.ne_gate[0] = g->ne[0]; G.ne_gate[1] = g->ne[1];
             G.t_down = d->type; G.ne_down[0] = d->ne[0]; G.ne_down[1] = d->ne[1];
-            vx_groups.push_back(G);
-            gi = (int32_t) vx_groups.size() - 1;
+            G.fmt_group = (int32_t) fmt_groups.size();
+            fmt_groups.push_back(G);
+            fi = (int32_t) fmt_groups.size() - 1;
         }
-        vx_groups[gi].layers.push_back(il);
-        sl->vx_group = gi;
-        sl->vx_li    = (int32_t) vx_groups[gi].layers.size() - 1;
+        fmt_groups[fi].layers.push_back(il);
+        sl->vx_fmt_group = fi;
+        sl->vx_fmt_li    = (int32_t) fmt_groups[fi].layers.size() - 1;
+        sl->vx_group     = fi;
+        sl->vx_li        = sl->vx_fmt_li;
     }
+    vx_groups = fmt_groups;
 
     // --moe-stream-vram-parallel 1: only with the GPU producer (decided at load, before this): its "router done" is what lets the
     // CPU split start while the GPU runs the device pass; without it the pass stays after the CPU experts.
@@ -14701,7 +14933,129 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         }
     }
 
-    // 2. sizes, and the free VRAM before anything is allocated
+    // 2. sizes, optional chunk / storage-buffer sub-group partitioning, and the free VRAM before anything is allocated
+    size_t vfree = 0, vtotal = 0;
+    ggml_backend_dev_memory(dev, &vfree, &vtotal);
+
+    int64_t bytes_per_n_fmt = 0;
+    for (const auto & F : fmt_groups) {
+        const int64_t nb_gu = (int64_t) ggml_row_size(F.t_gate, F.ne_gate[0])*2*F.ne_gate[1];
+        const int64_t nb_dn = (int64_t) ggml_row_size(F.t_down, F.ne_down[0])*F.ne_down[1];
+        bytes_per_n_fmt += (nb_gu + nb_dn)*(int64_t) F.layers.size();
+    }
+
+    static const int64_t test_vram_chunk = getenv("MOE_STREAM_TEST_VRAM_CHUNK") ? (int64_t) atoll(getenv("MOE_STREAM_TEST_VRAM_CHUNK")) : 0;
+    const int64_t chunk_bytes = test_vram_chunk > 0 ? test_vram_chunk
+                              : p1.vram_chunk == 1  ? ((int64_t) 2 << 30)
+                              : p1.vram_chunk > 1   ? p1.vram_chunk : 0;
+    int64_t single_layer_n_cap = INT64_MAX;
+    std::vector<int64_t> grp_slice_cap(vx_groups.size(), INT64_MAX);
+
+    if (chunk_bytes > 0) {
+        const auto probe_op_slices = [&](const vx_group_t & F, int64_t hi_slices) -> int64_t {
+            const auto supports_at = [&](int64_t ns) -> bool {
+                ggml_context * pctx = ggml_init({ /* .mem_size = */ 8*ggml_tensor_overhead(), /* .mem_buffer = */ nullptr, /* .no_alloc = */ true });
+                if (!pctx) {
+                    return false;
+                }
+                ggml_tensor * s0_gu = ggml_new_tensor_3d(pctx, F.t_gate, F.ne_gate[0], 2*F.ne_gate[1], ns);
+                ggml_tensor * s1_gu = ggml_new_tensor_3d(pctx, GGML_TYPE_F32, F.ne_gate[0], n_expert_used, 1);
+                ggml_tensor * s0_dn = ggml_new_tensor_3d(pctx, F.t_down, F.ne_down[0], F.ne_down[1], ns);
+                ggml_tensor * s1_dn = ggml_new_tensor_3d(pctx, GGML_TYPE_F32, F.ne_down[0], n_expert_used, 1);
+                ggml_tensor * ids   = ggml_new_tensor_2d(pctx, GGML_TYPE_I32, n_expert_used, 1);
+                ggml_tensor * op_gu = ggml_mul_mat_id(pctx, s0_gu, s1_gu, ids);
+                ggml_tensor * op_dn = ggml_mul_mat_id(pctx, s0_dn, s1_dn, ids);
+                const bool ok = ggml_backend_dev_supports_op(dev, op_gu) && ggml_backend_dev_supports_op(dev, op_dn);
+                ggml_free(pctx);
+                return ok;
+            };
+            const int64_t min_s = (int64_t) n_zero + 1;
+            const int64_t max_s = std::max<int64_t>(min_s, hi_slices);
+            if (supports_at(max_s)) {
+                return max_s;
+            }
+            if (!supports_at(min_s)) {
+                return 0;
+            }
+            int64_t lo = min_s, hi = max_s;
+            while (lo < hi) {
+                const int64_t mid = lo + (hi - lo + 1)/2;
+                if (supports_at(mid)) { lo = mid; } else { hi = mid - 1; }
+            }
+            return lo;
+        };
+
+        const int64_t list_cap = vx_auto ? (p1.vram_experts > 0 ? (int64_t) p1.vram_experts : (int64_t) vx_list_min) : (int64_t) N;
+        const int64_t vram_cap = bytes_per_n_fmt > 0 ? std::max<int64_t>(1, (int64_t) vfree/bytes_per_n_fmt + 1) : list_cap;
+        const int64_t n_per_layer_max = std::max<int64_t>(1, std::min<int64_t>(list_cap, vram_cap));
+
+        vx_groups.clear();
+        grp_slice_cap.clear();
+        for (size_t fi = 0; fi < fmt_groups.size(); fi++) {
+            const auto & F = fmt_groups[fi];
+            const int64_t nb_gu = (int64_t) ggml_row_size(F.t_gate, F.ne_gate[0])*2*F.ne_gate[1];
+            const int64_t nb_dn = (int64_t) ggml_row_size(F.t_down, F.ne_down[0])*F.ne_down[1];
+            const int64_t nb_pl = std::max<int64_t>(1, nb_gu + nb_dn);
+            const int64_t vp_1l = vp ? (int64_t) n_expert_used*n_expert_total*(int64_t) sizeof(int32_t) : 0;
+            const int64_t hi_pr = (int64_t) F.layers.size()*n_per_layer_max + (int64_t) n_zero + 2*((int64_t) n_slots + (int64_t) n_zero);
+            const int64_t op_cap = probe_op_slices(F, hi_pr);
+            if (op_cap <= (int64_t) n_zero) {
+                vx_flags_off(format("%s does not support MUL_MAT_ID for %s / %s expert pools",
+                        ggml_backend_dev_name(dev), ggml_type_name(F.t_gate), ggml_type_name(F.t_down)).c_str());
+                return false;
+            }
+            const int64_t ch_cap_1l = chunk_bytes > vp_1l ? (chunk_bytes - vp_1l)/nb_pl : 0;
+            const int64_t max_n_1l  = std::min<int64_t>(op_cap, ch_cap_1l) - (int64_t) n_zero;
+            if (max_n_1l < 1) {
+                vx_flags_off(format("not even 1 expert in a 1-layer chunk fits inside %.1f MiB / storage-buffer limit on %s",
+                        chunk_bytes/1048576.0, ggml_backend_dev_name(dev)).c_str());
+                return false;
+            }
+            single_layer_n_cap = std::min<int64_t>(single_layer_n_cap, max_n_1l);
+            const int64_t n_pl_f   = std::min<int64_t>(n_per_layer_max, max_n_1l);
+            const int64_t max_L_op = (op_cap - (int64_t) n_zero)/std::max<int64_t>(1, n_pl_f);
+            const int64_t max_L_ch = chunk_bytes > (int64_t) n_zero*nb_pl
+                    ? (chunk_bytes - (int64_t) n_zero*nb_pl)/std::max<int64_t>(1, n_pl_f*nb_pl + vp_1l) : 0;
+            const int64_t max_L    = std::max<int64_t>(1, std::min<int64_t>((int64_t) F.layers.size(), std::min<int64_t>(max_L_op, max_L_ch)));
+            const size_t  K        = (F.layers.size() + (size_t) max_L - 1)/(size_t) max_L;
+            const size_t  base_len = F.layers.size()/K;
+            const size_t  rem_len  = F.layers.size()%K;
+            size_t off = 0;
+            for (size_t c = 0; c < K; c++) {
+                const size_t len = base_len + (c < rem_len ? 1 : 0);
+                vx_group_t G_sub = F;
+                G_sub.layers.assign(F.layers.begin() + (ptrdiff_t) off, F.layers.begin() + (ptrdiff_t) (off + len));
+                const int32_t gi_new = (int32_t) vx_groups.size();
+                for (size_t li = 0; li < G_sub.layers.size(); li++) {
+                    llama_moe_stream_layer * sl = layers[G_sub.layers[li]].get();
+                    sl->vx_group = gi_new;
+                    sl->vx_li    = (int32_t) li;
+                }
+                const int64_t vp_sub = vp_1l*(int64_t) G_sub.layers.size();
+                const int64_t ch_cap = chunk_bytes > vp_sub ? (chunk_bytes - vp_sub)/nb_pl : 0;
+                vx_groups.push_back(std::move(G_sub));
+                grp_slice_cap.push_back(std::min<int64_t>(op_cap, ch_cap));
+                off += len;
+            }
+        }
+        if (!vx_auto && single_layer_n_cap < (int64_t) N) {
+            fprintf(stderr, "%s: --moe-stream-vram-chunk %.1f MiB caps --moe-stream-vram-experts %u to %lld per layer\n",
+                    __func__, chunk_bytes/1048576.0, N, (long long) single_layer_n_cap);
+            N = (uint32_t) single_layer_n_cap;
+            p1.vram_experts = N;
+            vx_list_min = std::min<uint32_t>(vx_list_min, N);
+            if (!vx_non_uniform) {
+                for (auto & kv : vx_file_layers) {
+                    if (kv.second.size() > N) { kv.second.resize(N); }
+                }
+            }
+        }
+        if (vx_groups.size() > fmt_groups.size()) {
+            fprintf(stderr, "%s: --moe-stream-vram-chunk: split %zu format group(s) into %zu contiguous VRAM pool buffer(s) (chunk cap %.1f MiB)\n",
+                    __func__, fmt_groups.size(), vx_groups.size(), chunk_bytes/1048576.0);
+        }
+    }
+
     int64_t bytes_per_n = 0;   // one expert in every streamed layer
     int64_t bytes_zero  = 0;
     for (auto & G : vx_groups) {
@@ -14714,31 +15068,32 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         }
     }
 
-    size_t vfree = 0, vtotal = 0;
-    ggml_backend_dev_memory(dev, &vfree, &vtotal);
-
     // With the auto pool the layers may differ by one place. The fit and the closed loop then
     // count PLACES (one place = bytes_per_n / layers = 2.99 MiB for Ling), not whole rows of one place in every layer (110.57 MiB): the closed
     // loop gave 77-93 MiB back to rounding. One pool group only (Ling); MOE_STREAM_TEST_UNIFORM_N=1 (test only) keeps the uniform N, so old and
     // new run from one binary; MOE_STREAM_TEST_VX_CAP_TOTAL=<places> (test only) caps the places in total (an exact gate with N + 1 in some layers).
     static const bool test_uniform = getenv("MOE_STREAM_TEST_UNIFORM_N") && atoi(getenv("MOE_STREAM_TEST_UNIFORM_N")) != 0;
     static const int64_t test_cap_total = getenv("MOE_STREAM_TEST_VX_CAP_TOTAL") ? (int64_t) atoll(getenv("MOE_STREAM_TEST_VX_CAP_TOTAL")) : 0;
-    const bool    fine   = vx_auto && vx_groups.size() == 1 && !test_uniform;
-    const int64_t Lg0    = fine ? (int64_t) vx_groups[0].layers.size() : 1;
+    const bool    fine   = vx_auto && fmt_groups.size() == 1 && !test_uniform;
+    const int64_t Lg0    = fine ? (int64_t) fmt_groups[0].layers.size() : 1;
     const int64_t place_b = fine ? bytes_per_n/std::max<int64_t>(1, Lg0) : bytes_per_n;   // the unit of the fit
     vx_extra = 0;
     int64_t cap_u = INT64_MAX;   // the most units (places, or N) the pinned N / the lists / the test cap allow
-    // the list of layer il is cut to its places: N, or N + 1 in the first vx_extra layers of the group
+    // the list of layer il is cut to its places: N, or N + 1 in the first vx_extra layers of the format group
     // (rebuilt from the whole list file every time: the loop may also GROW a layer's list again, and a resize of a cut list would pad it with zeros)
     const auto cut_lists = [&](uint32_t N_now) {
         if (vx_non_uniform && !test_uniform) {
+            std::vector<int64_t> sub_used(vx_groups.size(), 0);
             for (size_t gi = 0; gi < vx_groups.size(); gi++) {
-                const auto & G = vx_groups[gi];
-                const size_t total_places = (size_t) N_now * G.layers.size() + (gi == 0 ? (size_t) vx_extra : 0u);
+                sub_used[gi] = (int64_t) vx_groups[gi].layers.size();
+            }
+            for (size_t fi = 0; fi < fmt_groups.size(); fi++) {
+                const auto & F = fmt_groups[fi];
+                const size_t total_places = (size_t) N_now * F.layers.size() + (fi == 0 ? (size_t) vx_extra : 0u);
                 std::map<int32_t, size_t> cnt_per_il;
                 // (in the file, score, -rank, -il): the file's entries before the id-order rest appended after them
                 std::vector<std::tuple<int32_t, int64_t, int32_t, int32_t>> cands;
-                for (const int32_t il : G.layers) {
+                for (const int32_t il : F.layers) {
                     const auto & full   = vx_rank_lists.at(il);
                     const auto & scs    = vx_file_scores.at(il);
                     const size_t n_file = vx_file_part(il, full.size());
@@ -14749,15 +15104,21 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     }
                 }
                 std::sort(cands.begin(), cands.end(), std::greater<>());
-                size_t used = G.layers.size();
+                size_t used = F.layers.size();
                 for (const auto & c : cands) {
                     if (used >= total_places) {
                         break;
                     }
-                    cnt_per_il[-std::get<3>(c)]++;
+                    const int32_t il = -std::get<3>(c);
+                    const int32_t gi = layers[il]->vx_group;
+                    if (chunk_bytes > 0 && gi >= 0 && sub_used[(size_t) gi] + (int64_t) n_zero >= grp_slice_cap[(size_t) gi]) {
+                        continue;
+                    }
+                    cnt_per_il[il]++;
+                    if (gi >= 0) { sub_used[(size_t) gi]++; }
                     used++;
                 }
-                for (const int32_t il : G.layers) {
+                for (const int32_t il : F.layers) {
                     const auto & full = vx_rank_lists.at(il);
                     const size_t n    = std::min<size_t>(full.size(), cnt_per_il[il]);
                     vx_file_layers[il].assign(full.begin(), full.begin() + n);
@@ -14768,7 +15129,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         for (auto & kv : vx_file_layers) {
             const auto & slc  = *layers[kv.first];
             const auto & full = vx_rank_lists.at(kv.first);
-            const size_t n    = std::min<size_t>(full.size(), N_now + ((uint32_t) slc.vx_li < vx_extra ? 1u : 0u));
+            const size_t n    = std::min<size_t>(full.size(), N_now + ((uint32_t) slc.vx_fmt_li < vx_extra ? 1u : 0u));
             kv.second.assign(full.begin(), full.begin() + n);
         }
     };
@@ -14798,6 +15159,9 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         const int64_t room  = (int64_t) vfree - bytes_zero - p1.vram_free - vx_growth_used;
         const int64_t n_fit = room > 0 ? room/std::max<int64_t>(1, place_b) : 0;   // places (fine) or N (uniform)
         int64_t n_cap = (p1.vram_experts > 0 ? (int64_t) p1.vram_experts : (int64_t) vx_list_min)*Lg0;
+        if (single_layer_n_cap < INT64_MAX) {
+            n_cap = std::min<int64_t>(n_cap, single_layer_n_cap*Lg0);
+        }
         if (fine && test_cap_total > 0) {
             n_cap = std::min<int64_t>(n_cap, test_cap_total);
         }
@@ -15049,12 +15413,40 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             }
         }
     }
+    const auto real_of_group = [&](size_t gi) -> int32_t {
+        int32_t r = 0;
+        for (const int32_t il : vx_groups[gi].layers) {
+            r += (int32_t) vx_file_layers.at(il).size();
+        }
+        return r;
+    };
+    if (tail_on && chunk_bytes > 0) {
+        const size_t tg = (size_t) tail_group;
+        if ((int64_t) tail_n + (int64_t) real_of_group(tg) + (int64_t) n_zero > grp_slice_cap[tg]) {
+            tail_on = false; tail_preset = false; tail_n = 0; tail_copy_n = 0; tail_first = 0; tail_group = 0;
+            tail_proj.clear(); tail_pgroup.clear(); tail_off_g.clear(); tail_dn_r1.clear(); tail_tc = 0;
+            tail_onewave_host = false; tail_onewave_max = 0;
+            ca_want = false; ca_one_wave = false; ca_on = false; ca_sets = 1; ca_set_places = 0;
+            tail_why = "exceeds --moe-stream-vram-chunk or backend storage-buffer limit";
+        }
+    }
+    if (chunk_bytes > 0 && vx_auto) {
+        for (size_t gi = 0; gi < vx_groups.size(); gi++) {
+            const int64_t t_sl = tail_on && (int32_t) gi == tail_group ? (int64_t) tail_n : 0;
+            const int64_t max_real = grp_slice_cap[gi] - t_sl - (int64_t) n_zero;
+            const int64_t L_sub    = std::max<int64_t>(1, (int64_t) vx_groups[gi].layers.size());
+            const int64_t max_n_g  = max_real/L_sub;
+            const int64_t l0       = vx_groups[gi].layers.empty() ? 0 : (int64_t) layers[vx_groups[gi].layers[0]]->vx_fmt_li;
+            const int64_t rem_g    = std::max<int64_t>(0, max_real - max_n_g*L_sub);
+            cap_u = std::min<int64_t>(cap_u, fine ? max_n_g*Lg0 + std::min<int64_t>(Lg0 - 1, l0 + rem_g) : max_n_g);
+        }
+    }
     if (!tail_on) {
         fprintf(stderr, "%s: the pool has no tail (%s): the GPU-wave pool copies stay in the compute buffer\n", __func__, tail_why.c_str());
     }
     for (size_t gi = 0; gi < vx_groups.size(); gi++) {
         auto & G = vx_groups[gi];
-        G.n_real   = (int32_t) (N*G.layers.size()) + (int32_t) vx_extra;   // ([tail | held | zero])
+        G.n_real   = real_of_group(gi);   // ([tail | held | zero])
         G.n_zero_g = (int32_t) n_zero;
         G.n_tail   = tail_on && (int32_t) gi == tail_group ? tail_n : 0;
         G.p0       = G.n_tail;
@@ -15099,7 +15491,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             auto & G = vx_groups[gi];
             const bool tg = tail_on && (int32_t) gi == tail_group;   // only the tail group holds the tail
             // [tail | held places | zero slices] - the device pass's views start after the tail
-            G.n_real   = (int32_t) (N*G.layers.size()) + (int32_t) vx_extra;
+            G.n_real   = real_of_group(gi);
             G.n_zero_g = (int32_t) n_zero;
             G.n_tail   = tg ? tail_n : 0;
             G.p0       = G.n_tail;
@@ -15342,8 +15734,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                     lend_slot[(size_t) rk[j][1]][(size_t) rk[j][0]] = G.p0 + (int32_t) j;
                 }
             }
-            const bool score_split = vx_non_uniform && !test_uniform;
-            int32_t next_base = G.p0;                                                             // (after the tail; score-allocated lists)
+            int32_t next_base = G.p0;                                                             // (after the tail)
             for (size_t li = 0; li < G.layers.size(); li++) {
                 llama_moe_stream_layer & sl = *layers[G.layers[li]];
                 const auto & lst = vx_file_layers.at(sl.il);
@@ -15352,7 +15743,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                 sl.vx_slot.assign(n_expert_total, -1);
                 sl.vx_list = lst;
                 const uint32_t n_li = (uint32_t) lst.size();                                      // N, or N + 1 in the first vx_extra layers; a score-allocated list has its own count
-                const int32_t  base = score_split ? next_base : G.p0 + (int32_t) (li*N + std::min<size_t>(li, vx_extra));   // (after the tail)
+                const int32_t  base = next_base;                                                  // cumulative within this sub-group
                 for (uint32_t s = 0; s < n_li; s++) {
                     const int32_t e    = lst[s];
                     const int32_t slot = lend_slot.empty() ? base + (int32_t) s : lend_slot[li][s];
@@ -15934,6 +16325,10 @@ void llama_moe_stream::vf_setup(ggml_backend_dev_t dev) {
     vx_pad_init();   // the places' row padding (the places get other uses only with VRAM follow, which fills them again)
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     vf_dev_sync = reg ? (bool (*)(ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_device_sync") : nullptr;
+    if (vf_dev_sync == nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            getenv("MOE_STREAM_TEST_VRAM_ON_CPU") && atoi(getenv("MOE_STREAM_TEST_VRAM_ON_CPU")) != 0) {
+        vf_dev_sync = +[](ggml_backend_dev_t) -> bool { return true; };   // TEST ONLY: CPU backend is host-synchronous
+    }
     vf_dev      = dev;
     if (vf_dev_sync == nullptr) {
         moe_stream_fail("--moe-stream-vram-follow: the backend of %s has no device-wide wait (ggml_backend_cuda_device_sync) - "
@@ -16118,10 +16513,17 @@ void llama_moe_stream::vf_tick() {
             }
         }
     }
+    const int32_t S = (int32_t) p1.vram_follow_swaps;
+    std::vector<std::vector<cand>> hot_g(vx_groups.size()), cold_g(vx_groups.size());
+    std::vector<size_t>            nh_g(vx_groups.size(), 0), nc_g(vx_groups.size(), 0), hi_g(vx_groups.size(), 0);
+    std::vector<int32_t>           r_g(vx_groups.size(), 0);
+    std::vector<uint8_t>           stopped_g(vx_groups.size(), 0);
+    int32_t max_fmt = -1;
     for (size_t gi = 0; gi < vx_groups.size(); gi++) {
         const auto & G = vx_groups[gi];
-        const int32_t S = (int32_t) p1.vram_follow_swaps;
-        std::vector<cand> hot, cold;
+        max_fmt = std::max<int32_t>(max_fmt, std::max<int32_t>(0, G.fmt_group));
+        auto & hot  = hot_g[gi];
+        auto & cold = cold_g[gi];
         for (const int32_t il : G.layers) {
             const auto & sl = *layers[il];
             for (uint32_t e = 0; e < n_expert_total; e++) {
@@ -16136,20 +16538,43 @@ void llama_moe_stream::vf_tick() {
             }
         }
         // the order is total (the key, then the layer, then the expert), so a tick decides the same swaps from the same counts
-        const size_t nh = std::min(hot.size(), (size_t) std::max<int32_t>(4*S, 256));
-        std::partial_sort(hot.begin(), hot.begin() + nh, hot.end(), [](const cand & a, const cand & b) {
+        nh_g[gi] = std::min(hot.size(), (size_t) std::max<int32_t>(4*S, 256));
+        std::partial_sort(hot.begin(), hot.begin() + nh_g[gi], hot.end(), [](const cand & a, const cand & b) {
             return a.key != b.key ? a.key > b.key : a.il != b.il ? a.il < b.il : a.e < b.e; });
-        const size_t nc = std::min(cold.size(), (size_t) S);
-        std::partial_sort(cold.begin(), cold.begin() + nc, cold.end(), [](const cand & a, const cand & b) {
+        nc_g[gi] = std::min(cold.size(), (size_t) S);
+        std::partial_sort(cold.begin(), cold.begin() + nc_g[gi], cold.end(), [](const cand & a, const cand & b) {
             return a.key != b.key ? a.key < b.key : a.il != b.il ? a.il < b.il : a.e < b.e; });
-        int32_t r = 0, done = 0;
-        for (size_t hi = 0; hi < nh && done < S && r < (int32_t) nc; hi++) {
-            const cand & h = hot[hi];
-            const cand & c = cold[r];
+    }
+    for (int32_t fg = 0; fg <= max_fmt; fg++) {
+        int32_t done = 0;
+        while (done < S) {
+            size_t best_gi = SIZE_MAX;
+            for (size_t gi = 0; gi < vx_groups.size(); gi++) {
+                if (std::max<int32_t>(0, vx_groups[gi].fmt_group) != fg || stopped_g[gi] ||
+                        hi_g[gi] >= nh_g[gi] || r_g[gi] >= (int32_t) nc_g[gi]) {
+                    continue;
+                }
+                if (best_gi == SIZE_MAX) {
+                    best_gi = gi;
+                } else {
+                    const cand & a = hot_g[gi][hi_g[gi]];
+                    const cand & b = hot_g[best_gi][hi_g[best_gi]];
+                    if (a.key != b.key ? a.key > b.key : a.il != b.il ? a.il < b.il : a.e < b.e) {
+                        best_gi = gi;
+                    }
+                }
+            }
+            if (best_gi == SIZE_MAX) {
+                break;
+            }
+            const size_t gi = best_gi;
+            const cand & h  = hot_g[gi][hi_g[gi]++];
+            const cand & c  = cold_g[gi][r_g[gi]];
             const uint32_t hr = (uint32_t) (h.key >> 32), cr = (uint32_t) (c.key >> 32);
             if (!((uint64_t) hr > (uint64_t) std::floor((double) cr*p1.vram_follow_ratio) + p1.vram_follow_margin)) {
                 vf_hysteresis_stop += 1;
-                break;
+                stopped_g[gi] = 1;
+                continue;
             }
             auto & A = *layers[h.il];
             int32_t s = A.expert_slot[h.e];
@@ -16201,7 +16626,7 @@ void llama_moe_stream::vf_tick() {
             vf_jobs.push_back(std::move(j));
             vf_swaps += 1;
             done += 1;
-            r += 1;
+            r_g[gi] += 1;
             if (!p1.vram_copyback && !vf_ev_tick) {
                 copy_one(made.back());
             }
@@ -21708,11 +22133,14 @@ bool llama_moe_stream::el_gpu_view(int64_t u) const {
     // In a window call none - its one-wave pieces stay on the host (the graph flags them as waves)
     // Nor a one-wave ubatch the tail rule keeps on the host (onewave_host) - by either branch: its rows may reach
     // --moe-stream-gpu-waves, and its CPU matmuls must read the whole pool (the window's room above the start size)
-    return (el_on || sh_on || win_on) && el_has_gpu && !cpu_repack_on.load() && u >= el_offload_min() && !win_host_call && !onewave_host(u) &&
+    return !uma_gpu_pool && (el_on || sh_on || win_on) && el_has_gpu && !cpu_repack_on.load() && u >= el_offload_min() && !win_host_call && !onewave_host(u) &&
            ((gpu_waves > 0 && u >= (int64_t) gpu_waves && !tailw_graph(u)) || n_waves(u) == 1);
 }
 
 bool llama_moe_stream::el_call_low(int64_t n_tok) const {
+    if (uma_gpu_pool) {
+        return false;
+    }
     const int64_t L = std::max<int64_t>(1, el_offload_min());
     if (win_call(n_tok)) {
         // A window call is multi-wave - its waves are CPU waves or tail waves, no pool-view copy;
