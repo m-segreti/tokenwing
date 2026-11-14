@@ -22,7 +22,7 @@ The streaming logic is one class, `llama_moe_stream`, with one instance per load
 | `tools/moe-trace/` | `llama-moe-trace`: records which experts every MoE layer selects for every token. Two Python readers sit next to it. |
 | `tools/moe-decode-batch/` | `llama-moe-decode-batch`: runs the same words as one call per word and as calls of K words, and prints the engine's counters per call. It can also compare logits between settings. |
 | `tokenwing-tools/experts/` | Builds and checks the experts file (`expert_repack.py`, `verify_sidecar.py`), makes the usage seed and the VRAM expert list. |
-| `tokenwing-tools/correction/` | Trains and checks the correction file. Ling 3.0 Flash only. |
+| `tokenwing-tools/correction/` | Trains and checks the correction file. |
 | `tokenwing-tools/testing/`, `tokenwing-tools/hardware/` | `check.py` and `compare.py`; small programs that measure the SSD, RAM and PCIe. See [Testing](testing.md). |
 
 Function-name prefixes in `llama-moe-stream.cpp`:

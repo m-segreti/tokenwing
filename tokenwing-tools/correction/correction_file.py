@@ -6,9 +6,14 @@ The model's shape (n_expert, n_embd) is read from the model.  This module is the
     load_correction(path, gguf_path)                   -> (header dict, {(target, lead): Bt memmap}); raises CorrectionFileError
 
 The guess of target layer X made `lead` layers early from source layer L = X - lead:
-    x0 = RMSNorm(residual + shared expert of L)            (the normed base WITHOUT any gain)
-    plain logits      = W_X (g_X * x0)                     (g_X = blk.X.ffn_norm.weight)
-    corrected logits  = plain + x0 @ B = (W_X diag(g_X) + Bt) x0          Bt = B^T  [n_expert, n_embd]  (what the file holds)
+  - models with ffn_norm:
+      x0 = RMSNorm(residual + shared expert of L)            (the normed base WITHOUT any gain)
+      plain logits     = W_X (g_X * x0)                      (g_X = blk.X.ffn_norm.weight)
+      corrected logits = plain + x0 @ B = (W_X diag(g_X) + Bt) x0          Bt = B^T  [n_expert, n_embd]
+  - hyper-connection models without ffn_norm (hc_ffn_norm):
+      x_d = guess_in(X)                                      (the hyper-connection FFN mixer output for target X)
+      plain logits     = W_X x_d
+      corrected logits = plain + x_d @ B = (W_X + Bt) x_d                  Bt = B^T  [n_expert, n_embd]
 """
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "gguf-py"))
@@ -44,14 +49,21 @@ def _field(rd, key, default=None):
 
 def model_info(gguf_path, layers):
     """The identity of a model for the file: architecture, sizes, and a sha256 over the router tensors of `layers` (ffn_gate_inp.weight,
-    optional exp_probs_b.bias, ffn_norm.weight, as stored, in this order, for X in `layers`)."""
+    optional exp_probs_b.bias, and ffn_norm.weight or hc_ffn_norm.weight, as stored, in this order, for X in `layers`)."""
     rd = _gguf(gguf_path)
     tn = {t.name: t for t in rd.tensors}
     arch = _field(rd, "general.architecture", "?")
     h = hashlib.sha256()
     shape = None
+    has_hc_norm = None
     for X in layers:
-        for nm in ("blk.%d.ffn_gate_inp.weight" % X, "blk.%d.exp_probs_b.bias" % X, "blk.%d.ffn_norm.weight" % X):
+        layer_hc = ("blk.%d.ffn_norm.weight" % X not in tn) and ("blk.%d.hc_ffn_norm.weight" % X in tn)
+        if has_hc_norm is None:
+            has_hc_norm = layer_hc
+        elif layer_hc != has_hc_norm:
+            raise CorrectionFileError("layer %d norm kind differs from layer %d" % (X, layers[0]))
+        norm_suffix = "hc_ffn_norm.weight" if has_hc_norm else "ffn_norm.weight"
+        for nm in ("blk.%d.ffn_gate_inp.weight" % X, "blk.%d.exp_probs_b.bias" % X, "blk.%d.%s" % (X, norm_suffix)):
             if nm not in tn:
                 if nm.endswith("exp_probs_b.bias") and arch != "bailingmoe3":
                     continue   # hashed whenever the model has it (as the engine does), required only for bailingmoe3
@@ -63,9 +75,10 @@ def model_info(gguf_path, layers):
             h.update(np.ascontiguousarray(np.asarray(t.data)).tobytes())
             if nm.endswith("ffn_gate_inp.weight"):
                 shape = [int(x) for x in t.shape][::-1]            # [n_expert, n_embd]
+    norm_label = "hc_ffn_norm.weight" if has_hc_norm else "ffn_norm.weight"
     return {"arch": arch, "name": _field(rd, "general.name", ""), "n_layer": _field(rd, "%s.block_count" % arch),
             "n_expert": shape[0], "n_embd": shape[1], "layers": list(layers), "router_sha256": h.hexdigest(),
-            "hash_of": "sha256 over, for X in layers: blk.X.ffn_gate_inp.weight, optional blk.X.exp_probs_b.bias, blk.X.ffn_norm.weight (raw bytes)"}
+            "hash_of": "sha256 over, for X in layers: blk.X.ffn_gate_inp.weight, optional blk.X.exp_probs_b.bias, blk.X.%s (raw bytes)" % norm_label}
 
 
 def write_correction(path, minfo, pairs, extra):
@@ -73,6 +86,11 @@ def write_correction(path, minfo, pairs, extra):
     keys = sorted(pairs)
     ne, nd = int(minfo["n_expert"]), int(minfo["n_embd"])
     nbytes = ne * nd * 4
+    fold_desc = (
+        "W' = W_X + Bt  (applied to guess_in(X) = the hyper-connection FFN mixer output); lead d: source layer = X - d"
+        if "hc_ffn_norm.weight" in minfo.get("hash_of", "")
+        else "W' = W_X diag(g_X) + Bt  (applied to x0 = the normed base without gain); lead d: source layer = X - d"
+    )
     # header first with provisional offsets to learn its size; the JSON length is fixed by padding the offsets to a constant width
     def build(payload_start):
         off = payload_start
@@ -84,7 +102,7 @@ def write_correction(path, minfo, pairs, extra):
     payload_start = ALIGN * 16
     while True:
         plist, size = build(payload_start)
-        hdr = {"format": FORMAT, "model": minfo, "fold": "W' = W_X diag(g_X) + Bt  (applied to x0 = the normed base without gain); lead d: source layer = X - d",
+        hdr = {"format": FORMAT, "model": minfo, "fold": fold_desc,
                "pairs": plist, "payload_start": payload_start, "file_size": size, **extra}
         # payload hash needs the payload: hash the pairs in order (all pairs are contiguous, each nbytes, no padding between)
         h = hashlib.sha256()

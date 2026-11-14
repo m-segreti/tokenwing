@@ -3,10 +3,10 @@
 // The trained correction of the router-trick guess, in the engine.
 // The file (the format is in tokenwing-tools/correction/correction_file.py) holds, per (target layer X, lead d), a matrix Bt [n_expert, n_embd]. At model load, for every pair
 // this run's guesses can use, this builds
-//     W'(X, d) = W_X * g_X[None, :] + Bt          (one tensor on the buffer type of X's router, so the guess runs where it ran before)
-// and a tensor of ones on the buffer type of X's ffn_norm. The guess for (X, d) is then   W' . rms_norm(base)   - the same product as the plain
-// guess W_X . (g_X * rms_norm(base)) - with the "gain" being the ones. A pair absent from the file, or any refusal, keeps the plain guess.
-// Nothing here changes the real routing of any layer.
+//     W'(X, d) = W_X * g_X[None, :] + Bt          (when X has ffn_norm; one tensor on the buffer type of X's router, plus a tensor of ones on X's ffn_norm buffer type)
+//     W'(X, d) = W_X + Bt                         (on a hyper-connection model with hc_ffn_norm and no ffn_norm, applied to the model's own guess input for X)
+// On a model with ffn_norm, the guess for (X, d) is W' . rms_norm(base) with the ones replacing the gain; on a hyper-connection model it is W' . guess_in(X).
+// A pair absent from the file, or any refusal, keeps the plain guess. Nothing here changes the real routing of any layer.
 
 #include "ggml.h"
 #include "ggml-backend.h"

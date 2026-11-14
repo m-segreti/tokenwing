@@ -2510,8 +2510,9 @@ struct llama_moe_stream {
     // (llama_moe_stream_wordstart) adds them to the waiting list, source by source in layer order, through the streamed layers'
     // add code (la_guesses_src; with N = 1 prefetch_next's plan path). ws_adding marks the entries and names it makes. mtx held
     int32_t ws_D = 0, ws_S0 = -1, ws_first = -1;
-    // --moe-stream-correction: the corrected guess matrices W'(X, d) and the ones that replace X's gain in that guess (built at
-    // model load by corr.load; nullptr = the plain guess). A corrected pair's guess is  W' . rms_norm(base)  with no gain
+    // --moe-stream-correction: the corrected guess matrices W'(X, d), and (when ffn_norm is folded) the ones that replace X's
+    // gain in that guess (built at model load by corr.load; nullptr = the plain guess). A corrected pair's guess is
+    // W' . rms_norm(base) with no gain, or W' . guess_in(X) on a hyper-connection model
     llama_moe_correction corr;
     ggml_tensor * corr_gate(int32_t X, int32_t d) const { return corr.gate(X, d); }
     ggml_tensor * corr_unit(int32_t X, int32_t d) const { return corr.gate(X, d) != nullptr ? corr.unit(X) : nullptr; }
@@ -2618,6 +2619,8 @@ struct llama_moe_stream {
     // only builds the copies in decode graphs (n_tokens == 1) - a prompt ubatch would need one slot per
     // token, which is 43 x 2560 floats each.
     ggml_tensor * pred_input_vec_tensor()   const { return pred_input_vec_t; }
+    ggml_tensor * pred_input_vec2_tensor()  const { return pred_input_vec2_t; }
+    void          mark_pred_input_vec2()          { pred_input_vec2_used = true; }
     size_t        pred_input_vec_offset(int32_t il) const { return (size_t) il*n_embd; }
     ggml_tensor * pred_input_guess_tensor() const { return pred_input_guess_t; }
     size_t        pred_input_guess_offset(int32_t il) const { return (size_t) il*n_expert_used; }
@@ -2646,11 +2649,17 @@ struct llama_moe_stream {
     ggml_tensor *           pred_input_vec_t      = nullptr;
     struct ggml_context *   pred_input_vec_ctx    = nullptr;
     ggml_backend_buffer_t   pred_input_vec_buf    = nullptr;
+    float *                 pred_input_vec2_mem   = nullptr;
+    ggml_tensor *           pred_input_vec2_t     = nullptr;
+    struct ggml_context *   pred_input_vec2_ctx   = nullptr;
+    ggml_backend_buffer_t   pred_input_vec2_buf   = nullptr;
+    bool                    pred_input_vec2_used  = false;
     int32_t *               pred_input_guess_mem  = nullptr;
     ggml_tensor *           pred_input_guess_t    = nullptr;
     struct ggml_context *   pred_input_guess_ctx  = nullptr;
     ggml_backend_buffer_t   pred_input_guess_buf  = nullptr;
     std::vector<float>      pred_input_out_vec;    // [n_words, n_layer, n_embd] as it is appended
+    std::vector<float>      pred_input_out_vec2;   // [n_words, n_layer, n_embd] lead-2 guess input when distinct
     std::vector<int32_t>    pred_input_out_guess;  // [n_words, n_layer, n_expert_used], the engine's guess
     std::vector<int32_t>    pred_input_out_real;   // [n_words, n_layer, n_expert_used], the real top-k
     std::vector<int64_t>    pred_input_rows;       // the decode word index of each stored word
