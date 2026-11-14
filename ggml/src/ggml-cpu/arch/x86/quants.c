@@ -762,14 +762,29 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+// 4 Q2_0 rows bx bytes apart x one Q8_0 vector -> s[0..3], the same bits as 4 calls of ggml_vec_dot_q2_0_q8_0 above (its AVX2
+// path). A Q2_0 block holds 64 weights (value = v - 1, v the 2-bit field) and meets two Q8_0 blocks; per 32 weights:
+//   - the int32 lanes are the same: ggml's lane j is sum (v - 1) * y over bytes 4j..4j+3 (maddubs of v and of 1, subtracted,
+//     then madd with ones); here vpdpbusd sums v * y over the same 4 bytes and subtracts sum(y) of those bytes (vpdpbusd with
+//     ones, shared by the 4 rows) - exact integers, so equal for every int8 y. The unpacking is ggml's (v | v << 12, | v << 6,
+//     & 0x03030303): bytes 0-7 of the block go with its first Q8_0 block, bytes 8-15 with the second;
+//   - the scales are the same float products fp16(x.d) * fp16(y.d), one fmadd per 32 weights in ggml's order (the first Q8_0
+//     block, then the second);
+//   - as in ggml, even blocks go to one accumulator and odd blocks to a second, an odd last block into the first, and the end
+//     is hsum_float_8 of their sum.
+// What is shared by the 4 rows: the Q8_0 loads and sum(y). width 256 or 512 (the 512-bit one keeps two rows per register: row a
+// in lanes 0-7, row b in lanes 8-15, each with its own accumulators); pf > 0 = Q2_0 blocks (18 B) ahead in the row, -k = the
+// same block of the 4-row group k groups ahead (-1 = the next), 0 = no software prefetch.
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX2__)
 static inline void q2_0_x4_prefetch(const block_q2_0 * GGML_RESTRICT const * xs, int i, size_t bx, int pf) {
+    // one prefetch per row every 2 blocks (36 B), so every cache line of the row is touched
     for (int r = 0; r < 4; ++r) {
         const char * p = pf > 0 ? (const char *) (xs[r] + i + pf) : (const char *) (xs[r] + i) + (size_t) (-pf)*4*bx;
         _mm_prefetch(p, _MM_HINT_T0);
     }
 }
 
+// one Q2_0 block (i) of each of the 4 rows against Q8_0 blocks 2i and 2i+1, into acc[r] - ggml's q2_0_acc_block_avx2 per row
 static inline void q2_0_x4_step_ymm(const block_q2_0 * GGML_RESTRICT const * xs, int i, const block_q8_0 * GGML_RESTRICT y, __m256 * acc) {
     const __m256i y0   = _mm256_loadu_si256((const __m256i *) y[2*i + 0].qs);
     const __m256i y1   = _mm256_loadu_si256((const __m256i *) y[2*i + 1].qs);
@@ -799,6 +814,8 @@ static inline void q2_0_x4_step_ymm(const block_q2_0 * GGML_RESTRICT const * xs,
 #endif
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX2__)
+// the 512-bit step: rows 0 and 1 share acc01, rows 2 and 3 acc23 (the first row of a pair in lanes 0-7, the second in 8-15);
+// each 256-bit half gets exactly the fmadds ggml's q2_0_acc_block_avx2 gives that row
 static inline void q2_0_x4_step_zmm(const block_q2_0 * GGML_RESTRICT const * xs, int i, const block_q8_0 * GGML_RESTRICT y, __m512 * acc01, __m512 * acc23) {
     const __m256i y0_256 = _mm256_loadu_si256((const __m256i *) y[2*i + 0].qs);
     const __m256i y1_256 = _mm256_loadu_si256((const __m256i *) y[2*i + 1].qs);
@@ -1055,8 +1072,22 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     *s = sumf;
 }
 
+// 4 Q4_0 rows bx bytes apart x one Q8_0 vector -> s[0..3], the same bits as 4 calls of ggml_vec_dot_q4_0_q8_0 above (its AVX2
+// path) for every activation ggml's Q8_0 quantizer makes:
+//   - the int32 lanes are the same: ggml's lane j is sum (q - 8) * y over bytes 4j..4j+3 (vpdpbusd of |q - 8| and y carrying the
+//     sign of q - 8, or vpdpbssd where AVX-VNNI-INT8 is built); here vpdpbusd sums q * y over the same 4 bytes and subtracts
+//     8 * sum(y) of those bytes (shared by the 4 rows) - exact integers. They agree for every y in [-127, 127], which is all the
+//     Q8_0 quantizer gives for finite values (scale 127 / max): ggml's sign trick turns y = -128 against a negative q - 8 into
+//     -128 instead of +128, so only NaN / Inf activations could tell them apart, and then neither result is finite;
+//   - the same nibble order (low nibbles = values 0-15, high nibbles = 16-31, as bytes_from_nibbles_32), the same scale
+//     fp16(x.d) * fp16(y.d), one fmadd per block into one accumulator, the same hsum_float_8. Every block goes through the
+//     vector loop, as in ggml, so there is no scalar tail.
+// What is shared by the 4 rows: the Q8_0 loads and 8 * sum(y). width 256 or 512 (the 512-bit one keeps two rows per register:
+// row a in lanes 0-7, row b in lanes 8-15); pf > 0 = Q4_0 blocks (18 B) ahead in the row, -k = the same block of the 4-row group
+// k groups ahead (-1 = the next), 0 = no software prefetch.
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX2__)
 static inline void q4_0_x4_prefetch(const block_q4_0 * GGML_RESTRICT const * xs, int ib, size_t bx, int pf) {
+    // called every 2 blocks (36 B), so every cache line of the row is touched
     for (int r = 0; r < 4; ++r) {
         const char * p = pf > 0 ? (const char *) (xs[r] + ib + pf) : (const char *) (xs[r] + ib) + (size_t) (-pf)*4*bx;
         _mm_prefetch(p, _MM_HINT_T0);
@@ -2517,8 +2548,23 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+// 4 Q3_K rows bx bytes apart x one Q8_K vector -> s[0..3], the same bits as 4 calls of ggml_vec_dot_q3_K_q8_K above (its AVX2
+// path). A weight is low + 4*h - 4 (low = its 2 bits in qs, h = its bit in hmask). Per super-block and row:
+//   - the 16-bit pair sums are the same integers: ggml computes maddubs(low, y) - maddubs(4 where h is NOT set, y); here
+//     u = low | (4 where h is set), a value 0..7, and maddubs(u, y) - maddubs(4, y), with maddubs(4, y) shared by the 4 rows.
+//     Both are sum (low + 4*h - 4) * y over each pair, and nothing saturates (the largest magnitude is 7 * 128 * 2 + 4 * 128 * 2
+//     = 2816).
+//     Each hmask bit is moved to bit 2 by a shift that stays inside its byte, in ggml's bit order;
+//   - the 16 scales are ggml's (the same 12-byte unpacking, minus 32) and the same shuffles pick them for each group of 32
+//     values; vpdpwssd multiplies and adds where ggml does madd + add, so the int32 lanes are summed in another order - exact
+//     integers (far from overflow), the same values;
+//   - the same float steps: d = y.d * fp16(x.d), one fmadd per super-block in order, *s = hsum_float_8(acc).
+// What is shared by the 4 rows: the Q8_K loads and maddubs(4, y). width 256 or 512 (the 512-bit one keeps two groups of 32
+// values per register and adds its two halves before the fmadd); pf > 0 = Q3_K super-blocks (110 B) ahead in the row, -k = the
+// same super-block of the 4-row group k groups ahead (-1 = the next), 0 = no software prefetch.
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX2__)
 static inline void q3_K_x4_prefetch(const block_q3_K * GGML_RESTRICT const * xs, int i, size_t bx, int pf) {
+    // a super-block is 110 B: up to 3 cache lines from its first to its last byte
     for (int r = 0; r < 4; ++r) {
         const char * p = pf > 0 ? (const char *) (xs[r] + i + pf) : (const char *) (xs[r] + i) + (size_t) (-pf)*4*bx;
         _mm_prefetch(p,      _MM_HINT_T0);
@@ -2527,6 +2573,7 @@ static inline void q3_K_x4_prefetch(const block_q3_K * GGML_RESTRICT const * xs,
     }
 }
 
+// the 16 sub-block scales of a super-block as int16, minus 32 - ggml's all_scales in ggml_vec_dot_q3_K_q8_K
 static inline __m256i q3_K_x4_scales(const uint8_t * sc) {
     const uint32_t kmask1 = 0x03030303;
     const uint32_t kmask2 = 0x0f0f0f0f;
@@ -2542,6 +2589,9 @@ static inline __m256i q3_K_x4_scales(const uint8_t * sc) {
 #endif
 
 #if defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__AVX512BW__) && defined(__AVX512F__) && defined(__AVX2__)
+// the 512-bit one: a register holds two groups of 32 values (u0 | u1, ...), so each 128-bit quarter is one sub-block of 16;
+// vpermw with indices 4k..4k+3 gives each quarter the scale ggml's shuffle gives that sub-block (indices stay below 16, so the
+// undefined upper half of sc512 is never read); ggml's lane k is lane k + lane 8+k
 static void ggml_vec_dot_q3_K_q8_K_x4_zmm(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, int pf) {
     const int nb = n / QK_K;
     const block_q3_K * GGML_RESTRICT xs[4] = {

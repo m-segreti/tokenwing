@@ -4515,7 +4515,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--moe-stream-cpu-x4-prefetch"}, "next|none|N",
         "software prefetch of the --moe-stream-cpu-x4 kernel: next = the same block of the next 4-row group, none, or N = "
-        "N blocks of 17 bytes ahead in the row (default: next; without it the 4-row kernel is slower than one row per call)",
+        "N blocks of the weight format ahead in the row (17 bytes for MXFP4, 18 for Q4_0 and Q2_0, 110 for Q3_K, 136 for IQ4_XS) "
+        "(default: next; without it the 4-row kernel is slower than one row per call)",
         [](common_params & params, const std::string & value) {
             if (value == "next") {
                 params.moe_stream_cpu_x4_pf = -1;

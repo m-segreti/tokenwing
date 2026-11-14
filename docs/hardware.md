@@ -27,7 +27,7 @@
 ### CPU
 
 - **Expert compute.** The CPU computes the experts that are in RAM. It starts on them while the missing ones land, and each projection has its own ready flag (`--moe-stream-proj-ready`), so gate and up run while down is still being read. With no GPU the router runs on the CPU, so the expert IDs are available at once.
-- **Instruction sets.** The 4-row expert kernels (`--moe-stream-cpu-x4`, for MXFP4 and IQ4_XS) need AVX-512 VNNI. The tiled prompt matmul has AVX-512 VNNI, AVX2 and AVX paths. The iqk kernels (`--moe-stream-cpu-iqk`) are x86-64 with AVX2. ARM CPUs run llama.cpp's own ARM kernels.
+- **Instruction sets.** The 4-row expert kernels (`--moe-stream-cpu-x4`, for MXFP4, IQ4_XS, Q3_K, Q4_0 and Q2_0) need AVX-512 VNNI. The tiled prompt matmul has AVX-512 VNNI, AVX2 and AVX paths. The iqk kernels (`--moe-stream-cpu-iqk`) are x86-64 with AVX2. ARM CPUs run llama.cpp's own ARM kernels.
 - **Thread placement.** Compute threads can be placed on cores with `-C`, `--cpu-range` and `--cpu-strict`.
 
 ## 2. Supported hardware
