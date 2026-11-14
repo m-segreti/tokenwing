@@ -275,6 +275,21 @@ struct llama_file::impl {
         }
     }
 
+    // With direct reads the loader reads the aligned range around a tensor, so for the file's last tensor it asks for up to one
+    // alignment unit past the end of the file. Those padding bytes read as zeros, as in read_raw_unsafe on other systems;
+    // anything further past the end is still an error.
+    void read_raw_unsafe(void * ptr, size_t len) {
+        if (direct_io && pos + len > size && pos <= size && pos + len - size < alignment) {
+            const size_t tail = pos + len - size;
+            const size_t p0   = pos;
+            read_raw(ptr, len - tail);
+            std::memset((char *) ptr + (len - tail), 0, tail);
+            pos = p0 + len;
+            return;
+        }
+        read_raw(ptr, len);
+    }
+
     uint32_t read_u32() {
         uint32_t val;
         read_raw(&val, sizeof(val));
@@ -575,11 +590,7 @@ int llama_file::file_id() const {
 
 void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
 void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-#ifdef _WIN32
-void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
-#else
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
-#endif
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 
