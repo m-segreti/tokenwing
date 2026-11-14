@@ -11286,6 +11286,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // Qwen3.8-Flash-Next's expert formats and shapes for ik's kernels (GGML_CPU_IQK=N), against the reference: Q3_K gate / up
+    // (2560 -> 640), Q4_0 / Q2_0 down (640 -> 2560). 8 experts, top-2: 32 / 64 / 128 / 512 tokens give about 8 / 16 / 32 / 128
+    // rows per expert, so experts land on both sides of the row counts where the port takes an expert (N, 8 with GGML_CPU_IQK=8)
+    // and where it unpacks the weights first (16 rows with AVX-512 VNNI; without it Q4_0 / Q2_0 from 32, Q3_K never, and Q3_K
+    // is taken only up to 32 rows)
+    for (int n : {32, 64, 128, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 8, 2, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 8, 2, false, 2560, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 2, false, 2560, n,  640));
+    }
+    // with n_used == n_mats every token routes to every expert, so each expert gets exactly n rows. Without AVX-512 VNNI the port
+    // takes Q3_K up to 32 rows and leaves 33 to ggml, and 32 is the first row count at which it unpacks Q4_0 / Q2_0
+    for (int n : {32, 33}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 4, 4, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 4, 4, false, 2560, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 4, 4, false, 2560, n,  640));
+    }
+    // short rows with a block tail (Q4_0: 5 blocks, one after the groups of 4; Q2_0: 3 blocks, an odd count) and 48 weight rows
+    // (a row chunk that is not a multiple of 32)
+    for (int n : {64, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 8, 2, false, 512, n,  160));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 2, false, 512, n,  192));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 8, 2, false,  48, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 8, 2, false,  48, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 8, 2, false,  48, n,  640));
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
