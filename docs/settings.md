@@ -379,6 +379,7 @@ These are read once at start-up. The ones under "Test only" exist for tests: mos
 | `MOE_STREAM_TEST_NO_EAGER_CUBLAS` | When 1, the cuBLAS handles are created lazily instead of at the VRAM pool's load-time check. |
 | `MOE_STREAM_TEST_NO_FREE_SLOT` | Names a layer whose first expert pick finds no free slot, to exercise the no-free-slot fallback. |
 | `MOE_STREAM_TEST_NO_KEEP_RAM` | When 1, a VRAM-held expert never keeps a RAM slot, even when every streamed layer holds all its experts in RAM. |
+| `MOE_STREAM_TEST_NO_KPOOL_REPLAY` | When 1, a layer-major replay of a qwen4exp call does not restore each ubatch's k-pool layout and state but keeps those of the call's last ubatch, so the text differs from the per-ubatch path, which is the control that must fail. |
 | `MOE_STREAM_TEST_NO_ROW_PAD` | When 1, the tail-wave gather does not write zeros into the bytes the matmul reads past a place (its row padding), which brings back the NaN output this guards against. |
 | `MOE_STREAM_TEST_NO_TAIL` | When 1, the VRAM pool's tail is not set up for GPU prompt waves. |
 | `MOE_STREAM_TEST_NO_ZERO_TABLE` | When 1, the table of the pools' all-zero slices is not registered with the CUDA backend. |

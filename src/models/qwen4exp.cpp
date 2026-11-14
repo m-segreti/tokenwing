@@ -543,10 +543,8 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_tensor * hid_in = ggml_view_2d(ctx0, params.lm_hid, n_embd * hc, n_tokens, params.lm_hid->nb[1],
                 params.lm_row0 * params.lm_hid->nb[1]);
         res_hc = ggml_reshape_3d(ctx0, hid_in, n_embd, hc, n_tokens);
-    } else if (lm_b > 0) {
-        ggml_tensor * inpL = build_inp_embd(nullptr);
-        res_hc = ggml_reshape_3d(ctx0, inpL, n_embd, hc, n_tokens);
     } else {
+        GGML_ASSERT(lm_b == 0 && "a layer group after the first reads the call's hidden state (lm_hid)");
         ggml_tensor * inpL = build_inp_embd(model.tok_embd);
         cb(inpL, "model.input_embed", -1);
         ggml_build_forward_expand(gf, inpL);

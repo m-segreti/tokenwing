@@ -840,15 +840,19 @@ struct llm_graph_params {
     // last layer outputs every token's hidden state (llm_graph_result::t_lm_hidden) instead of the logits
     int32_t lm_il0 = 0;
     int32_t lm_il1 = -1;
-    // The call's hidden state [n_embd, T] in a device buffer (llama_context); a group graph of this ubatch reads its
-    // input from rows [lm_row0, lm_row0 + n_tokens) when it starts after layer 0 and writes its output there when it ends early -
-    // nothing goes through host memory and nothing waits between the graphs. nullptr = step 1's host path (ubatch.embd)
+    // The call's hidden state [n_embd * hc, T] (hc = the hyper-connection streams, 1 for a model without them) in a device
+    // buffer (llama_context); a group graph of this ubatch reads its input from rows [lm_row0, lm_row0 + n_tokens) when it starts
+    // after layer 0 and writes its output there when it ends early - nothing goes through host memory and nothing waits between
+    // the graphs. nullptr = the host path (ubatch.embd)
     ggml_tensor * lm_hid  = nullptr;
     int64_t       lm_row0 = 0;
     // lm_phase 1 = a streamed layer's first part for one ubatch (attention + router + shared expert; writes the residual +
     // shared expert into lm_hid, the normed expert input into lm_x and the router's picks / weights into lm_ids / lm_w, at its rows);
     // 2 = the expert graph of a streamed layer for the whole call (the usual wave loop over lm_ids, its matmuls in chunks of lm_chunk
-    // tokens, each chunk's routed output added into lm_hid); 0 = whole layers
+    // tokens, each chunk's routed output added into lm_hid); 0 = whole layers.
+    // A model with hyper-connection streams (qwen4exp) writes only the residual into lm_hid in lm_phase 1, and the FFN combine's
+    // inject weights into lm_inj; in lm_phase 2 the routed output is summed into lm_moe, and per chunk the model adds the shared
+    // expert and runs the combine into lm_hid
     int32_t       lm_phase = 0;
     ggml_tensor * lm_x     = nullptr;
     ggml_tensor * lm_moe   = nullptr;   // optional [n_embd, T] routed-expert accumulator when hidden state has hyper-connection streams
@@ -1171,6 +1175,8 @@ struct llm_graph_context {
     ggml_tensor * lm_w     = nullptr;
     int64_t       lm_row0  = 0;
     int64_t       lm_chunk = 0;
+    // filled by build_moe_ffn in lm_phase 2: each chunk's last copy into lm_moe (or lm_hid without it); a model builder with
+    // lm_moe set continues from these nodes (shared expert + combine)
     mutable std::vector<ggml_tensor *> lm_moe_chunks;
 
     llm_graph_context(const llm_graph_params & params);

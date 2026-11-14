@@ -198,8 +198,8 @@ A prompt call runs the same graph code with more rows. The differences are below
 
 **Layer-major** (`--moe-stream-layer-major`, Ling, Flint and qwen4exp). `lm_layer_major_ok` admits a call of more than one ubatch with one sequence. `llama_context` raises `n_batch` up to the context size (`--moe-stream-layer-major-batch` caps it). The `decode` loop then walks the layers (`lm_group` layers at a time, one by default):
 
-1. Every ubatch runs the layer. For a streamed layer this is a graph with `lm_phase == 1`: attention and router only. The router's ids and weights go into the call's tensors (`lm_hid`, `lm_x`, `lm_ids`, `lm_w`). Before each later layer the memory is rewound with `rewind()` and each ubatch replayed with `reapply()`.
-2. Then one expert graph for the whole call (`lm_phase == 2`): one remap op per wave, the matmuls in chunks of `n_ubatch` rows, each chunk added into its rows of `lm_hid`.
+1. Every ubatch runs the layer. For a streamed layer this is a graph with `lm_phase == 1`: attention and router only. The router's ids and weights go into the call's tensors (`lm_hid`, `lm_x`, `lm_ids`, `lm_w`). A model with hyper-connection streams (qwen4exp) keeps all its streams in `lm_hid` and has two more: `lm_inj`, the FFN combine's inject weights, and `lm_moe`, the routed experts' sum. Before each later layer the memory is rewound with `rewind()` and each ubatch replayed with `reapply()`.
+2. Then one expert graph for the whole call (`lm_phase == 2`): one remap op per wave, the matmuls in chunks of `n_ubatch` rows, each chunk added into its rows of `lm_hid`. With hyper-connection streams the chunks are summed into `lm_moe` instead, and each chunk then adds its shared expert and runs the combine into its rows of `lm_hid`.
 3. `lm_signal_done` calls `lm_layer_done` with a per-layer event, so the window knows the layer's slots are free.
 
 The engine side is `lm_call_begin`, `lm_layer_begin`, `lm_layer_done`, `lm_call_end`. If the call's tensors do not fit, or the expert graph holds fewer chunks than the call needs, the call runs in whole-layer groups or ubatch by ubatch, with one line.

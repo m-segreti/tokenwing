@@ -2600,7 +2600,7 @@ bool llama_context::lm_layer_major_ok(uint32_t n_tokens_all) {
     if (!want || n_tokens_all <= cparams.n_ubatch || lm_force_off) {
         return false;   // off, or one ubatch: nothing to reorder (or this call's layer-major attempt failed)
     }
-    if (!llama_arch_layer_major(model.arch) ||                      // the model builders that take a layer range (Ling-3.0, Flint)
+    if (!llama_arch_layer_major(model.arch) ||                      // the model builders that take a layer range (Ling-3.0, Flint, qwen4exp)
         cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP || cparams.n_rs_seq > 0 ||   // MTP and its snapshot slots: not checked
         cparams.embeddings || !memory ||
         std::find(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), true) !=
@@ -3192,7 +3192,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // state kept in host memory between groups; the loop below then runs the last group with the usual output handling. The memory is
     // applied once per ubatch (the first group) and replayed for the later groups (reapply). Whole layers keep each ubatch's own expert
     // stage, so the text is the per-ubatch path's. Anything it does not support runs the per-ubatch path (lm_layer_major_ok).
-    struct lm_reset_t {   // back to whole graphs on every way out of decode(), and the hidden states freed (up to 10 KB per token)
+    struct lm_reset_t {   // back to whole graphs on every way out of decode(), and the call's tensors freed (up to about 60 KiB per token)
         llama_context & c;
         ~lm_reset_t() {
             if (auto * ms = c.model.moe_stream(); ms && ms->lm_in_call) {
@@ -3332,10 +3332,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             lm_last0 = (int) hparams.n_layer();
         }
         lm_h.clear();
-        // The call's hidden state [n_embd, T] on the device of the layers (the CPU on a CPU-only run): the group
-        // graphs read and write their ubatch's rows there, so no graph waits for the one before it and nothing goes to the host.
-        // Step 2b adds the normed expert input [n_embd, T] and the router's picks and weights [k, T]; with a GPU expert pool that has
-        // a tail they all live in the tail's extension (vacated for this call's GPU-wave graphs first), else in a buffer of their own
+        // The call's hidden state [n_embd * hc, T] (hc = the hyper-connection streams, 1 without them) on the device of the layers
+        // (the CPU on a CPU-only run): the group graphs read and write their ubatch's rows there, so no graph waits for the one before
+        // it and nothing goes to the host. With the expert graphs split off (lm_split) it adds the normed expert input [n_embd, T] and
+        // the router's picks and weights [k, T], and with hyper-connection streams also the routed-expert sum lm_moe [n_embd, T] and
+        // the FFN combine's inject weights lm_inj [hc, T]; with a GPU expert pool that has a tail they all live in the tail's
+        // extension (vacated for this call's GPU-wave graphs first), else in a buffer of their own
         if (lm_last0 > 0) {
             auto * ms = model.moe_stream();
             const int64_t k  = hparams.n_expert_used();
@@ -3446,7 +3448,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 ms->lm_layer_begin(il0);
             }
             const bool psplit_now = psplit_here && il0 > 0;   // (test only, once)
-            if (il0 > 0 && (psplit_now || !mctx->rewind())) {   // (Ling's hybrid memory can; lm_layer_major_ok admits Ling only)
+            if (il0 > 0 && (psplit_now || !mctx->rewind())) {   // (the memories of the models llama_arch_layer_major admits can)
                 psplit_test = 0;
                 LLAMA_LOG_ERROR("%s: layer-major: the memory cannot go back to the first ubatch\n", __func__);
                 const bool cut = lm_remove_call();
