@@ -178,14 +178,20 @@ def _probe_shard_tensors(mmf, plugin, conv, shard_path, reader):
             if rc != 0:
                 raise mmf.Refuse(f"{t.name}: quant plugin probe failed: {plugin.last_error()}")
             if plan.action == ACTION_KEEP:
-                out_type = gguf.GGMLQuantizationType(t.raw_dtype)
+                try:
+                    out_type = gguf.GGMLQuantizationType(t.raw_dtype)
+                except ValueError:
+                    raise mmf.Refuse(f"{t.name}: type id {t.raw_dtype} is not a ggml type, and the plugin keeps it as it is")
                 out_dims = t.dims
                 blck_size, type_size = gguf.GGML_QUANT_SIZES[out_type]
                 if type_size == 0 or math.prod(out_dims) % blck_size != 0:
                     raise mmf.Refuse(f"{t.name}: type {out_type.name} has invalid block geometry")
                 src_nb = out_nb = math.prod(out_dims) // blck_size * type_size
             elif plan.action in (ACTION_REHEADER, ACTION_TRANSCODE):
-                out_type = gguf.GGMLQuantizationType(int(plan.out_type))
+                try:
+                    out_type = gguf.GGMLQuantizationType(int(plan.out_type))
+                except ValueError:
+                    raise mmf.Refuse(f"{t.name}: the plugin's output type id {plan.out_type} is not a ggml type")
                 out_dims = tuple(int(plan.out_ne[d]) for d in range(int(plan.out_n_dims)))
                 src_nb, out_nb = int(plan.src_nbytes), int(plan.out_nbytes)
                 blck_size, type_size = gguf.GGML_QUANT_SIZES[out_type]

@@ -477,6 +477,11 @@ def main():
             reader = gguf.GGUFReader(src)
         except (ValueError, OSError) as e:
             raise Refuse(f"{src} cannot be read as a GGUF file: {e}")
+        # a quant plugin's types have no size without the plugin (their tensors would read as 0 bytes)
+        plugin_types = sorted({t.tensor_type.name for t in reader.tensors if gguf.GGML_QUANT_SIZES[t.tensor_type][1] == 0})
+        if plugin_types:
+            raise Refuse(f"{src} has tensors of quant plugin types ({', '.join(plugin_types)}): give --quant-plugin with the "
+                         f"plugin the file was made with")
         others = check_split(src, reader, out_path)
         n_split = len(others) + 1
         if reader.endianess != gguf.GGUFEndian.LITTLE:
