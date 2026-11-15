@@ -15,8 +15,8 @@ Each mechanism is a flag. Most are off by default, so plain TokenWing behaves li
 | `-np, --parallel N` | number of server slots (default: -1, -1 = auto) (env: LLAMA_ARG_N_PARALLEL) |
 | `-m, --model FNAME` | model path to load (env: LLAMA_ARG_MODEL) |
 | `--quant-plugin PATH` | shared library (.so / .dll) registering external GGML quantization types GGML_TYPE_EXT0..EXT5 (default: none) (env: LLAMA_ARG_QUANT_PLUGIN) |
-| `--moe-router-min-w FLOAT` | skip routed tail experts beyond `--moe-router-k-min` whose normalized weight <= FLOAT (default: 0.0 = disabled) (env: LLAMA_ARG_MOE_ROUTER_MIN_W) |
-| `--moe-router-k-min N` | minimum routed experts always retained per token when `--moe-router-min-w > 0` (default: 4) (env: LLAMA_ARG_MOE_ROUTER_K_MIN) |
+| `--moe-router-min-w FLOAT` | drop the last experts each token's router picked: in every MoE layer, the picks after the first --moe-router-k-min (in the router's order, highest score first) are dropped from the end while their routing weights, as a share of the token's total, add up to at most FLOAT x (layer / last layer)^2 (layer 0 never drops). The kept weights are scaled back to the old total when the model normalises its routing weights or uses softmax gating. In streamed layers and in layers run by a quant plugin's GPU kernel a dropped expert is not read or computed (unless the layer has per-expert scales or biases); elsewhere it is computed with weight 0. This changes the model's answers (default: 0 = off) |
+| `--moe-router-k-min N` | with --moe-router-min-w above 0: the first N experts each token's router picks are never dropped (default: 4) |
 | `--host HOST` | IP addresses to listen on, comma-separated, or UNIX socket paths ending in .sock; with multiple TCP addresses, :: binds IPv6 only; overlapping addresses result in undefined behavior (default: 127.0.0.1) (env: LLAMA_ARG_HOST) |
 | `--port PORT` | port to listen (default: 8080) (env: LLAMA_ARG_PORT) |
 | `--api-key KEY` | API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none) (env: LLAMA_API_KEY) |

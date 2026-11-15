@@ -201,6 +201,10 @@ llama_context::llama_context(
     cparams.warmup                  = false;
     cparams.moe_router_min_w        = model.moe_router_min_w();
     cparams.moe_router_k_min        = model.moe_router_k_min();
+    if (cparams.moe_router_min_w > 0.0f && params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+        fprintf(stderr, "%s: --moe-router-min-w %g (--moe-router-k-min %d) is on: each token drops the last experts its router "
+                "picked, so the model's answers change\n", __func__, (double) cparams.moe_router_min_w, (int) std::max(1, cparams.moe_router_k_min));
+    }
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);

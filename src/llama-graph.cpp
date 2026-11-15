@@ -2814,12 +2814,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         weights = ggml_reshape_3d(ctx0, w2d, 1, n_expert_used, n_tokens);
         cb(weights, "ffn_moe_weights_pruned", il);
 
-        const ggml_tensor * up_src = up_exps && up_exps->view_src ? up_exps->view_src : up_exps;
-        const bool up_on_dev = up_src && up_src->buffer && !ggml_backend_buffer_is_host(up_src->buffer);
-        const bool can_sentinel_skip = (mstream != nullptr && mstream->layer(il) != nullptr) ||
-                (up_on_dev && !up_exps_s && !gate_exps_s && !down_exps_s &&
-                 !up_exps_b && !gate_exps_b && !down_exps_b &&
-                 ggml_quant_plugin_has_cuda(up_exps->type, /*is_id =*/ true));
+        // A dropped pair's id becomes n_expert, which names no expert, so the expert is not read or computed at all.
+        // That id may only reach code that knows it: the streaming engine's remap op (it maps it to the all-zero slices)
+        // and a quant plugin's GPU kernel (mul_mat_id_cuda skips an id equal to the expert count). It must never reach a
+        // gather from a per-expert tensor - scales, biases, LoRA - so a layer with any of those keeps the ids and only
+        // the zero weights drop the experts (computed, times 0).
+        const auto plugin_gpu = [&](const ggml_tensor * t) {
+            const ggml_tensor * src = t && t->view_src ? t->view_src : t;
+            return src && src->buffer && !ggml_backend_buffer_is_host(src->buffer) &&
+                   ggml_quant_plugin_has_cuda(t->type, /*is_id =*/ true);
+        };
+        const bool no_expert_extras = !up_exps_s && !gate_exps_s && !down_exps_s &&
+                !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && !weight_before_ffn;
+        const bool can_sentinel_skip = no_expert_extras &&
+                ((mstream != nullptr && mstream->layer(il) != nullptr) ||
+                 (!gate_up_exps && plugin_gpu(up_exps) && plugin_gpu(gate_exps) && plugin_gpu(down_exps) &&
+                  (loras == nullptr || loras->empty())));
         if (can_sentinel_skip) {
             ggml_tensor * f_sel      = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
             ggml_tensor * prune_mask = ggml_scale_bias(ctx0, keep_mask, -1.0f, 1.0f);
