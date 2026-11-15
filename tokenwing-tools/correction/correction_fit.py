@@ -57,7 +57,9 @@ def sqrt_softplus_scores(x):
 def gate_scores(lg, bias=None, gating="sigmoid", gating_id=0):
     if gating == "softmax":
         sc = softmax_scores(lg)
-    elif gating_id == 3 or gating == "sqrt_softplus":
+    elif gating_id == 3:   # softmax on the chosen weights only: the experts are selected on the raw logits
+        sc = lg
+    elif gating_id == 4 or gating == "sqrt_softplus":
         sc = sqrt_softplus_scores(lg)
     else:
         sc = sig(lg)

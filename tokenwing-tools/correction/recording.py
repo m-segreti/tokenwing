@@ -61,7 +61,9 @@ class Rec:
             xm = x - np.max(x, axis=-1, keepdims=True)
             ex = np.exp(xm)
             sc = ex / np.sum(ex, axis=-1, keepdims=True) + self.bias[None, :, :]
-        elif self.gating_id == 3:
+        elif self.gating_id == 3:   # softmax on the chosen weights only: the experts are selected on the raw logits
+            sc = x + self.bias[None, :, :]
+        elif self.gating_id == 4:   # sqrt(softplus)
             sp = np.where(x > 20.0, x, np.log1p(np.exp(np.clip(x, -80.0, 20.0))))
             sc = np.sqrt(np.maximum(sp, 0.0)) + self.bias[None, :, :]
         else:
