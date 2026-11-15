@@ -792,8 +792,12 @@ llama_context::~llama_context() {
     }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
-    if (auto * ms = model.moe_stream(); ms != nullptr) {
-        ms->uma_backend = nullptr;
+    if (auto * ms = ctx_moe_stream(); ms != nullptr) {   // only this context's backend (another context may still run on the model)
+        for (auto & backend : backends) {
+            if (ms->uma_backend == backend.get()) {
+                ms->uma_backend = nullptr;
+            }
+        }
     }
     for (auto ev : lm_evs) {   // the per-layer events of the window's signals
         if (ev) {

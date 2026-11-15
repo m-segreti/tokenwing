@@ -15000,7 +15000,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             const int64_t nb_gu = (int64_t) ggml_row_size(F.t_gate, F.ne_gate[0])*2*F.ne_gate[1];
             const int64_t nb_dn = (int64_t) ggml_row_size(F.t_down, F.ne_down[0])*F.ne_down[1];
             const int64_t nb_pl = std::max<int64_t>(1, nb_gu + nb_dn);
-            const int64_t vp_1l = vp ? (int64_t) n_expert_used*n_expert_total*(int64_t) sizeof(int32_t) : 0;
+            const int64_t vp_1l = vp ? (int64_t) n_expert_used*(n_expert_total + 1)*(int64_t) sizeof(int32_t) : 0;   // (+ the pruned row)
             const int64_t hi_pr = (int64_t) F.layers.size()*n_per_layer_max + (int64_t) n_zero + 2*((int64_t) n_slots + (int64_t) n_zero);
             const int64_t op_cap = probe_op_slices(F, hi_pr);
             if (op_cap <= (int64_t) n_zero) {
