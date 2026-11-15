@@ -79,7 +79,6 @@ struct ggml_quant_plugin_api {
             int32_t device_id, void * cuda_stream);
 
     // ids: int32 [n_expert_used, ne12] at byte strides ids_nb0 / ids_nb1; the result of pair (j, t) goes to dst + j*nb1 + t*nb2.
-    // An id equal to ne02 (the expert count) names no expert: the pair was dropped (--moe-router-min-w) and its result is 0.
     // first_zero >= 0: the experts from first_zero on are all-zero slices (the streaming engine's reserve), whose result is 0.
     int32_t (*mul_mat_id_cuda)(
             int32_t ggml_type_id,

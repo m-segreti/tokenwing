@@ -21,9 +21,6 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
-    float    moe_router_min_w = 0.0f;
-    int32_t  moe_router_k_min = 4;
-
     float rope_freq_base;
     float rope_freq_scale;
 

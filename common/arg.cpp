@@ -3295,33 +3295,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_QUANT_PLUGIN"));
     add_opt(common_arg(
-        {"--moe-router-min-w"}, "FLOAT",
-        "drop the last experts each token's router picked: in every MoE layer, the picks after the first --moe-router-k-min "
-        "(in the router's order, highest score first) are dropped from the end while their routing weights, as a share of "
-        "the token's total, add up to at most FLOAT x (layer / last layer)^2 (layer 0 never drops). The kept weights are "
-        "scaled back to the old total when the model normalises its routing weights or uses softmax gating. In streamed "
-        "layers and in layers run by a quant plugin's GPU kernel a dropped expert is not read or computed (unless the layer "
-        "has per-expert scales or biases); elsewhere it is computed with weight 0. This changes the model's answers "
-        "(default: 0 = off)",
-        [](common_params & params, const std::string & value) {
-            const float v = std::stof(value);
-            if (!std::isfinite(v) || v < 0.0f) {
-                throw std::invalid_argument("--moe-router-min-w needs a number >= 0");
-            }
-            params.moe_router_min_w = v;
-        }
-    ).set_examples({LLAMA_EXAMPLE_COMMON}));
-    add_opt(common_arg(
-        {"--moe-router-k-min"}, "N",
-        "with --moe-router-min-w above 0: the first N experts each token's router picks are never dropped (default: 4)",
-        [](common_params & params, int value) {
-            if (value < 1) {
-                throw std::invalid_argument("--moe-router-k-min needs a number >= 1");
-            }
-            params.moe_router_k_min = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_COMMON}));
-    add_opt(common_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",
         [](common_params & params, const std::string & value) {

@@ -59,7 +59,7 @@ __global__ void k_mul_mat(const char * vx, const char * vy, char * dst,
     *(float *) (dst + i01*sizeof(float) + i11*nb1 + i12*nb2 + i13*nb3) = dot_row(x, y, ne00/32);
 }
 
-// pair (j, t): expert ids[j, t]; an id outside [0, ne02) - the dropped-pair id ne02 - or at or past first_zero gives 0
+// pair (j, t): expert ids[j, t]; an id at or past first_zero (an all-zero slice) gives 0 without reading it
 __global__ void k_mul_mat_id(const char * vx, const char * vy, const char * ids, char * dst,
         int64_t ne00, int64_t ne01, int64_t ne02, size_t nb01, size_t nb02,
         int64_t ne11, size_t nb11, size_t nb12,

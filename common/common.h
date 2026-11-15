@@ -937,8 +937,6 @@ struct common_params {
     std::string moe_stream_oracle = "";    // trace prefix to replay instead of predicting
     int32_t     moe_stream_oracle_lead = -1; // oracle lookahead in MoE layers, -1 = 1
     std::string quant_plugin = "";         // shared library (.so / .dll) registering GGML_TYPE_EXT0..EXT5
-    float       moe_router_min_w = 0.0f;   // drop each token's last picked experts (--moe-router-min-w; changes the answers; 0 = off)
-    int32_t     moe_router_k_min = 4;      // with moe_router_min_w > 0: the first picks never dropped
     // optional callback for model loading progress and cancellation:
     // called with a progress value between 0.0 and 1.0.
     // return false from callback to abort model loading or true to continue

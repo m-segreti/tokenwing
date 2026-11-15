@@ -574,9 +574,6 @@ extern "C" {
                                                 //      experts on DEV whatever device holds the layer; NULL = on the layer's own device.
                                                 //      The layers themselves come from moe_stream_gpu_layers_list (common fills it)
         const char * quant_plugin;              // shared library (.so / .dll) registering GGML_TYPE_EXT0..EXT5, NULL = none
-        float        moe_router_min_w;          // > 0: each token drops its last picked experts whose weight share adds up to at most this
-                                                //      times (layer / last layer)^2 (--moe-router-min-w); changes the answers; 0 = off
-        int32_t      moe_router_k_min;          // with moe_router_min_w > 0: the first picks never dropped (default 4)
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

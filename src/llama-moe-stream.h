@@ -542,7 +542,7 @@ struct llama_moe_stream_layer {
     int32_t               vx_li    = -1;   // this layer's index in its group (its slice of the group's vp_table)
     bool                  vp_built = false;   // the last one-token graph built this layer's device pass in its launch
     std::vector<int32_t>  vx_seen;    // remap scratch: the distinct VRAM-held experts of a call
-    bool vx_held(int32_t e) const { return e >= 0 && (size_t) e < vx_slot.size() && vx_slot[e] >= 0; }
+    bool vx_held(int32_t e) const { return !vx_slot.empty() && vx_slot[e] >= 0; }
 
     // stats, one set per phase: prompt processing and decode, so that ms/token means the same
     // thing on both sides of the phase change (the old single set divided the stall by all
