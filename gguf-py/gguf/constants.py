@@ -5826,12 +5826,13 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
-    EXT0    = 43
-    EXT1    = 44
-    EXT2    = 45
-    EXT3    = 46
-    EXT4    = 47
-    EXT5    = 48
+    # formats supplied at run time by a quant plugin (ggml-quant-plugin.h); ids 43-111 stay free for llama.cpp
+    EXT0    = 112
+    EXT1    = 113
+    EXT2    = 114
+    EXT3    = 115
+    EXT4    = 116
+    EXT5    = 117
 
 
 class ExpertGatingFuncType(IntEnum):

@@ -430,13 +430,17 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_EXT0    = 43,
-        GGML_TYPE_EXT1    = 44,
-        GGML_TYPE_EXT2    = 45,
-        GGML_TYPE_EXT3    = 46,
-        GGML_TYPE_EXT4    = 47,
-        GGML_TYPE_EXT5    = 48,
-        GGML_TYPE_COUNT   = 49,
+        // Weight formats supplied at run time by a quant plugin (--quant-plugin, ggml-quant-plugin.h). These ids are
+        // written into GGUF files, so they sit far from the ids llama.cpp hands out (dense from 0, a few new ones a
+        // year) and from the ones ik_llama.cpp uses (97-99, 133 and up): ids 43-111 are left free for llama.cpp.
+        // Ids without a format in between have no type name and no size (a file using one is refused).
+        GGML_TYPE_EXT0    = 112,
+        GGML_TYPE_EXT1    = 113,
+        GGML_TYPE_EXT2    = 114,
+        GGML_TYPE_EXT3    = 115,
+        GGML_TYPE_EXT4    = 116,
+        GGML_TYPE_EXT5    = 117,
+        GGML_TYPE_COUNT   = 118,
     };
 
     // [TAG_GGML_PREC]

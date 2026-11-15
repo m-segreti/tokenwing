@@ -25,6 +25,11 @@ extern "C" void ggml_internal_set_ext_type_traits(
         ggml_to_float_t   to_float,
         ggml_from_float_t from_float_ref);
 
+// the plugin header names the ids without including ggml.h: the two must agree
+static_assert(GGML_TYPE_EXT0 == GGML_QUANT_PLUGIN_TYPE_FIRST, "ggml-quant-plugin.h and ggml.h disagree on the first plugin type id");
+static_assert(GGML_TYPE_EXT5 - GGML_TYPE_EXT0 + 1 == GGML_QUANT_PLUGIN_MAX_TYPES, "one ggml type per plugin slot");
+static_assert(GGML_TYPE_EXT5 + 1 == GGML_TYPE_COUNT, "the plugin types are the last ggml types");
+
 namespace {
 
 std::mutex                                  g_plugin_mu;

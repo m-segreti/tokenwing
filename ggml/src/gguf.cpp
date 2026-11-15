@@ -733,6 +733,13 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
                 ok = false;
                 break;
             }
+            // an id in the free range below the plugin types (e.g. a format a newer llama.cpp added) has no name
+            if (ggml_type_name(info.t.type) == nullptr) {
+                GGML_LOG_ERROR("%s: tensor '%s' has ggml type %d, which this build does not know\n",
+                    __func__, info.t.name, (int) info.t.type);
+                ok = false;
+                break;
+            }
             const size_t  type_size = ggml_type_size(info.t.type);
             const int64_t blck_size = ggml_blck_size(info.t.type);
 

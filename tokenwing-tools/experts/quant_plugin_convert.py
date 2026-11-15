@@ -12,9 +12,9 @@ import numpy as np
 import gguf
 from gguf.constants import GGUFValueType
 
-PLUGIN_ABI_VERSION = 1
-PLUGIN_SUPPORTED_ABI_VERSIONS = (1,)
-PLUGIN_EXT_BASE = 43
+PLUGIN_ABI_VERSION = 2
+PLUGIN_SUPPORTED_ABI_VERSIONS = (2,)
+PLUGIN_EXT_BASE = int(gguf.GGMLQuantizationType.EXT0)   # GGML_QUANT_PLUGIN_TYPE_FIRST in ggml-quant-plugin.h
 PLUGIN_MAX_TYPES = 6
 ACTION_KEEP = 0
 ACTION_REHEADER = 1

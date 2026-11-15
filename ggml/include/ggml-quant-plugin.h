@@ -7,9 +7,13 @@
 extern "C" {
 #endif
 
-#define GGML_QUANT_PLUGIN_ABI_VERSION 1
+// Version 2: the plugin types moved to ids 112-117 (a plugin built for version 1 wrote other ids into model files)
+#define GGML_QUANT_PLUGIN_ABI_VERSION 2
 #define GGML_QUANT_PLUGIN_MAX_TYPES   6
 #define GGML_QUANT_PLUGIN_ENTRY_NAME  "ggml_quant_plugin_get_api"
+// The ggml type id of plugin slot 0 (GGML_TYPE_EXT0); slot i is GGML_QUANT_PLUGIN_TYPE_FIRST + i. A plugin's converter
+// returns these ids as out_type for the tensors it converts.
+#define GGML_QUANT_PLUGIN_TYPE_FIRST  112
 
 enum ggml_quant_plugin_tensor_action {
     GGML_QUANT_PLUGIN_TENSOR_KEEP      = 0,
