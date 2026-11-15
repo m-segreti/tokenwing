@@ -1105,7 +1105,15 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
 }
 
 size_t llama_model_loader::lazy_read::moe_stream_min_bytes() {
-    static const bool ram = getenv("MOE_STREAM_TEST_TOKEN_TABLE_RAM") && atoi(getenv("MOE_STREAM_TEST_TOKEN_TABLE_RAM")) != 0;
+    // Windows: a mapped view of the model file makes NTFS send our unbuffered expert reads to the drive one at a time (each
+    // waits for the previous), which halved Ling's read speed - so the word table is held in RAM there unless the variable is 0
+#ifdef _WIN32
+    const bool ram_default = true;
+#else
+    const bool ram_default = false;
+#endif
+    static const char * env = getenv("MOE_STREAM_TEST_TOKEN_TABLE_RAM");
+    static const bool ram = env ? atoi(env) != 0 : ram_default;
     return ram ? SIZE_MAX : 64ull * 1024 * 1024;
 }
 

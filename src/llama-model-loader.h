@@ -96,7 +96,7 @@ struct llama_model_loader {
 
         // The size above which --moe-stream reads a marked tensor lazily in AUTO mode - 64 MiB, so the word table (token_embd,
         // 0.4 GiB on Ling Flash) is mapped from the file instead of held in RAM next to the pools. SIZE_MAX with the test variable
-        // MOE_STREAM_TEST_TOKEN_TABLE_RAM=1 (read once): the old way, from the same binary
+        // MOE_STREAM_TEST_TOKEN_TABLE_RAM=1 (read once): the old way, from the same binary. Windows defaults to RAM (=0 maps)
         static size_t moe_stream_min_bytes();
 
         // decide whether this tensor is read lazily

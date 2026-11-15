@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <mutex>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -619,6 +620,201 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 }
 #endif
 
+#if defined(_WIN32)
+// A reserved address range standing for a whole file: its pages are committed and filled by unbuffered reads ahead of use
+// (llama_prefetch) or on first touch (a vectored exception handler). It serves the lazy tables like a file mapping, but the
+// file has no mapped view, so NTFS keeps sending the stream's unbuffered reads of the same file to the drive in parallel.
+struct llama_win_read_region {
+    static constexpr size_t PAGE   = 4096;
+    // filled bytes kept (1 GiB); the next prefetch over it drops them all first. LLAMA_WIN_LAZY_BUDGET_MIB=N (test only) sets it
+    static size_t budget() {
+        static const size_t b = getenv("LLAMA_WIN_LAZY_BUDGET_MIB") ? (size_t) atoll(getenv("LLAMA_WIN_LAZY_BUDGET_MIB")) << 20 : 1ull << 30;
+        return b;
+    }
+
+    char *  base = nullptr;
+    size_t  size = 0;
+    HANDLE  h    = INVALID_HANDLE_VALUE;   // a duplicate of the loader's unbuffered, overlapped handle: it outlives the loader
+    std::mutex mu;                         // guards everything below
+    std::vector<uint8_t> filled;           // per page
+    std::vector<std::pair<size_t, size_t>> runs_filled;   // [first page, n pages)
+    size_t  filled_bytes = 0;
+    size_t  n_reads = 0, read_bytes = 0;   // for the line at exit
+    HANDLE  evs[64] = {};
+
+    llama_win_read_region(HANDLE hf, size_t n);
+    ~llama_win_read_region();
+
+    // fill the pages of these [first, last) page runs that are not filled yet; mu held
+    void fill_locked(const std::vector<std::pair<size_t, size_t>> & runs) {
+        struct io { OVERLAPPED ov; size_t p0, np; bool pending; };
+        std::vector<io> q;
+        for (const auto & [a, b] : runs) {
+            for (size_t p = a; p < b;) {
+                if (filled[p]) { p++; continue; }
+                size_t e = p;
+                while (e < b && !filled[e] && e - p < 256) { filled[e++] = 1; }   // at most 1 MiB per read
+                q.push_back({ {}, p, e - p, false });
+                p = e;
+            }
+        }
+        for (size_t i = 0; i < q.size(); i += 64) {
+            const size_t n = std::min<size_t>(64, q.size() - i);
+            for (size_t k = 0; k < n; k++) {
+                io & x = q[i + k];
+                char * dst = base + x.p0*PAGE;
+                if (!VirtualAlloc(dst, x.np*PAGE, MEM_COMMIT, PAGE_READWRITE)) {
+                    GGML_ABORT("lazy table: commit failed: %s", llama_format_win_err(GetLastError()).c_str());
+                }
+                const uint64_t off = (uint64_t) x.p0*PAGE;
+                x.ov.Offset     = (DWORD) off;
+                x.ov.OffsetHigh = (DWORD) (off >> 32);
+                x.ov.hEvent     = evs[k];
+                ResetEvent(evs[k]);
+                DWORD got = 0;
+                if (ReadFile(h, dst, (DWORD) (x.np*PAGE), &got, &x.ov)) {
+                    x.pending = true;   // done already; the result call below returns at once
+                } else if (GetLastError() == ERROR_IO_PENDING) {
+                    x.pending = true;
+                } else if (GetLastError() != ERROR_HANDLE_EOF) {
+                    GGML_ABORT("lazy table: read failed: %s", llama_format_win_err(GetLastError()).c_str());
+                }
+            }
+            for (size_t k = 0; k < n; k++) {
+                io & x = q[i + k];
+                DWORD got = 0;
+                if (x.pending && !GetOverlappedResult(h, &x.ov, &got, TRUE) && GetLastError() != ERROR_HANDLE_EOF) {
+                    GGML_ABORT("lazy table: read failed: %s", llama_format_win_err(GetLastError()).c_str());
+                }
+                runs_filled.emplace_back(x.p0, x.np);
+                filled_bytes += x.np*PAGE;
+                n_reads++;
+                read_bytes += x.np*PAGE;
+            }
+        }
+    }
+
+    void check_locked(const std::vector<std::pair<size_t, size_t>> & runs);
+
+    void drop_all_locked() {
+        for (const auto & [p0, np] : runs_filled) {
+            VirtualFree(base + p0*PAGE, np*PAGE, MEM_DECOMMIT);
+            std::fill(filled.begin() + p0, filled.begin() + p0 + np, 0);
+        }
+        runs_filled.clear();
+        filled_bytes = 0;
+    }
+};
+
+static std::mutex                           g_win_regions_mu;   // taken before a region's own mutex
+static std::vector<llama_win_read_region *> g_win_regions;
+
+static LONG CALLBACK llama_win_read_region_veh(EXCEPTION_POINTERS * e) {
+    const EXCEPTION_RECORD * er = e->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const char * a = (const char *) er->ExceptionInformation[1];
+    std::lock_guard<std::mutex> lk(g_win_regions_mu);
+    for (auto * r : g_win_regions) {
+        if (a >= r->base && a < r->base + r->size) {
+            std::lock_guard<std::mutex> lr(r->mu);
+            const size_t p = (size_t) (a - r->base) / llama_win_read_region::PAGE;
+            r->fill_locked({ { p, p + 1 } });   // a page another thread filled meanwhile is skipped
+            r->check_locked({ { p, p + 1 } });
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+llama_win_read_region::llama_win_read_region(HANDLE hf, size_t n) : size(n) {
+    if (!DuplicateHandle(GetCurrentProcess(), hf, GetCurrentProcess(), &h, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        throw std::runtime_error(format("lazy table: DuplicateHandle failed: %s", llama_format_win_err(GetLastError()).c_str()));
+    }
+    base = (char *) VirtualAlloc(nullptr, n, MEM_RESERVE, PAGE_READWRITE);
+    if (!base) {
+        CloseHandle(h);
+        throw std::runtime_error(format("lazy table: reserving %zu bytes failed: %s", n, llama_format_win_err(GetLastError()).c_str()));
+    }
+    filled.assign((n + PAGE - 1) / PAGE, 0);
+    for (auto & ev : evs) { ev = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
+    static const PVOID veh = AddVectoredExceptionHandler(1, llama_win_read_region_veh);
+    GGML_ASSERT(veh != nullptr);
+    std::lock_guard<std::mutex> lk(g_win_regions_mu);
+    g_win_regions.push_back(this);
+    LLAMA_LOG_INFO("%s: lazy tables of this file (%.2f GiB) are filled by unbuffered reads, not mapped (LLAMA_WIN_LAZY_MAP=1 maps)\n",
+            __func__, n/1073741824.0);
+}
+
+llama_win_read_region::~llama_win_read_region() {
+    {
+        std::lock_guard<std::mutex> lk(g_win_regions_mu);
+        g_win_regions.erase(std::find(g_win_regions.begin(), g_win_regions.end(), this));
+    }
+    LLAMA_LOG_INFO("%s: lazy tables: %zu reads, %.1f MiB read\n", __func__, n_reads, read_bytes/1048576.0);
+    VirtualFree(base, 0, MEM_RELEASE);
+    for (auto & ev : evs) { if (ev) { CloseHandle(ev); } }
+    CloseHandle(h);
+}
+
+// fill the ranges that lie in a read region (parallel reads) and zero their size so the caller skips them
+static void llama_win_read_region_prefetch(llama_memory_ranges & mr) {
+    using R = llama_win_read_region;
+    std::lock_guard<std::mutex> lk(g_win_regions_mu);
+    for (auto * r : g_win_regions) {
+        std::vector<std::pair<size_t, size_t>> runs;
+        for (auto & m : mr) {
+            const char * a = (const char *) m.addr;
+            if (m.size && a >= r->base && a < r->base + r->size) {
+                const size_t p0 = (size_t) (a - r->base) / R::PAGE;
+                const size_t p1 = std::min(r->filled.size(), ((size_t) (a - r->base) + m.size + R::PAGE - 1) / R::PAGE);
+                runs.emplace_back(p0, p1);
+                m.size = 0;
+            }
+        }
+        if (runs.empty()) {
+            continue;
+        }
+        std::sort(runs.begin(), runs.end());
+        std::lock_guard<std::mutex> lr(r->mu);
+        if (r->filled_bytes > R::budget()) {
+            r->drop_all_locked();   // between graph runs: nothing reads the table now
+        }
+        r->fill_locked(runs);
+        r->check_locked(runs);
+    }
+}
+
+// LLAMA_WIN_LAZY_CHECK=1 (test): every prefetched page run is read again into a buffer of its own and compared with the region
+void llama_win_read_region::check_locked(const std::vector<std::pair<size_t, size_t>> & runs) {
+    static const bool on = getenv("LLAMA_WIN_LAZY_CHECK") && atoi(getenv("LLAMA_WIN_LAZY_CHECK")) != 0;
+    if (!on) {
+        return;
+    }
+    static size_t n_ok = 0;
+    for (const auto & [a, b] : runs) {
+        const size_t len = (b - a)*PAGE;
+        char * tmp = (char *) VirtualAlloc(nullptr, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        GGML_ASSERT(tmp);
+        OVERLAPPED ov{};
+        const uint64_t off = (uint64_t) a*PAGE;
+        ov.Offset = (DWORD) off; ov.OffsetHigh = (DWORD) (off >> 32); ov.hEvent = evs[0]; ResetEvent(evs[0]);
+        DWORD got = 0;
+        if (!ReadFile(h, tmp, (DWORD) len, &got, &ov) && GetLastError() == ERROR_IO_PENDING) {
+            GetOverlappedResult(h, &ov, &got, TRUE);
+        }
+        if (got == 0 || memcmp(tmp, base + a*PAGE, got) != 0) {
+            GGML_ABORT("lazy table check: pages %zu..%zu differ from the file", a, b);
+        }
+        VirtualFree(tmp, 0, MEM_RELEASE);
+        if (++n_ok == 1 || n_ok % 100000 == 0) {
+            LLAMA_LOG_INFO("lazy table check: %zu page runs match the file\n", n_ok);
+        }
+    }
+}
+#endif
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
@@ -729,6 +925,7 @@ struct llama_mmap::impl {
     }
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
+    std::unique_ptr<llama_win_read_region> region;
 
     impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
         GGML_UNUSED(numa);
@@ -736,6 +933,16 @@ struct llama_mmap::impl {
         size = file->size();
 
         HANDLE hFile = (HANDLE) _get_osfhandle(file->file_id());
+
+        // Direct-I/O load, mapped only for lazy tables: any mapped view makes NTFS send the stream's unbuffered expert reads to
+        // the drive one at a time, so the table's pages are filled with our own unbuffered reads instead (LLAMA_WIN_LAZY_MAP=1:
+        // the old file mapping)
+        static const bool keep_map = getenv("LLAMA_WIN_LAZY_MAP") && atoi(getenv("LLAMA_WIN_LAZY_MAP")) != 0;
+        if (file->has_direct_io() && prefetch == 0 && !keep_map) {
+            region = std::make_unique<llama_win_read_region>(hFile, size);
+            addr   = region->base;
+            return;
+        }
 
         hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
 
@@ -785,6 +992,9 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        if (region) {
+            addr = nullptr;   // the region frees its own reservation
+        }
         if (hMapping) {
             if (addr) {
                 if (!UnmapViewOfFile(addr)) {
@@ -985,6 +1195,8 @@ void llama_prefetch(llama_memory_ranges mr) {
     }
 
 #if defined(_WIN32)
+    llama_win_read_region_prefetch(mr);
+
     using prefetch_virtual_memory_t = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
     static const auto pPrefetchVirtualMemory = (prefetch_virtual_memory_t) (void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
     if (!pPrefetchVirtualMemory) {
