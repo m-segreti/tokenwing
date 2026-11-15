@@ -464,6 +464,8 @@ extern "C" {
                                                 //      wave evicts the call's already-used experts first; 0 = off (default)
         int32_t      moe_stream_conv_silu;      // 1 = Ling's KDA conv applies SiLU before the reshape, so the CUDA
                                                 //      conv + SiLU fusion fires (same output), 0 = off
+        int32_t      moe_stream_hc_share;       // 1 = hyper-connection models: the 2*sigmoid(inject) weights of an FFN
+                                                //      combine are computed once for the guess and the layer (same output), 0 = off
         int32_t      moe_stream_gpu_share_q8;   // 1 = CUDA matvecs that read the same input bytes in one graph
                                                 //      share one q8_1 copy of it (same output), 0 = off
         int32_t      moe_stream_vram_experts;   // the first N experts of the list file of every streamed layer are kept in

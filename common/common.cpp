@@ -1870,6 +1870,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_wave_plan        = params.moe_stream_wave_plan;
     mparams.moe_stream_wave_victim      = params.moe_stream_wave_victim;
     mparams.moe_stream_conv_silu        = params.moe_stream_conv_silu;
+    mparams.moe_stream_hc_share         = params.moe_stream_hc_share;
     mparams.moe_stream_gpu_share_q8     = params.moe_stream_gpu_share_q8;
     mparams.moe_stream_vram_experts     = params.moe_stream_vram_experts;
     mparams.moe_stream_vram_experts_file   = params.moe_stream_vram_experts_file.empty() ? NULL : params.moe_stream_vram_experts_file.c_str();

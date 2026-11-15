@@ -2450,6 +2450,9 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inject,
                             int   il);
 
+        // --moe-stream-hc-share: the 2*sigmoid(inject) combine weights per inject tensor, computed once
+        std::map<ggml_tensor *, ggml_tensor *> hc_w;
+
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,

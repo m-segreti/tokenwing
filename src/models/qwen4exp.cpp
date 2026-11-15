@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-stream.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -429,8 +430,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, inject);
-    w = ggml_scale(ctx0, w, 2.0f);
+    // --moe-stream-hc-share: one weight tensor per inject tensor. The guess's shared-expert combine and the layer's own FFN
+    // combine read the same inject, so the second one reuses the weights (the same kernels on the same input, computed once)
+    // and its fused combine reads them instead of recomputing the sigmoid and the scale in front of it
+    const bool share = mstream && mstream->p1.hc_share;
+    ggml_tensor * w = nullptr;
+    if (share) {
+        const auto it = hc_w.find(inject);
+        w = it != hc_w.end() ? it->second : nullptr;
+    }
+    if (w == nullptr) {
+        w = ggml_sigmoid(ctx0, inject);
+        w = ggml_scale(ctx0, w, 2.0f);
+        if (share) {
+            hc_w[inject] = w;
+        }
+    }
 
     ggml_tensor * cur = nullptr;
     if (cparams.fused_dsv4_hc_post && il >= 0) {

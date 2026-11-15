@@ -169,6 +169,8 @@ struct llama_moe_stream_p1 {
     bool        wave_victim    = false;   // a slot's wave mark (slot_wave) lasts the whole multi-wave call, so
                                           //       pick_victim's "an expert of an earlier wave of this call" branch can fire
     bool        conv_silu      = false;   // Ling's KDA conv: SiLU before the reshape, so CUDA fuses conv + SiLU
+    bool        hc_share       = false;   // hyper-connection models: an FFN combine's 2*sigmoid(inject) weights computed once,
+                                          //       for the guess's shared-expert combine and the layer's own combine
     bool        gpu_share_q8   = false;   // CUDA matvecs reading the same input bytes share one q8_1 copy
     uint32_t    vram_experts   = 0;       // the first N experts of the list of every streamed layer live in VRAM, 0 = off
     std::string vram_experts_file;        // the ranked list per layer ("tokenwing vram-experts v1")
