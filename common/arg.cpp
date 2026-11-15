@@ -4921,6 +4921,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-stream-ple-late"}, "0|1",
+        "qwen4exp: the n-gram embedding rows (the per-layer table one layer reads, memory-mapped from the model file) are "
+        "gathered right before the layer that reads them instead of first with the token row, so the CPU gathers them while "
+        "the GPU computes the layers before it; the same values (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-ple-late must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_ple_late = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-gpu-share-q8"}, "0|1",
         "CUDA: matvecs (one to eight rows) that read exactly the same input bytes in one graph compute share one "
         "q8_1 copy of the input instead of quantizing it again each (e.g. 6 per Ling KDA layer -> 1); the same bits. "

@@ -3345,7 +3345,7 @@ llama_moe_stream::llama_moe_stream(
     fprintf(stderr, "%s: io-wake %s, promote %s, guess-cap %d, evict-halflife %.1f, evict-credit %.2f, "
             "prompt-end %s (halflife %.1f), prompt-values %s, chance-model %s, read-threshold %.2f, guess-cap-refill %s, "
             "cpu-skip-zero %s, cpu-x4 %s, cpu-fuse %s, x4-kernel %s, x4-prefetch %s, fused-route %s, slot-check %s, "
-            "conv-silu %s, hc-share %s, rs-window %s, gpu-share-q8 %s, cpu-dispatch %s, vram-experts %u%s, gpu-skip-zero %s, plan %s%s, drop-stale %s, "
+            "conv-silu %s, hc-share %s, rs-window %s, ple-late %s, gpu-share-q8 %s, cpu-dispatch %s, vram-experts %u%s, gpu-skip-zero %s, plan %s%s, drop-stale %s, "
             "cpu-weighted-sum %s, needed-early %s, behind %s, guess-inflight %s, guess-top %s, lookahead %s, protect-named %s, "
             "wordstart %s, proj-ready %s, cpu-state-inplace %s, cpu-small-ops %s\n", __func__,
             p1.io_wake_chunk ? "chunk" : "read", p1.promote ? "on" : "off", p1.guess_cap,
@@ -3356,7 +3356,7 @@ llama_moe_stream::llama_moe_stream(
             p1.cpu_x4 == 1 ? "256-bit" : p1.cpu_x4 == 2 ? "512-bit" : "off",
             p1.cpu_x4_pf < 0 ? "next" : p1.cpu_x4_pf == 0 ? "none" : std::to_string(p1.cpu_x4_pf).c_str(),
             p1.fused_route ? "on" : "off", p1.slot_check ? "on" : "off",
-            p1.conv_silu ? "on" : "off", p1.hc_share ? "on" : "off", p1.rs_window ? "on" : "off", p1.gpu_share_q8 ? "on" : "off",
+            p1.conv_silu ? "on" : "off", p1.hc_share ? "on" : "off", p1.rs_window ? "on" : "off", p1.ple_late ? "on" : "off", p1.gpu_share_q8 ? "on" : "off",
             p1.cpu_dispatch ? "on" : "off",
             p1.vram_experts, p1.vram_experts > 0 || p1.vram_free > 0 ? format("%s (%s)", p1.vram_free > 0 ? format(" [auto: keep-free %.0f MiB at the end state%s]", p1.vram_free/1048576.0,
                 p1.vram_experts > 0 ? ", the pinned N is a cap" : "").c_str() : "", p1.vram_experts_file.c_str()).c_str() : "",

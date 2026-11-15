@@ -860,6 +860,7 @@ struct common_params {
     int32_t     moe_stream_conv_silu   = 0;       // 1 = KDA conv + SiLU fused on CUDA (same bits)
     int32_t     moe_stream_hc_share    = 0;       // 1 = an FFN hyper-connection combine's weights computed once (same bits)
     int32_t     moe_stream_rs_window   = 0;       // 1 = delta-net state fetch / conv-state write in the GPU window (same bits)
+    int32_t     moe_stream_ple_late    = 0;       // 1 = qwen4exp's n-gram rows gathered right before the layer that reads them
     int32_t     moe_stream_gpu_share_q8 = 0;      // 1 = CUDA matvecs share one q8_1 copy of the same input (same bits)
     int32_t     moe_stream_vram_experts = 0;      // N most-picked experts per streamed layer kept in VRAM, 0 = off
     std::string moe_stream_vram_experts_file = ""; // their ranked list (tokenwing vram-experts v1)

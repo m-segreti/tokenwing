@@ -468,6 +468,8 @@ extern "C" {
                                                 //      combine are computed once for the guess and the layer (same output), 0 = off
         int32_t      moe_stream_rs_window;      // 1 = qwen4exp reply graphs with the GPU producer: the next delta-net layer's
                                                 //      state fetch and this layer's conv-state write in the GPU window (same output)
+        int32_t      moe_stream_ple_late;       // 1 = qwen4exp: the n-gram embedding rows are gathered right before the layer that
+                                                //      reads them, not first, so the CPU gathers them while the GPU runs (same output)
         int32_t      moe_stream_gpu_share_q8;   // 1 = CUDA matvecs that read the same input bytes in one graph
                                                 //      share one q8_1 copy of it (same output), 0 = off
         int32_t      moe_stream_vram_experts;   // the first N experts of the list file of every streamed layer are kept in

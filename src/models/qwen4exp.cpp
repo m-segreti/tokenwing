@@ -540,7 +540,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     if (mctx_hyb && hparams.ple_n_heads > 0 && has_ple) {
         ple_emb = build_inp_ple(mctx_hyb);
         // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
+        // --moe-stream-ple-late: not here - the gather (a CPU op on the memory-mapped table) is then built right before the
+        // layer that reads it, so it runs while the GPU computes the layers before that one
+        if (!(mstream && mstream->p1.ple_late)) {
+            ggml_build_forward_expand(gf, ple_emb);
+        }
     }
 
     // the QSA layers share one set of k-pool inputs
