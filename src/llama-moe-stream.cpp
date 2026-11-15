@@ -1765,7 +1765,7 @@ llama_moe_stream::llama_moe_stream(
         off("--moe-stream-vram-follow 1", "--moe-stream-vram-experts N or --moe-stream-vram-free SIZE (the places per streamed layer)");
         p1.vram_follow = false;
     }
-    if (p1.vram_follow && cpu_repack && !(ggml_quant_plugin_get() && ggml_quant_plugin_get()->repack_expert_slot)) {
+    if (p1.vram_follow && cpu_repack) {
         off("--moe-stream-vram-follow 1", "--moe-stream-cpu-repack 0 (it copies RAM slots into the GPU pool, which needs the plain layout)");
         p1.vram_follow = false;
     }
@@ -3911,8 +3911,7 @@ void llama_moe_stream::print_repack_state() const {
         return;
     }
 
-    int64_t n_pool = 0, n_rep = 0;
-    const bool plug_rep = plugin_repack_on.load();
+    int64_t n_pool = 0, n_rep = 0, n_plug = 0;
 
     for (const auto & sl : layers) {
         if (!sl) {
@@ -3923,15 +3922,18 @@ void llama_moe_stream::print_repack_state() const {
                 continue;
             }
             n_pool += 1;
-            n_rep  += (w.pool->extra || plug_rep) ? 1 : 0;
+            n_rep  += (w.pool->extra || w.plugin_repack) ? 1 : 0;
+            n_plug += w.plugin_repack ? 1 : 0;
         }
     }
 
-    fprintf(stderr, "%s: cpu-repack %s: %lld of %lld expert pool tensors hold the repacked layout, "
+    fprintf(stderr, "%s: cpu-repack %s: %lld of %lld expert pool tensors hold the repacked layout%s, "
             "%lld do not (that type or shape has no repacked kernel on this CPU: IQ4_XS has none on x86); "
             "the sidecar stores '%s', so reads are %s\n", __func__,
-            (cpu_repack_on || plug_rep) ? "on" : (cpu_repack ? "OFF (no kernel)" : "off"),
-            (long long) n_rep, (long long) n_pool, (long long) (n_pool - n_rep), sidecar_layout.c_str(),
+            cpu_repack_on ? "on" : (cpu_repack ? "OFF (no kernel)" : "off"),
+            (long long) n_rep, (long long) n_pool,
+            n_plug > 0 ? format(" (%lld of them the quant plugin's)", (long long) n_plug).c_str() : "",
+            (long long) (n_pool - n_rep), sidecar_layout.c_str(),
             convert_on_read ? "converted after the read" : "copied into the slot as they are");
 }
 
@@ -4318,6 +4320,7 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
         throw std::runtime_error(format("failed to wrap the expert pool of '%s'", name.c_str()));
     }
 
+    bool plugin_repack = false;   // this pool's slots hold the quant plugin's layout
     if (cpu_repack || n_repacked_blocks > 0) {
         ggml_backend_buffer_t rbuf = ggml_backend_cpu_repack_buffer_from_ptr(mem, nbytes);
 
@@ -4333,14 +4336,19 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
             } else {
                 ggml_backend_buffer_free(rbuf);   // no repacked kernel for this type/shape
 
-                const ggml_quant_plugin_api * qapi = cpu_repack ? ggml_quant_plugin_get() : nullptr;
-                if (qapi && qapi->repack_expert_slot &&
+                // A quant plugin's format may have its own in-slot layout (repack_expert_slot). Only a plugin type, and only
+                // when the plugin has no GPU kernel for it: nothing says a GPU kernel reads that layout, and the engine
+                // copies RAM slots to a GPU in several places. Such a pool then counts as repacked like a built-in one
+                // (cpu_repack_on), so the same rules keep its slots on the CPU.
+                const bool ext_type = pool->type >= GGML_TYPE_EXT0 && pool->type <= GGML_TYPE_EXT5;
+                const ggml_quant_plugin_api * qapi = cpu_repack && ext_type ? ggml_quant_plugin_get() : nullptr;
+                const bool gpu_kernel = ext_type && (ggml_quant_plugin_has_cuda(pool->type, false) || ggml_quant_plugin_has_cuda(pool->type, true));
+                if (qapi && qapi->repack_expert_slot && !gpu_kernel &&
                         qapi->repack_expert_slot((int32_t) pool->type, nullptr, nullptr, pool->ne[0], pool->ne[1]) == 0) {
+                    plugin_repack    = true;
                     plugin_repack_on = true;
+                    cpu_repack_on    = true;
                     convert_on_read  = true;
-                    if (p1.cpu_x4 == 0) {
-                        ggml_cpu_set_mxfp4_kernel(2, p1.cpu_x4_pf);
-                    }
                 } else if (n_repacked_blocks > 0) {
                     throw std::runtime_error(format(
                                 "the sidecar is stored in the '%s' layout but this CPU has no repacked "
@@ -4431,7 +4439,7 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
     LLAMA_LOG_DEBUG("%s: layer %d %s pool: %d slots x %zu B = %.2f MiB\n",
             __func__, il, name.c_str(), (int) n_slots, nb_expert, nbytes/1024.0/1024.0);
 
-    sl->weights[pi] = { pool, mem, projs[pi].offs, projs[pi].size };
+    sl->weights[pi] = { pool, mem, projs[pi].offs, projs[pi].size, plugin_repack };
 
     return pool;
 }
@@ -4901,7 +4909,7 @@ void llama_moe_stream::repack_slot(llama_moe_stream_layer & sl, int32_t pi, int3
                     sl.il, pi, w.size, ggml_nbytes(w.pool), (int) w.pool->ne[2]);
     }
 
-    if (plugin_repack_on.load(std::memory_order_relaxed)) {
+    if (w.plugin_repack) {
         const ggml_quant_plugin_api * qapi = ggml_quant_plugin_get();
         if (!qapi || !qapi->repack_expert_slot) {
             moe_stream_fail("layer %d projection %d: quant plugin repack_expert_slot missing", sl.il, pi);
@@ -5140,7 +5148,7 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
     // it the other way round (or unconditionally) compared plain bytes with repacked ones.
     const bool have_repacked = have_repacked_in;
 
-    if (have_repacked && plugin_repack_on && wp && wp->pool && wp->mem) {
+    if (have_repacked && wp && wp->plugin_repack && wp->pool && wp->mem) {
         const auto & w = *wp;
         const ggml_quant_plugin_api * qapi = ggml_quant_plugin_get();
         if (qapi && qapi->repack_expert_slot) {
@@ -5217,7 +5225,7 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
             "(in memory %02x%02x%02x, %s %02x%02x%02x)",
             what, il, expert, p, size - i, i,
             h[i], h[(i + 1) % size], h[(i + 2) % size],
-            (cpu_repack_on || plugin_repack_on) ? "repacked model" : (vs_model ? "model" : (model_file ? "model file" : "sidecar")),
+            (cpu_repack_on || (wp && wp->plugin_repack)) ? "repacked model" : (vs_model ? "model" : (model_file ? "model file" : "sidecar")),
             m[i], m[(i + 1) % size], m[(i + 2) % size]);
 
     if (vctx) {
@@ -5288,7 +5296,7 @@ void llama_moe_stream::verify_slot(llama_moe_stream_layer & sl, int32_t slot, in
         }
 
         // a slot of a repacked pool holds the repacked bytes
-        const bool slot_repacked = (cpu_repack_on && w.pool && w.pool->extra != nullptr) || plugin_repack_on.load();
+        const bool slot_repacked = (cpu_repack_on && w.pool && w.pool->extra != nullptr) || w.plugin_repack;
 
         err = compare_model(sl.il, p, expert, (const char *) w.mem + (size_t) slot*w.size, w.size,
                     format("pool slot %d of layer %d", slot, sl.il).c_str(), slot_repacked);
