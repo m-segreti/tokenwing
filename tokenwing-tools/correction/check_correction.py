@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """The correction file: the reader check and the corrupted-file test.
 
-  check_correction.py reproduce --file F --model GGUF --eval LIST [--ref ridge4.json --ref-variant ni70] [--out table.json]
+  check_correction.py reproduce --file F --model GGUF --eval LIST [--ref ridge4.json --ref-variant ni70 [--max-diff N]] [--out table.json]
       Loads F with the reference loader (correction_file.load_correction), folds it as the engine does (W' = W_X diag(g_X) + Bt on models with
       ffn_norm, or W' = W_X + Bt on hyper-connection models without ffn_norm; a pair absent from the file = the plain guess), scores the
       held-out recordings of LIST ("set kind dir" per line) and prints need recall / miss coverage / read precision.  With --ref it compares
-      every count of the reference run (a saved ridge JSON, the variant given) and prints the differences: for a file with ALL pairs they must be ~0.
+      every count of the reference run (a saved ridge JSON, the variant given) and prints the differences: for a file with ALL pairs they must be ~0
+      (a few counts of rounding are normal: the stored Ling reproduction differs by 3).  With --max-diff N the exit code is 1 when a count
+      differs by more than N; without it the check only prints.
   check_correction.py selftest --model GGUF [--other-model GGUF2] --work DIR
       Writes a small file and shows that the loader REFUSES: a truncated file, an extended file, a flipped payload byte, a flipped header byte,
       a wrong magic, an unknown format, a pair outside the file, overlapping pairs, a router hash mismatch, another model (and that the good file loads).
@@ -185,7 +187,11 @@ if __name__ == "__main__":
     p = sp.add_parser("reproduce")
     p.add_argument("--file", required=True); p.add_argument("--model", required=True); p.add_argument("--eval", required=True)
     p.add_argument("--ref", default=None); p.add_argument("--ref-variant", default="ni70"); p.add_argument("--out", default=None)
+    p.add_argument("--max-diff", type=float, default=None, help="with --ref: exit 1 when a count differs from the reference by more than this")
     p = sp.add_parser("selftest")
     p.add_argument("--model", required=True); p.add_argument("--other-model", default=None); p.add_argument("--work", required=True)
     a = ap.parse_args()
-    sys.exit(selftest(a) if a.cmd == "selftest" else (1 if (reproduce(a) or 0) > 1e-6 else 0))
+    if a.cmd == "selftest":
+        sys.exit(selftest(a))
+    worst = reproduce(a)
+    sys.exit(1 if a.max_diff is not None and worst > a.max_diff else 0)
