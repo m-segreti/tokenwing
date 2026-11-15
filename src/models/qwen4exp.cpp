@@ -576,6 +576,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // The expert streaming's word-start guesses (shared code, llama-graph.cpp; nothing without --moe-stream-wordstart)
     llm_graph_moe_ws ws = moe_ws_begin();
 
+    // --moe-stream-rs-window: in a reply graph with the GPU producer, a delta-net layer's conv-state write and the next
+    // delta-net layer's conv / recurrent state fetch go into the GPU window of the MoE layer (the idle time after the router
+    // mark while the CPU computes the experts). They read nothing of this word's activations after the conv input, so they
+    // leave the serial path between the CPU experts and the next router. Same ops on the same inputs, another order
+    rs_window_on = inp && mstream && mstream->p1.rs_window && mstream->ne_gpu_graph() && n_tokens == 1 &&
+                   cparams.n_rs_seq == 0 && params.lm_phase == 0;
+
     for (int il = lm_b; il < lm_e; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
@@ -650,7 +657,33 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         moe_guess_finish_in(model, il, base, base ? guess_in : nullptr, g);
 
         ggml_tensor * ffn_in_n = cur;   // a word-start source's guess input without --moe-stream-pred-shared
+        if (rs_window_on) {
+            const int  il_next  = il + 1;
+            const bool pre_next = il_next < lm_e && hparams.is_recr(il_next);
+            if (!conv_defer.empty() || pre_next) {
+                llm_graph_input_rs * inp_rs = inp->get_recr();
+                moe_window_nodes = [this, inp_rs, il_next, pre_next]() {
+                    for (ggml_tensor * c : conv_defer) {
+                        ggml_build_forward_expand(gf, c);
+                    }
+                    conv_defer.clear();
+                    if (pre_next) {   // the same gathers build_conv_state_at and build_layer_attn_linear would build
+                        ggml_tensor * conv_all = inp_rs->mctx->get_r_l(il_next);
+                        ggml_tensor * ssm_all  = inp_rs->mctx->get_s_l(il_next);
+                        if (rs_rows.find(conv_all) == rs_rows.end()) {
+                            rs_rows.emplace(conv_all, build_rs(inp_rs, conv_all, conv_all->ne[0], ubatch.n_seqs));
+                        }
+                        if (rs_rows.find(ssm_all) == rs_rows.end()) {
+                            rs_rows.emplace(ssm_all, build_rs(inp_rs, ssm_all, hparams.n_embd_s(), ubatch.n_seqs));
+                        }
+                    }
+                };
+            }
+        }
         cur = build_layer_ffn(cur, il, &g, shexp);
+        if (rs_window_on) {
+            run_moe_window();   // a layer whose MoE has no window (a whole VRAM layer): here, after its routed experts
+        }
         if (cur == nullptr) {   // the routed experts + shared expert + HC combine come later, in the layer's expert graph
             GGML_ASSERT(params.lm_phase == 1 && params.lm_x && params.lm_inj);
             ggml_tensor * x_dst = ggml_view_2d(ctx0, params.lm_x, n_embd, n_tokens, params.lm_x->nb[1],
@@ -1314,9 +1347,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+            conv_kernel_size - 1, conv_channels, il, rs_window_on ? &conv_defer : nullptr);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state = nullptr;
+    if (rs_window_on) {   // fetched in the window of the layer before (rs_rows holds it)
+        const auto it = rs_rows.find(ssm_states_all);
+        state = it != rs_rows.end() ? it->second : nullptr;
+    }
+    if (state == nullptr) {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    }
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -1568,7 +1608,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
         ggml_tensor *        x,
         int64_t              state_cols,
         int64_t              channels,
-        int                  il) {
+        int                  il,
+        std::vector<ggml_tensor *> * defer) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head = mctx_cur->get_head();
@@ -1610,7 +1651,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        if (defer) {   // the strided tail copied as it is (one copy instead of a contiguous copy and a copy), expanded later
+            defer->push_back(ggml_cpy(ctx0, tail, dst));
+        } else {
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        }
     }
 
     return conv_input;

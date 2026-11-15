@@ -171,6 +171,8 @@ struct llama_moe_stream_p1 {
     bool        conv_silu      = false;   // Ling's KDA conv: SiLU before the reshape, so CUDA fuses conv + SiLU
     bool        hc_share       = false;   // hyper-connection models: an FFN combine's 2*sigmoid(inject) weights computed once,
                                           //       for the guess's shared-expert combine and the layer's own combine
+    bool        rs_window      = false;   // qwen4exp reply graphs with the GPU producer: the next delta-net layer's state fetch
+                                          //       and this layer's conv-state write in the MoE layer's GPU window
     bool        gpu_share_q8   = false;   // CUDA matvecs reading the same input bytes share one q8_1 copy
     uint32_t    vram_experts   = 0;       // the first N experts of the list of every streamed layer live in VRAM, 0 = off
     std::string vram_experts_file;        // the ranked list per layer ("tokenwing vram-experts v1")

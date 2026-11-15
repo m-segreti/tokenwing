@@ -2513,13 +2513,19 @@ struct llama_model_qwen4exp : public llama_model_base {
         std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
         // one conv history per cache tensor: delta-net and PLE each have their own
+        // defer: the history write is collected there (a strided copy) instead of expanded
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                            int   il);
+                            int   il,
+      std::vector<ggml_tensor *> * defer = nullptr);
+
+        // --moe-stream-rs-window: on in this graph, and the delta-net layer's conv-state writes waiting for its window
+        bool                       rs_window_on = false;
+        std::vector<ggml_tensor *> conv_defer;
 
         ggml_tensor * build_inp_ple(
   const llama_memory_hybrid_idx_context * mctx_hyb);

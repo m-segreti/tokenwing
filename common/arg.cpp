@@ -4906,6 +4906,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-stream-rs-window"}, "0|1",
+        "qwen4exp delta-net layers, reply graphs with the GPU producer (--moe-stream-needed-early 1): the next delta-net "
+        "layer's conv and recurrent state fetch and this layer's conv-state write run in the GPU's window after the router "
+        "mark (while the CPU computes the experts) instead of on the serial path between the CPU experts and the next router; "
+        "the conv-state write copies the strided view directly; the same values (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-rs-window must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_rs_window = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-gpu-share-q8"}, "0|1",
         "CUDA: matvecs (one to eight rows) that read exactly the same input bytes in one graph compute share one "
         "q8_1 copy of the input instead of quantizing it again each (e.g. 6 per Ling KDA layer -> 1); the same bits. "
