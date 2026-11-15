@@ -1898,6 +1898,19 @@ static inline bool ggml_cuda_is_ext_type(ggml_type type) {
     return type >= GGML_TYPE_EXT0 && type <= GGML_TYPE_EXT5;
 }
 
+// A quant plugin type with the plugin's own GPU kernel. The type is tested first, inline, so every other matmul pays one
+// compare and no call into ggml-base. The plugin's kernels are CUDA code and get a CUDA stream: a HIP or MUSA build never
+// hands them its own stream (the plugin type then has no GPU support there and its weights stay on the CPU).
+static inline bool ggml_cuda_plugin_kernel(ggml_type type, bool is_id) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(type);
+    GGML_UNUSED(is_id);
+    return false;
+#else
+    return ggml_cuda_is_ext_type(type) && ggml_quant_plugin_has_cuda(type, is_id);
+#endif
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -2173,7 +2186,7 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && ggml_quant_plugin_has_cuda(src0->type, /*is_id =*/ false)) {
+    if (ggml_cuda_plugin_kernel(src0->type, /*is_id =*/ false) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         const ggml_quant_plugin_api * api = ggml_quant_plugin_get();
         GGML_ASSERT(api != nullptr && api->mul_mat_cuda != nullptr);
         const int32_t rc = api->mul_mat_cuda(
@@ -2311,7 +2324,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (ggml_quant_plugin_has_cuda(src0->type, /*is_id =*/ true)) {
+    if (ggml_cuda_plugin_kernel(src0->type, /*is_id =*/ true)) {
         return false;
     }
 
@@ -2346,7 +2359,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    if (ggml_quant_plugin_has_cuda(src0->type, /*is_id =*/ true)) {
+    if (ggml_cuda_plugin_kernel(src0->type, /*is_id =*/ true)) {
         GGML_ASSERT(ids->type == GGML_TYPE_I32);
         const ggml_quant_plugin_api * api = ggml_quant_plugin_get();
         GGML_ASSERT(api != nullptr && api->mul_mat_id_cuda != nullptr);
@@ -6298,7 +6311,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_EXT4:
                     case GGML_TYPE_EXT5:
                         return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
-                               ggml_quant_plugin_has_cuda(a->type, op->op == GGML_OP_MUL_MAT_ID);
+                               ggml_cuda_plugin_kernel(a->type, op->op == GGML_OP_MUL_MAT_ID);
                     default:
                         return false;
                 }
