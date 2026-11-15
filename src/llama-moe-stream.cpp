@@ -5145,8 +5145,8 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
         const ggml_quant_plugin_api * qapi = ggml_quant_plugin_get();
         if (qapi && qapi->repack_expert_slot) {
             if (!verify_repack_mem) {
-                void * mem = nullptr;
-                if (posix_memalign(&mem, MOE_STREAM_ALIGN, w.size) != 0) {
+                void * mem = moe_aligned_alloc(w.size);
+                if (!mem) {
                     fprintf(stderr, "llama_moe_stream: the read-back check is skipped: cannot allocate %zu bytes for it\n", w.size);
                     return "";
                 }
