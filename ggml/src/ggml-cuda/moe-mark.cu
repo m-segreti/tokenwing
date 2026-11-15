@@ -1,13 +1,14 @@
 #include "moe-mark.cuh"
 
 #include <algorithm>
-#include <atomic>
 #include <vector>
+
+#if defined(GGML_USE_HIP)
+#include <atomic>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 
-#if defined(GGML_USE_HIP)
 static std::atomic<int32_t> g_hip_sync_spin_us{0};
 
 void ggml_hip_set_sync_spin_us(int32_t spin_us) {
@@ -27,7 +28,7 @@ int32_t ggml_hip_get_sync_spin_us(void) {
     return env_us >= 0 ? env_us : g_hip_sync_spin_us.load(std::memory_order_relaxed);
 }
 
-static inline void ggml_hip_spin_pause(void) {
+void ggml_hip_spin_pause(void) {
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
 #elif defined(__aarch64__)

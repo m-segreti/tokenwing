@@ -3045,11 +3045,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
         if (q == cudaErrorNotReady) {
             const int64_t t0 = ggml_time_us();
             for (uint32_t it = 0;; ++it) {
-#if defined(__x86_64__) || defined(_M_X64)
-                _mm_pause();
-#elif defined(__aarch64__)
-                asm volatile("yield" ::: "memory");
-#endif
+                ggml_hip_spin_pause();
                 q = cudaStreamQuery(cuda_ctx->stream());
                 if (q == cudaSuccess) {
                     ggml_cuda_prof_flush();

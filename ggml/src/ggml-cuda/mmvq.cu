@@ -625,6 +625,8 @@ static bool mmvq_rdna4_short_rows_on() {
 }
 
 #if defined(GGML_USE_HIP)
+#include <atomic>
+
 static std::atomic<bool> g_hip_mmvq_rdna_opt{false};
 
 void ggml_hip_set_mmvq_rdna(bool on) {

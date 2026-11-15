@@ -63,6 +63,7 @@ bool ggml_cuda_moe_mark_takes_node(const ggml_tensor * node);
 #if defined(GGML_USE_HIP)
 void    ggml_hip_set_sync_spin_us(int32_t spin_us);
 int32_t ggml_hip_get_sync_spin_us(void);
+void    ggml_hip_spin_pause(void);   // one CPU pause in a spin-wait loop (x86: pause, ARM: yield)
 #endif
 
 // TEST ONLY (MOE_STREAM_TEST_VF_PLACE_CHECK): one thread spins for us microseconds of GPU time on stream,
