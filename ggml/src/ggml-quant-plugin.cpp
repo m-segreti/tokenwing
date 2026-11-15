@@ -65,6 +65,10 @@ HMODULE load_shared_lib(const char * utf8_path, std::string & err_out) {
 void * resolve_sym(HMODULE h, const char * name) {
     return reinterpret_cast<void *>(GetProcAddress(h, name));
 }
+
+void close_shared_lib(HMODULE h) {
+    FreeLibrary(h);
+}
 #else
 void * g_plugin_handle = nullptr;
 
@@ -81,7 +85,41 @@ void * load_shared_lib(const char * path, std::string & err_out) {
 void * resolve_sym(void * h, const char * name) {
     return dlsym(h, name);
 }
+
+void close_shared_lib(void * h) {
+    dlclose(h);
+}
 #endif
+
+// What makes a plugin type usable: the CPU computes every expert held in RAM, so a type needs its CPU dot product and
+// the format its other operand is converted to (a built-in type), and dequantization for the operations that read rows
+// (get_rows, the read-back check). Returns the reason a slot cannot be used, or nullptr.
+const char * type_info_problem(const ggml_quant_plugin_type_info & info) {
+    if (info.type_name == nullptr || info.type_name[0] == '\0') {
+        return "no type name";
+    }
+    if (info.blck_size <= 0 || info.type_size == 0) {
+        return "block size or bytes per block is 0";
+    }
+    if (info.to_float == nullptr) {
+        return "no to_float (dequantization)";
+    }
+    if (info.vec_dot == nullptr) {
+        return "no vec_dot (CPU dot product)";
+    }
+    // the formats ggml's CPU backend converts a matmul's other operand to (each has a CPU from_float)
+    switch (info.vec_dot_type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
+        case GGML_TYPE_Q8_K:
+            return nullptr;
+        default:
+            return "a vec_dot_type other than F32, F16, BF16, Q8_0, Q8_1 or Q8_K";
+    }
+}
 
 } // namespace
 
@@ -112,16 +150,29 @@ bool ggml_quant_plugin_load(const char * path) {
             return false;
         }
 
+        // every way out below that refuses the plugin closes the library again; nothing global changes before the end
         auto get_api = reinterpret_cast<ggml_quant_plugin_get_api_t>(resolve_sym(h, GGML_QUANT_PLUGIN_ENTRY_NAME));
         if (!get_api) {
             GGML_LOG_ERROR("%s: '%s' does not export '%s'\n", __func__, path, GGML_QUANT_PLUGIN_ENTRY_NAME);
+            close_shared_lib(h);
             return false;
         }
 
         const ggml_quant_plugin_api * api = get_api();
-        if (!api || api->abi_version != GGML_QUANT_PLUGIN_ABI_VERSION) {
-            GGML_LOG_ERROR("%s: '%s' ABI version mismatch (got %u, expected %u)\n",
-                __func__, path, api ? api->abi_version : 0u, (unsigned) GGML_QUANT_PLUGIN_ABI_VERSION);
+        if (!api) {
+            GGML_LOG_ERROR("%s: '%s': %s returned no interface\n", __func__, path, GGML_QUANT_PLUGIN_ENTRY_NAME);
+            close_shared_lib(h);
+            return false;
+        }
+        if (api->abi_version != GGML_QUANT_PLUGIN_ABI_VERSION) {
+            GGML_LOG_ERROR("%s: '%s' was built for plugin interface version %u, this build has version %u\n",
+                __func__, path, api->abi_version, (unsigned) GGML_QUANT_PLUGIN_ABI_VERSION);
+            close_shared_lib(h);
+            return false;
+        }
+        if (api->get_type_info == nullptr) {
+            GGML_LOG_ERROR("%s: '%s' has no get_type_info\n", __func__, path);
+            close_shared_lib(h);
             return false;
         }
 
@@ -130,23 +181,39 @@ bool ggml_quant_plugin_load(const char * path) {
             if (rc != 0) {
                 const char * why = api->last_error ? api->last_error() : "init failed";
                 GGML_LOG_ERROR("%s: '%s' init failed (%d): %s\n", __func__, path, (int) rc, why ? why : "");
+                close_shared_lib(h);
                 return false;
             }
         }
 
+        // all slots are checked before any of them is registered, so a refused plugin leaves ggml's type tables as they were
+        const auto refuse = [&]() {
+            if (api->shutdown) {
+                api->shutdown();
+            }
+            close_shared_lib(h);
+            return false;
+        };
+        ggml_quant_plugin_type_info infos[GGML_QUANT_PLUGIN_MAX_TYPES] = {};
         for (int32_t i = 0; i < GGML_QUANT_PLUGIN_MAX_TYPES; ++i) {
-            ggml_quant_plugin_type_info info = {};
-            if (!api->get_type_info || api->get_type_info(i, &info) != 0) {
+            if (api->get_type_info(i, &infos[i]) != 0) {
                 const char * why = api->last_error ? api->last_error() : "get_type_info failed";
                 GGML_LOG_ERROR("%s: '%s' get_type_info(%d) failed: %s\n", __func__, path, (int) i, why ? why : "");
-                return false;
+                return refuse();
             }
-            if (!info.enabled) {
+            if (!infos[i].enabled) {
                 continue;
             }
-            if (info.blck_size <= 0 || info.type_size == 0 || info.type_name == nullptr) {
-                GGML_LOG_ERROR("%s: '%s' returned invalid traits for slot %d\n", __func__, path, (int) i);
-                return false;
+            if (const char * why = type_info_problem(infos[i])) {
+                GGML_LOG_ERROR("%s: '%s' cannot be used: its type in slot %d (%s) has %s\n", __func__, path, (int) i,
+                    infos[i].type_name ? infos[i].type_name : "?", why);
+                return refuse();
+            }
+        }
+        for (int32_t i = 0; i < GGML_QUANT_PLUGIN_MAX_TYPES; ++i) {
+            const ggml_quant_plugin_type_info & info = infos[i];
+            if (!info.enabled) {
+                continue;
             }
             ggml_internal_set_ext_type_traits(
                 (ggml_type) (GGML_TYPE_EXT0 + i),

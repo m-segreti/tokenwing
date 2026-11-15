@@ -746,8 +746,13 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
             // check that row size is divisible by block size
             if (blck_size == 0 || info.t.ne[0] % blck_size != 0) {
                 if (blck_size == 0 && info.t.type >= GGML_TYPE_EXT0 && info.t.type <= GGML_TYPE_EXT5) {
-                    GGML_LOG_ERROR("%s: tensor '%s' uses extension type %d (%s), which requires --quant-plugin <path>\n",
-                        __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type));
+                    if (ggml_quant_plugin_get() == nullptr) {
+                        GGML_LOG_ERROR("%s: tensor '%s' uses plugin type %d (%s), which requires --quant-plugin <path>\n",
+                            __func__, info.t.name, (int) info.t.type, ggml_type_name(info.t.type));
+                    } else {
+                        GGML_LOG_ERROR("%s: tensor '%s' uses plugin type %d (slot %d), which the loaded quant plugin does not provide\n",
+                            __func__, info.t.name, (int) info.t.type, (int) (info.t.type - GGML_TYPE_EXT0));
+                    }
                 } else {
                     GGML_LOG_ERROR("%s: tensor '%s' of type %d (%s) has %" PRId64 " elements per row, "
                         "not a multiple of block size (%" PRId64 ")\n",
