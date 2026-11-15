@@ -4497,9 +4497,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-vram-chunk"}, "SIZE",
-        "with --moe-stream-vram-experts / --moe-stream-vram-free: partition each format's VRAM expert pool across contiguous layer "
-        "sub-groups so every sub-group buffer and tensor stays within SIZE and the device's storage-buffer range (1 or auto = 2GiB, "
-        "SIZE > 1 = explicit cap such as 1536MiB, default: 0 = off, one group per format)",
+        "with --moe-stream-vram-experts / --moe-stream-vram-free: split the VRAM expert pool into buffers of "
+        "consecutive layers of at most SIZE each (auto or 1 = 2GiB), for GPUs whose largest buffer is smaller than "
+        "the pool (Vulkan on AMD: 4 GiB per allocation); not needed on CUDA / ROCm. Each buffer has its own zero "
+        "slices, VRAM follow moves experts only inside one buffer, and the pool's tail is off when it does not fit "
+        "next to its buffer's experts; a SIZE too small for one expert switches the pool off with one line "
+        "(default: 0 = one buffer per expert format)",
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
                 params.moe_stream_vram_chunk = 1;
@@ -4514,9 +4517,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-uma"}, "0|1",
-        "with --moe-stream on unified-memory GPUs (integrated APUs / iGPUs and Apple Silicon Metal): size pools from one shared "
-        "system RAM budget, skip the duplicate VRAM expert pool, and map 64 KiB-aligned RAM expert pools directly onto the GPU "
-        "without host-to-device weight copies (default: 0 = off)",
+        "unified-memory GPUs (integrated GPUs, Apple): the GPU's weights and whole MoE layers are counted in the "
+        "RAM budget, whole MoE layers are kept by the auto-fit only if all of them fit, there is no VRAM expert "
+        "pool, and the RAM expert pools are 64 KiB-aligned. The GPU computes the routed experts straight from the "
+        "RAM slots only on Vulkan (host-memory import) and Metal; on ROCm and CUDA, and with --moe-stream-window, "
+        "elastic RAM, slot shares, huge pages or the CPU repack, the pools stay normal host pools, with one line. "
+        "The GPU's KV cache and compute buffers are not in the RAM plan: leave room for them with "
+        "--moe-stream-ram-free. No unified-memory GPU among the model's devices: ignored, one line "
+        "(default: 0 = off)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {
                 const int v0 = value;
@@ -4528,8 +4536,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-hip-mmvq"}, "0|1",
-        "under ROCm/HIP on AMD RDNA GPUs: enable 1-warp and 2-warp rows_per_block=8 short-row quantized matmul-vec dispatch across "
-        "RDNA2, RDNA3, RDNA3.5, and RDNA4, and use multi-warp RDNA3 tables on RDNA3.5 (default: 0 = off)",
+        "ROCm, AMD RDNA GPUs: one-column quantized matvecs whose rows fit one or two warps run 1 or 2 warps with 8 "
+        "rows per block (RDNA4 runs the one-warp shape by default), and RDNA3.5 uses RDNA3's warp counts; "
+        "process-wide, the same as GGML_HIP_MMVQ_RDNA=1; no ROCm backend: ignored, one line (default: 0 = off)",
         [](common_params & params, int value) {
             if (value != 0 && value != 1) {
                 const int v0 = value;
@@ -4541,8 +4550,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-hip-sync"}, "N",
-        "under ROCm/HIP: user-space spin-poll window in microseconds on fine-grained completion counters and stream events before "
-        "blocking in hipEventSynchronize / hipStreamSynchronize (1 = auto 400 us, > 1 = explicit us, default: 0 = off)",
+        "ROCm: before a GPU stream sync or a wait for one of the engine's GPU marks, spin up to N microseconds on "
+        "the stream / on the mark's counter in pinned memory, then wait as before (1 = 400 us); process-wide; "
+        "GGML_HIP_SYNC_SPIN_US overrides it when set; no ROCm backend: ignored, one line (default: 0 = off)",
         [](common_params & params, int value) {
             if (value < 0) {
                 LOG_WRN("--moe-stream-hip-sync must be >= 0: %d -> 0\n", value);
