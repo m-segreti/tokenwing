@@ -3380,6 +3380,7 @@ struct llama_moe_stream {
     // bytes it compares are not a slot (writing the repacked model bytes into slot 0 of the pool would
     // corrupt a live expert)
     mutable void *                     verify_repack_mem = nullptr;
+    mutable size_t                     verify_repack_bytes = 0;   // its size: the largest slice checked so far
     mutable std::vector<ggml_context *> repack_verify_ctxs;
     mutable std::vector<ggml_tensor *>  repack_verify_views;
     // Compare the bytes of one projection of one expert of one layer in the model file

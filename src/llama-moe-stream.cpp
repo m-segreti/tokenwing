@@ -5148,21 +5148,36 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
     // it the other way round (or unconditionally) compared plain bytes with repacked ones.
     const bool have_repacked = have_repacked_in;
 
+    // the check's scratch for the repacked reference, as large as the largest slice so far (the projections and layers of a
+    // mixed-format model have slices of different sizes)
+    const auto verify_scratch = [this](size_t n) -> bool {
+        if (verify_repack_mem && verify_repack_bytes >= n) {
+            return true;
+        }
+        if (verify_repack_mem) {
+            moe_aligned_free(verify_repack_mem);
+        }
+        verify_repack_mem   = moe_aligned_alloc(n);
+        verify_repack_bytes = verify_repack_mem ? n : 0;
+        if (!verify_repack_mem) {
+            fprintf(stderr, "llama_moe_stream: the read-back check is skipped: cannot allocate %zu bytes for it\n", n);
+        }
+        return verify_repack_mem != nullptr;
+    };
+
     if (have_repacked && wp && wp->plugin_repack && wp->pool && wp->mem) {
         const auto & w = *wp;
         const ggml_quant_plugin_api * qapi = ggml_quant_plugin_get();
         if (qapi && qapi->repack_expert_slot) {
-            if (!verify_repack_mem) {
-                void * mem = moe_aligned_alloc(w.size);
-                if (!mem) {
-                    fprintf(stderr, "llama_moe_stream: the read-back check is skipped: cannot allocate %zu bytes for it\n", w.size);
-                    return "";
-                }
-                verify_repack_mem = mem;
+            if (!verify_scratch(w.size)) {
+                return "";
             }
-            if (qapi->repack_expert_slot((int32_t) w.pool->type, verify_repack_mem, m, w.pool->ne[0], w.pool->ne[1]) == 0) {
-                m = (const uint8_t *) verify_repack_mem;
+            const int32_t rc = qapi->repack_expert_slot((int32_t) w.pool->type, verify_repack_mem, m, w.pool->ne[0], w.pool->ne[1]);
+            if (rc != 0) {
+                return format("%s: the quant plugin could not repack the reference of layer %d expert %d projection %d (%d)",
+                        what, il, expert, p, (int) rc);
             }
+            m = (const uint8_t *) verify_repack_mem;
         }
     } else if (have_repacked && cpu_repack_on && wp && wp->pool && wp->pool->extra && wp->mem) {
         const auto & w = *wp;
@@ -5170,15 +5185,8 @@ std::string llama_moe_stream::compare_model(int32_t il, int p, int32_t expert, c
         // The repack always goes into this function's own scratch, never into the pool. It used to be written
         // into the slot under comparison, which made the comparison vacuous (it compared the slot with
         // the bytes it had just written there) and let the check overwrite a live slot of the pool.
-        if (!verify_repack_mem) {
-            void * mem = moe_aligned_alloc(w.size);
-
-            if (!mem) {
-                fprintf(stderr, "llama_moe_stream: the read-back check is skipped: cannot allocate %zu bytes for it\n", w.size);
-                return "";
-            }
-
-            verify_repack_mem = mem;
+        if (!verify_scratch(w.size)) {
+            return "";
         }
 
         uint8_t * dst = (uint8_t *) verify_repack_mem;
@@ -14733,8 +14741,8 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         const int64_t nb_dn = (int64_t) ggml_row_size(G.t_down, G.ne_down[0])*G.ne_down[1];
         bytes_per_n += (nb_gu + nb_dn)*(int64_t) G.layers.size();
         bytes_zero  += (nb_gu + nb_dn)*(int64_t) n_zero;
-        if (vp) {   // the group's id table (with the fixed part, so the fit check counts it)
-            bytes_zero += (int64_t) n_expert_used*n_expert_total*(int64_t) G.layers.size()*(int64_t) sizeof(int32_t);
+        if (vp) {   // the group's id table (with the fixed part, so the fit check counts it; one row more for the dropped-pair id)
+            bytes_zero += (int64_t) n_expert_used*(n_expert_total + 1)*(int64_t) G.layers.size()*(int64_t) sizeof(int32_t);
         }
     }
 
@@ -15536,7 +15544,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         vp_test_stale = getenv("MOE_STREAM_TEST_VP_STALE_TABLE") ? std::max(0, atoi(getenv("MOE_STREAM_TEST_VP_STALE_TABLE"))) : 0;
         fprintf(stderr, "%s: vram-parallel (--moe-stream-vram-parallel %d): in a needed-early GPU-producer one-token decode graph each marked layer's "
                 "device pass runs in its GPU launch after \"router done\", during the CPU experts, its ids from a VRAM table "
-                "(%.1f KiB)%s\n", __func__, p1.vram_parallel_cross ? 2 : 1, (double) n_expert_used*n_expert_total*il_of_moe.size()*sizeof(int32_t)/1024.0,
+                "(%.1f KiB)%s\n", __func__, p1.vram_parallel_cross ? 2 : 1, (double) n_expert_used*(n_expert_total + 1)*il_of_moe.size()*sizeof(int32_t)/1024.0,
                 vp_test_stale > 0 ? format("; MOE_STREAM_TEST_VP_STALE_TABLE=%d (TEST ONLY): that incoming row write is skipped",
                 vp_test_stale).c_str() : "");
     }
