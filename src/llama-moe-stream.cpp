@@ -376,19 +376,14 @@ static size_t os_direct_io_align(int fd, size_t file_size, const char ** how) {
     }
 #elif defined(_WIN32)
     GGML_UNUSED(file_size);
+    // An unbuffered read must be on the volume's logical sector size. The storage property query only answers on a volume or
+    // disk handle (on a file handle it fails with ERROR_INVALID_PARAMETER), so ask through the file handle itself
     HANDLE h = (HANDLE) _get_osfhandle(fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        STORAGE_PROPERTY_QUERY q{};
-        q.PropertyId = StorageAccessAlignmentProperty;
-        q.QueryType  = PropertyStandardQuery;
-        STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR desc{};
-        DWORD ret_bytes = 0;
-        if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), &desc, sizeof(desc), &ret_bytes, NULL) &&
-                ret_bytes >= sizeof(desc) && desc.BytesPerLogicalSector >= 512 &&
-                (desc.BytesPerLogicalSector & (desc.BytesPerLogicalSector - 1)) == 0) {
-            *how = "StorageAccessAlignmentProperty";
-            return (size_t) desc.BytesPerLogicalSector;
-        }
+    FILE_STORAGE_INFO si{};
+    if (h != INVALID_HANDLE_VALUE && GetFileInformationByHandleEx(h, FileStorageInfo, &si, sizeof(si)) &&
+            si.LogicalBytesPerSector >= 512 && (si.LogicalBytesPerSector & (si.LogicalBytesPerSector - 1)) == 0) {
+        *how = "the volume's logical sector size";
+        return (size_t) si.LogicalBytesPerSector;
     }
 #else
     GGML_UNUSED(fd); GGML_UNUSED(file_size);

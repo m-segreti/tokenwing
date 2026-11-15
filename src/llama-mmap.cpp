@@ -108,16 +108,13 @@ struct llama_file::impl {
             CloseHandle(h);
             return false;
         }
+        // unbuffered reads must be on the volume's logical sector size; the storage property query does not answer on a file
+        // handle, the file's storage information does
         size_t align = 4096;
-        STORAGE_PROPERTY_QUERY q{};
-        q.PropertyId = StorageAccessAlignmentProperty;
-        q.QueryType  = PropertyStandardQuery;
-        STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR desc{};
-        DWORD ret_bytes = 0;
-        if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), &desc, sizeof(desc), &ret_bytes, NULL) &&
-                ret_bytes >= sizeof(desc) && desc.BytesPerLogicalSector >= 512 &&
-                (desc.BytesPerLogicalSector & (desc.BytesPerLogicalSector - 1)) == 0) {
-            align = (size_t) desc.BytesPerLogicalSector;
+        FILE_STORAGE_INFO si{};
+        if (GetFileInformationByHandleEx(h, FileStorageInfo, &si, sizeof(si)) &&
+                si.LogicalBytesPerSector >= 512 && (si.LogicalBytesPerSector & (si.LogicalBytesPerSector - 1)) == 0) {
+            align = (size_t) si.LogicalBytesPerSector;
         }
         const int cfd = _open_osfhandle((intptr_t) h, _O_RDONLY | _O_BINARY);
         if (cfd == -1) {
