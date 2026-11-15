@@ -1872,8 +1872,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 first_igpu = first_igpu == nullptr && t == GGML_BACKEND_DEVICE_TYPE_IGPU ? dv.dev : first_igpu;
             }
         }
-        if (first_gpu == nullptr) {
-            first_gpu = first_igpu;
+        if (first_gpu == nullptr && params.moe_stream_uma == 1) {
+            first_gpu = first_igpu;   // --moe-stream-uma 1: an integrated GPU can be the engine's GPU (without it, it stays out as before)
         }
         const auto gpu_by_name = [&](const std::string & n, bool igpu_ok) -> ggml_backend_dev_t {
             for (const auto & dv : devices) {
@@ -1887,7 +1887,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_t ms_pool_dev = first_gpu;
         bool ms_pool_dev_set = false;
         if (params.moe_stream_vram_device && params.moe_stream_vram_device[0]) {
-            if (ggml_backend_dev_t d = gpu_by_name(params.moe_stream_vram_device, /* igpu_ok = */ true)) {
+            if (ggml_backend_dev_t d = gpu_by_name(params.moe_stream_vram_device, /* igpu_ok = */ params.moe_stream_uma == 1)) {
                 ms_pool_dev     = d;
                 ms_pool_dev_set = true;
             } else {

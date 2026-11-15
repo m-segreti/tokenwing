@@ -4397,7 +4397,11 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
             if (!uma_wrapped) {
                 ggml_backend_dev_props props{};
                 ggml_backend_dev_get_props(uma_dev, &props);
-                if (props.caps.buffer_from_host_ptr) {
+                // Vulkan implements the import (VK_EXT_external_memory_host; it refuses by itself where the extension is missing) but does
+                // not advertise it: the model loader would then wrap every mmapped weight of a discrete card in host memory too
+                ggml_backend_reg_t ureg = ggml_backend_dev_backend_reg(uma_dev);
+                const bool vk_import = ureg != nullptr && strcmp(ggml_backend_reg_name(ureg), "Vulkan") == 0;
+                if (props.caps.buffer_from_host_ptr || vk_import) {
                     mem = moe_aligned_alloc_n(alloc_bytes, uma_pool_align);
                     if (mem != nullptr) {
                         ggml_backend_buffer_t zbuf = ggml_backend_dev_buffer_from_host_ptr(uma_dev, mem, alloc_bytes, alloc_bytes);
