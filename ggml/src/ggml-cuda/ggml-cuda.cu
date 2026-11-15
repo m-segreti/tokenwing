@@ -4896,6 +4896,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // a SCALE the model's builder tagged (a hyper-connection mix's low-rank step) and the SILU right after it as one kernel
+    if (node->op == GGML_OP_SCALE && (node->op_params[GGML_FUSE_TAG_PARAM] & GGML_FUSE_TAG_MASK) == GGML_FUSE_TAG_MAGIC &&
+            (node->op_params[GGML_FUSE_TAG_PARAM] & GGML_FUSE_TAG_SCALE_SILU)) {
+        static const enum ggml_op scale_silu_ops[2] = { GGML_OP_SCALE, GGML_OP_UNARY };
+        if (ggml_can_fuse(cgraph, i, scale_silu_ops, 2)) {
+            ggml_tensor * silu = cgraph->nodes[i + 1];
+            if (ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node && node->src[0]->type == GGML_TYPE_F32 &&
+                    node->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
+                    ggml_is_contiguous(silu)) {
+                ggml_cuda_op_scale_silu(*cuda_ctx, node, silu);
+                return 1;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
         ggml_cuda_op_dsv4_hc_post(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
         return 3;

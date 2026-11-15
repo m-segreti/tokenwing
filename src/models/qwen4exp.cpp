@@ -349,6 +349,13 @@ static ggml_tensor * hc_stream_mean(ggml_context * ctx, ggml_tensor * x) {
     return ggml_scale(ctx, acc, 1.0f / (float) hc);
 }
 
+// A node marked for a backend fusion (GGML_FUSE_TAG_*, ggml-backend.h); backends that do not know the tag ignore it
+static void qwen4exp_fuse_tag(ggml_tensor * t, int32_t bits) {
+    const int32_t old = t->op_params[GGML_FUSE_TAG_PARAM];
+    const int32_t had = (old & GGML_FUSE_TAG_MASK) == GGML_FUSE_TAG_MAGIC ? (old & ~GGML_FUSE_TAG_MASK) : 0;
+    t->op_params[GGML_FUSE_TAG_PARAM] = GGML_FUSE_TAG_MAGIC | had | bits;
+}
+
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // build_hc_mix returns the mixed [n_embd, T] stream and the [hc, T] scatter weights.
 llama_model_qwen4exp::graph::hc_mix
@@ -383,6 +390,10 @@ llama_model_qwen4exp::graph::build_hc_mix(
         cb(inject, "hc_inject", il);
     } else {
         lo = ggml_scale(ctx0, build_lora_mm(w_down, xn), 1.0f / (float) hc);
+        // --moe-stream-hc-silu: the scale and the SiLU below as one CUDA kernel
+        if (mstream && mstream->p1.hc_silu) {
+            qwen4exp_fuse_tag(lo, GGML_FUSE_TAG_SCALE_SILU);
+        }
     }
     lo = ggml_silu(ctx0, lo);
     ggml_tensor * gate = build_lora_mm(w_up, lo);

@@ -743,6 +743,38 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     }
 }
 
+// SCALE then SILU in one pass: the scale step's expression (as scale_f32 computes it for F32) and op_silu on its result,
+// so every element gets the same float steps as the two kernels
+static __global__ void scale_silu_f32(const float * x, float * dst, const float scale, const float bias, const int64_t k) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    dst[i] = op_silu(scale * x[i] + bias);
+}
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node) {
+    const ggml_tensor * src0 = scale_node->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && silu_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(silu_node));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(silu_node));
+
+    float scale;
+    float bias;
+    memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+
+    const int64_t k = ggml_nelements(silu_node);
+    const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(scale_silu_f32, launch_params, (const float *) src0->data, (float *) silu_node->data, scale, bias, k);
+}
+
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     switch (ggml_get_unary_op(unary_node)) {
         case GGML_UNARY_OP_SILU:

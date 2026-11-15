@@ -489,6 +489,15 @@ extern "C" {
     // CPU tag (GGML_CPU_GSF_MAGIC) - but its array address is GPU memory, so only the CUDA backend reads it (the CPU never does)
     #define GGML_GPU_GSF_MAGIC 0x5C9
     #define GGML_MOE_ZERO_TAIL_MASK  0xFFF00000
+    // A node a model's graph builder marks for a backend fusion carries GGML_FUSE_TAG_MAGIC | bits in op_params[GGML_FUSE_TAG_PARAM]
+    // (unset = 0 = the op as before; a backend that does not know the tag ignores it). GGML_FUSE_TAG_SCALE_SILU on a SCALE: the
+    // SCALE and the UNARY SILU right after it may run as one kernel (the same float steps). GGML_FUSE_TAG_Q8_1 on that SCALE or on an
+    // RMS_NORM followed by its MUL: the fused kernel may also write the q8_1 copy of its output that a quantized matvec reading it uses
+    #define GGML_FUSE_TAG_PARAM ((int) (GGML_MAX_OP_PARAMS/sizeof(int32_t)) - 3)
+    #define GGML_FUSE_TAG_MAGIC 0x7A600000
+    #define GGML_FUSE_TAG_MASK  0xFFF00000
+    #define GGML_FUSE_TAG_SCALE_SILU 1
+    #define GGML_FUSE_TAG_Q8_1       2
     GGML_API bool                 ggml_trace_on(void);
     GGML_API void                 ggml_trace_event(int lane, const char * name, int64_t t0_us, int64_t t1_us, int64_t arg);
     GGML_API bool                 ggml_handoff_on(void);
