@@ -546,9 +546,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
     }
-    if (const char * env = getenv("GGML_QUANT_PLUGIN")) {
-        params.quant_plugin = env;
-    }
 
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
