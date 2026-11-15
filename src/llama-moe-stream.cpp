@@ -4022,7 +4022,7 @@ void llama_moe_stream::print_repack_state() const {
     fprintf(stderr, "%s: cpu-repack %s: %lld of %lld expert pool tensors hold the repacked layout%s, "
             "%lld do not (that type or shape has no repacked kernel on this CPU: IQ4_XS has none on x86); "
             "the sidecar stores '%s', so reads are %s\n", __func__,
-            cpu_repack_on ? "on" : (cpu_repack ? "OFF (no kernel)" : "off"),
+            (cpu_repack_on || plugin_repack_on) ? "on" : (cpu_repack ? "OFF (no kernel)" : "off"),
             (long long) n_rep, (long long) n_pool,
             n_plug > 0 ? format(" (%lld of them the quant plugin's)", (long long) n_plug).c_str() : "",
             (long long) (n_pool - n_rep), sidecar_layout.c_str(),
@@ -4512,17 +4512,21 @@ ggml_tensor * llama_moe_stream::create_pool(int32_t il, const std::string & name
                     ggml_backend_buffer_free(rbuf);   // no repacked kernel for this type/shape
 
                     // A quant plugin's format may have its own in-slot layout (repack_expert_slot). Only a plugin type, and only
-                    // when the plugin has no GPU kernel for it: nothing says a GPU kernel reads that layout, and the engine
-                    // copies RAM slots to a GPU in several places. Such a pool then counts as repacked like a built-in one
-                    // (cpu_repack_on), so the same rules keep its slots on the CPU.
+                    // when the plugin has no GPU kernel for it, or when its GPU kernel promises to read the repacked layout
+                    // (repack_expert_slot(type, NULL, NULL, -1, 0) == 1). Only when the GPU cannot read the repacked layout
+                    // does the pool set cpu_repack_on to keep its slots strictly on the CPU.
                     const bool ext_type = pool->type >= GGML_TYPE_EXT0 && pool->type <= GGML_TYPE_EXT5;
                     const ggml_quant_plugin_api * qapi = cpu_repack && ext_type ? ggml_quant_plugin_get() : nullptr;
                     const bool gpu_kernel = ext_type && (ggml_quant_plugin_has_cuda(pool->type, false) || ggml_quant_plugin_has_cuda(pool->type, true));
-                    if (qapi && qapi->repack_expert_slot && !gpu_kernel &&
+                    const bool gpu_reads_repacked = gpu_kernel && qapi && qapi->repack_expert_slot &&
+                            qapi->repack_expert_slot((int32_t) pool->type, nullptr, nullptr, -1, 0) == 1;
+                    if (qapi && qapi->repack_expert_slot && (!gpu_kernel || gpu_reads_repacked) &&
                             qapi->repack_expert_slot((int32_t) pool->type, nullptr, nullptr, pool->ne[0], pool->ne[1]) == 0) {
                         plugin_repack    = true;
                         plugin_repack_on = true;
-                        cpu_repack_on    = true;
+                        if (!gpu_reads_repacked) {
+                            cpu_repack_on = true;
+                        }
                         convert_on_read  = true;
                     } else if (n_repacked_blocks > 0) {
                         throw std::runtime_error(format(

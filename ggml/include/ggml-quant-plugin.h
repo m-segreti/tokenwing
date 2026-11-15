@@ -110,13 +110,13 @@ struct ggml_quant_plugin_api {
     int32_t  (*converter_finalize_aux)(
             void * conv, void * out_aux, size_t out_aux_cap, size_t * out_aux_written);
 
-    // Optional in-slot repacking of the streamed experts (--moe-stream-cpu-repack 1). Used only for this plugin's own
-    // types, and only for a type with no GPU kernel here (has_cuda 0): the engine copies RAM slots to a GPU in several
-    // places and no GPU kernel is promised to read the repacked layout. Each expert slice read from the model is passed
-    // through it into its RAM slot, same byte count. The repacked bytes are read only by this type's vec_dot and
-    // vec_dot_x4, at any row, one or four rows at a time. Called from several I/O threads at once.
-    // When dst_slot == NULL and src_plain == NULL, probes whether (ggml_type_id, ne0, ne1)
-    // supports equal-byte in-slot repacking (returns 0 if supported, non-zero otherwise).
+    // Optional in-slot repacking of the streamed experts (--moe-stream-cpu-repack 1). Used for this plugin's own
+    // types when has_cuda == 0, or when has_cuda == 1 and probing repack_expert_slot(type, NULL, NULL, -1, 0) returns 1
+    // (promising that the plugin's GPU kernels also accept the repacked slot layout whenever RAM slots are copied to GPU).
+    // Each expert slice read from the model is passed through it into its RAM slot, same byte count. Called from several
+    // I/O threads at once. When dst_slot == NULL and src_plain == NULL:
+    //   - (ne0 > 0, ne1 > 0): returns 0 if equal-byte in-slot repacking is supported, non-zero otherwise.
+    //   - (ne0 == -1, ne1 == 0): returns 1 if the plugin's GPU kernels also accept repacked buffers, 0 otherwise.
     int32_t  (*repack_expert_slot)(
             int32_t ggml_type_id, void * dst_slot, const void * src_plain,
             int64_t ne0, int64_t ne1);
