@@ -63,14 +63,23 @@ def main():
     moe_set = set(moe_layers)
     if not has_hc_norm:
         assert min(float(np.abs(Gn[X]).min()) for X in Gn) > 1e-6
-    default_srcs = [L for L in moe_layers[:-1] if any((L + d) in moe_set for d in LEADS)]
+    recs = [Rec(d) for d in train]
+    # Only layers streamed in EVERY recording: the engine records a source's guess input only when the next layer is streamed,
+    # and a target needs its real logits. A whole VRAM layer has neither, and a nextn (MTP) layer has no router loaded when MTP
+    # is off - a file whose model check covered it would be refused by the engine as a whole
+    for r in recs:
+        moe_set &= set(r.layers)
+    default_srcs = [L for L in sorted(moe_set) if (L + 1) in moe_set]
     LAYERS = [int(x) for x in os.environ["CORRECTION_TEST_LAYERS"].split(",")] if os.environ.get("CORRECTION_TEST_LAYERS") else default_srcs
+    left = [L for L in LAYERS if not (L in moe_set and (L + 1) in moe_set)]
+    if left:
+        print("source layers left out (not streamed in every recording, or the next layer is not): %s" % left, flush=True)
+    LAYERS = [L for L in LAYERS if L in moe_set and (L + 1) in moe_set]
     targets = sorted({L + d for L in LAYERS for d in LEADS if (L + d) in moe_set})
     groups = [LAYERS[i:i + a.group] for i in range(0, len(LAYERS), a.group)]
     state_p = work + "/state.json"
     st = json.load(open(state_p)) if os.path.exists(state_p) else {"done": [], "pairs": {}}
     trv = [Vec(d, nd) for d in train]
-    recs = [Rec(d) for d in train]
     t_start = time.time()
     budget = float(os.environ.get("PIECE_SECONDS", "600"))
     for gi, Lg in enumerate(groups):
