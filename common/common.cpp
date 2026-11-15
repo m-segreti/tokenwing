@@ -1874,6 +1874,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_rs_window        = params.moe_stream_rs_window;
     mparams.moe_stream_ple_late         = params.moe_stream_ple_late;
     mparams.moe_stream_hc_silu          = params.moe_stream_hc_silu;
+    mparams.moe_stream_hc_q8            = params.moe_stream_hc_q8;
     mparams.moe_stream_gpu_share_q8     = params.moe_stream_gpu_share_q8;
     mparams.moe_stream_vram_experts     = params.moe_stream_vram_experts;
     mparams.moe_stream_vram_experts_file   = params.moe_stream_vram_experts_file.empty() ? NULL : params.moe_stream_vram_experts_file.c_str();

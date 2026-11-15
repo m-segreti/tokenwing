@@ -4948,6 +4948,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-stream-hc-q8"}, "0|1",
+        "hyper-connection models (qwen4exp), CUDA with --moe-stream-gpu-share-q8 1: each mix's grouped norm also writes the "
+        "q8_1 copy of its output that the mix's first matvec reads, and with --moe-stream-hc-silu 1 the fused scale + SiLU "
+        "writes the second matvec's, so the matvecs skip their own quantize kernels (two per mix); the same bits (default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-hc-q8 must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_hc_q8 = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-gpu-share-q8"}, "0|1",
         "CUDA: matvecs (one to eight rows) that read exactly the same input bytes in one graph compute share one "
         "q8_1 copy of the input instead of quantizing it again each (e.g. 6 per Ling KDA layer -> 1); the same bits. "

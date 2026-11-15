@@ -95,8 +95,9 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
-// SCALE (x*scale + bias) and the UNARY SILU on its output as one kernel: F32, contiguous, the same float steps as the two ops
-void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node);
+// SCALE (x*scale + bias) and the UNARY SILU on its output as one kernel: F32, contiguous, the same float steps as the two ops;
+// q8_1: one row, also the q8_1 copy a quantized matvec on silu_node reads (into its shared entry)
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node, bool q8_1);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));

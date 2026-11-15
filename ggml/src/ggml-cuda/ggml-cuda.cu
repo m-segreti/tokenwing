@@ -4850,6 +4850,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        // a grouped norm the model's builder tagged (a hyper-connection mix's): its rows feed one quantized matvec through a
+        // reshape - the norm also writes that matvec's q8_1 copy (the float output as before: every other reader keeps it)
+        if ((node->op_params[GGML_FUSE_TAG_PARAM] & GGML_FUSE_TAG_MASK) == GGML_FUSE_TAG_MAGIC &&
+                (node->op_params[GGML_FUSE_TAG_PARAM] & GGML_FUSE_TAG_Q8_1) && cuda_ctx->q8_1_share.active &&
+                cuda_ctx->curr_stream_no == 0) {
+            const ggml_tensor * out     = cgraph->nodes[i + 1];
+            const ggml_tensor * mm_src1 = nullptr;
+            for (int j = i + 2; j < cgraph->n_nodes && j < i + 18 && mm_src1 == nullptr; j++) {
+                const ggml_tensor * t = cgraph->nodes[j];
+                if (t->op == GGML_OP_MUL_MAT && t->src[1] != nullptr && ggml_is_quantized(t->src[0]->type) &&
+                        (t->src[1] == out || t->src[1]->view_src == out)) {
+                    mm_src1 = t->src[1];
+                }
+            }
+            if (mm_src1 != nullptr && ggml_cuda_norm_rows_q8_shape_ok(node, out, mm_src1)) {
+                ggml_cuda_op_rms_norm_mul_rows_q8_1(*cuda_ctx, node, cgraph->nodes[i + 1], mm_src1);
+                return 1;
+            }
+        }
         // GGML_CUDA_FUSE_NORM_QUANT=1: one row feeding a quantized matvec soon after - the norm writes its q8_1 copy
         // too (the float output as before: every other reader keeps it)
         if (ggml_cuda_fuse_norm_q8_on() && cuda_ctx->q8_1_share.active && cuda_ctx->curr_stream_no == 0 &&
@@ -4905,7 +4924,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && silu->src[0] == node && node->src[0]->type == GGML_TYPE_F32 &&
                     node->type == GGML_TYPE_F32 && silu->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0]) &&
                     ggml_is_contiguous(silu)) {
-                ggml_cuda_op_scale_silu(*cuda_ctx, node, silu);
+                // with the q8_1 tag, one row read by a quantized matvec within the next nodes (the q8_1 sharing on): the kernel also
+                // writes that matvec's q8_1 copy, so the matvec does not quantize its input itself
+                bool q8 = false;
+                if ((node->op_params[GGML_FUSE_TAG_PARAM] & GGML_FUSE_TAG_Q8_1) && cuda_ctx->q8_1_share.active &&
+                        cuda_ctx->curr_stream_no == 0 && ggml_nrows(silu) == 1) {
+                    for (int j = i + 2; j < cgraph->n_nodes && j < i + 18 && !q8; j++) {
+                        const ggml_tensor * t = cgraph->nodes[j];
+                        q8 = t->op == GGML_OP_MUL_MAT && t->src[1] == silu && ggml_is_quantized(t->src[0]->type);
+                    }
+                }
+                ggml_cuda_op_scale_silu(*cuda_ctx, node, silu, q8);
                 return 1;
             }
         }

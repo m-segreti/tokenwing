@@ -2369,6 +2369,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.rs_window           = params.moe_stream_rs_window == 1;
         p1.ple_late            = params.moe_stream_ple_late == 1;
         p1.hc_silu             = params.moe_stream_hc_silu == 1;
+        p1.hc_q8               = params.moe_stream_hc_q8 == 1;
         p1.gpu_share_q8        = params.moe_stream_gpu_share_q8 == 1;
         p1.vram_experts        = params.moe_stream_vram_experts > 0 ? (uint32_t) params.moe_stream_vram_experts : 0;
         p1.vram_experts_file   = params.moe_stream_vram_experts_file ? params.moe_stream_vram_experts_file : "";
@@ -4517,6 +4518,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_rs_window        =*/ 0,   // the state fetch and the conv-state write where the layer needs them, as before
         /*.moe_stream_ple_late         =*/ 0,   // the n-gram rows gathered first, with the token row, as before
         /*.moe_stream_hc_silu          =*/ 0,   // the mix's scale and SiLU as two kernels, as before
+        /*.moe_stream_hc_q8            =*/ 0,   // the mix's matvecs quantize their inputs, as before
         /*.moe_stream_gpu_share_q8     =*/ 0,   // every matvec quantizes its input, as before
         /*.moe_stream_vram_experts     =*/ 0,   // off
         /*.moe_stream_vram_experts_file   =*/ nullptr,

@@ -175,6 +175,7 @@ struct llama_moe_stream_p1 {
                                           //       and this layer's conv-state write in the MoE layer's GPU window
     bool        ple_late       = false;   // qwen4exp: the n-gram embedding rows gathered right before the layer that reads them
     bool        hc_silu        = false;   // hyper-connection models: a mix's scale + SiLU tagged for one CUDA kernel
+    bool        hc_q8          = false;   // hyper-connection models: a mix's norm (and fused SiLU) write the matvecs' q8_1 copies
     bool        gpu_share_q8   = false;   // CUDA matvecs reading the same input bytes share one q8_1 copy
     uint32_t    vram_experts   = 0;       // the first N experts of the list of every streamed layer live in VRAM, 0 = off
     std::string vram_experts_file;        // the ranked list per layer ("tokenwing vram-experts v1")

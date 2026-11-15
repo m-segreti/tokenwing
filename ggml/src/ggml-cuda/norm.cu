@@ -711,6 +711,130 @@ static __global__ void rms_norm_mul_q8_1_f32(const float * x, float * dst, const
     GGML_UNUSED(s1); GGML_UNUSED(s2); GGML_UNUSED(s3);
 }
 
+// RMS_NORM + MUL for several rows (a grouped norm: one row per stream of a hyper-connection model) that one quantized matvec
+// reads as a single flattened vector, so row r's q8_1 blocks start at r*ncols/QK8_1. The statements of the dispatch's vec path
+// with vpt 1 and this block size (ncols4 <= block_size; the threads past ncols4 hold no value, as there), then the q8_1 copy
+// in rms_norm_mul_q8_1_f32's way (quantize_q8_1's arithmetic in its order). ncols4 is a multiple of the warp size, so the
+// threads past it are whole warps and the shuffles below always have every lane
+template <int block_size>
+static __global__ void rms_norm_mul_rows_q8_1_f32(const float * x, float * dst, const int ncols, const float eps, const float * mul,
+                                                  const int64_t mul_stride_row, block_q8_1 * y) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    extern __shared__ float s_sum[];
+    ggml_cuda_pdl_sync();
+
+    const int      ncols4 = ncols / 4;
+    const float4 * x4     = (const float4 *) (x   + (int64_t) row*ncols);
+    const float4 * mul4   = (const float4 *) (mul + (int64_t) row*mul_stride_row);
+    float4 *       dst4   = (float4 *) (dst + (int64_t) row*ncols);
+
+    float4 xs[1];
+    float  tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 1; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            xs[k] = x4[i];
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+
+    const int i = tid;
+    if (i >= ncols4) {
+        return;
+    }
+    float4 r = make_float4(scale*xs[0].x, scale*xs[0].y, scale*xs[0].z, scale*xs[0].w);
+    const float4 m = mul4[i];
+    r.x *= m.x;
+    r.y *= m.y;
+    r.z *= m.z;
+    r.w *= m.w;
+    dst4[i] = r;
+
+    float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+    float s0 = r.x, s1 = r.y, s2 = r.z, s3 = r.w;
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1) {   // the lane offsets 16, 8, 4 of the 32 values
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, WARP_SIZE));
+        s0 += __shfl_xor_sync(0xffffffff, s0, off, WARP_SIZE);
+        s1 += __shfl_xor_sync(0xffffffff, s1, off, WARP_SIZE);
+        s2 += __shfl_xor_sync(0xffffffff, s2, off, WARP_SIZE);
+        s3 += __shfl_xor_sync(0xffffffff, s3, off, WARP_SIZE);
+    }
+    {   // offset 2: value j with value j ^ 2 of the same float4
+        const float a0 = s0 + s2, a1 = s1 + s3, a2 = s2 + s0, a3 = s3 + s1;
+        s0 = a0; s1 = a1; s2 = a2; s3 = a3;
+    }
+    {   // offset 1
+        const float a0 = s0 + s1, a1 = s1 + s0, a2 = s2 + s3, a3 = s3 + s2;
+        s0 = a0; s1 = a1; s2 = a2; s3 = a3;
+    }
+    const float d   = amax / 127.0f;
+    const int   ib  = (row*ncols4 + i) / 8;
+    const int   iqs = 4*(i % 8);
+    const float xv[4] = { r.x, r.y, r.z, r.w };
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int8_t q = amax == 0.0f ? 0 : roundf(xv[j] / d);
+        y[ib].qs[iqs + j] = q;
+    }
+    if (i % 8 == 0) {
+        y[ib].ds = make_half2(d, s0);
+    }
+    GGML_UNUSED(s1); GGML_UNUSED(s2); GGML_UNUSED(s3);
+}
+
+// the rows fusion's shape rule: one token of contiguous F32 rows, a gain of one row or one per row, the dispatch's vec path with
+// vpt 1 and a block of 256 / 512 / 1024 (ncols4 a multiple of 64: whole warps of either warp size), aligned as the vec path
+// needs; mm_src1 = the matvec's input = the MUL output read as one contiguous row that needs no padding
+bool ggml_cuda_norm_rows_q8_shape_ok(const ggml_tensor * norm, const ggml_tensor * mul_tensor, const ggml_tensor * mm_src1) {
+    const ggml_tensor * x   = norm->src[0];
+    const ggml_tensor * mul = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    const int64_t ncols = x->ne[0];
+    const int64_t nrows = x->ne[1];
+    const int64_t n4    = ncols / 4;
+    return x->type == GGML_TYPE_F32 && norm->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && mul_tensor->type == GGML_TYPE_F32 &&
+           mul_tensor->src[0] == norm && ggml_is_contiguous(x) && x->ne[2] == 1 && x->ne[3] == 1 &&
+           ggml_is_contiguous(mul_tensor) && ggml_are_same_shape(mul_tensor, x) &&
+           mul->ne[0] == ncols && (mul->ne[1] == nrows || mul->ne[1] == 1) && mul->ne[2] == 1 && mul->ne[3] == 1 &&
+           mul->nb[0] == sizeof(float) && mul->nb[1] % 16 == 0 &&
+           ncols % 256 == 0 && n4 > 128 && n4 <= 1024 &&
+           ((uintptr_t) mul_tensor->data & 15) == 0 && ggml_cuda_is_aligned(x, 16) && ggml_cuda_is_aligned(mul, 16) &&
+           mm_src1->type == GGML_TYPE_F32 && mm_src1->data == mul_tensor->data && ggml_is_contiguous(mm_src1) &&
+           mm_src1->ne[0] == ncols*nrows && ggml_nrows(mm_src1) == 1 && (ncols*nrows) % MATRIX_ROW_PADDING == 0;
+}
+
+void ggml_cuda_op_rms_norm_mul_rows_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm, ggml_tensor * mul_tensor,
+                                         const ggml_tensor * mm_src1) {
+    const ggml_tensor * x   = norm->src[0];
+    const ggml_tensor * mul = mul_tensor->src[0] == norm ? mul_tensor->src[1] : mul_tensor->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    const int     ncols          = (int) x->ne[0];
+    const int     nrows          = (int) x->ne[1];
+    const int64_t mul_stride_row = mul->ne[1] == 1 ? 0 : (int64_t) (mul->nb[1] / sizeof(float));
+    block_q8_1 * y = (block_q8_1 *) ggml_cuda_q8_1_share_claim(ctx, mm_src1);
+    const dim3 blocks_num(nrows, 1, 1);
+#define NQR_LAUNCH(BS) do { \
+        const ggml_cuda_kernel_launch_params lp{ blocks_num, dim3(BS, 1, 1), BS > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream() }; \
+        ggml_cuda_kernel_launch(rms_norm_mul_rows_q8_1_f32<BS>, lp, (const float *) x->data, (float *) mul_tensor->data, ncols, eps, \
+            (const float *) mul->data, mul_stride_row, y); \
+    } while (0)
+    const int n4 = ncols / 4;
+    if (n4 <= 256) {
+        NQR_LAUNCH(256);
+    } else if (n4 <= 512) {
+        NQR_LAUNCH(512);
+    } else {
+        NQR_LAUNCH(1024);
+    }
+#undef NQR_LAUNCH
+}
+
 bool ggml_cuda_fuse_norm_q8_on() {
     static const bool on = [] {
         const char * v = getenv("GGML_CUDA_FUSE_NORM_QUANT");

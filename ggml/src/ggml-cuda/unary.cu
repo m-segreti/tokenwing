@@ -1,5 +1,7 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "mmvq.cuh"
+#include "quantize.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -757,7 +759,45 @@ static __global__ void scale_silu_f32(const float * x, float * dst, const float 
     dst[i] = op_silu(scale * x[i] + bias);
 }
 
-void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node) {
+// the same for one row of ne00 values, also writing the q8_1 copy of the result that a matvec on it reads: ne0 = the row padded as
+// the matvec pads it; each value's thread quantizes it as quantize_q8_1 does (one value per thread, the warp reductions over its
+// 32 values; the threads past ne00 quantize a 0)
+static __global__ void scale_silu_q8_1_f32(const float * x, float * dst, const float scale, const float bias, const int64_t ne00,
+                                           const int64_t ne0, block_q8_1 * y) {
+    ggml_cuda_pdl_lc();
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    float xi = 0.0f;
+    if (i0 < ne00) {
+        xi = op_silu(scale * x[i0] + bias);
+        dst[i0] = xi;
+    }
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    const int64_t ib  = i0 / QK8_1;
+    const int64_t iqs = i0 % QK8_1;
+    y[ib].qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    y[ib].ds = make_half2(d, sum);
+}
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node, bool q8_1) {
     const ggml_tensor * src0 = scale_node->src[0];
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 && scale_node->type == GGML_TYPE_F32 && silu_node->type == GGML_TYPE_F32);
@@ -768,6 +808,17 @@ void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scal
     float bias;
     memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
     memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+
+    if (q8_1) {   // one row (the caller checks), the q8_1 copy in the share entry the matvec on silu_node will find
+        GGML_ASSERT(ggml_nrows(silu_node) == 1);
+        block_q8_1 *  y    = (block_q8_1 *) ggml_cuda_q8_1_share_claim(ctx, silu_node);
+        const int64_t ne00 = silu_node->ne[0];
+        const int64_t ne0  = GGML_PAD(ne00, MATRIX_ROW_PADDING);
+        const int64_t nb   = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params((dim3) nb, CUDA_QUANTIZE_BLOCK_SIZE, 0, ctx.stream());
+        ggml_cuda_kernel_launch(scale_silu_q8_1_f32, lp, (const float *) src0->data, (float *) silu_node->data, scale, bias, ne00, ne0, y);
+        return;
+    }
 
     const int64_t k = ggml_nelements(silu_node);
     const int64_t num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;

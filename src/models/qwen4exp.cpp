@@ -373,7 +373,12 @@ llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
-    ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
+    ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    // --moe-stream-hc-q8: the CUDA norm (fused with its gain) also writes the q8_1 copy the down matvec reads
+    if (mstream && mstream->p1.hc_q8) {
+        qwen4exp_fuse_tag(xn, GGML_FUSE_TAG_Q8_1);
+    }
+    xn = ggml_mul(ctx0, xn, w_norm);
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
@@ -390,9 +395,10 @@ llama_model_qwen4exp::graph::build_hc_mix(
         cb(inject, "hc_inject", il);
     } else {
         lo = ggml_scale(ctx0, build_lora_mm(w_down, xn), 1.0f / (float) hc);
-        // --moe-stream-hc-silu: the scale and the SiLU below as one CUDA kernel
+        // --moe-stream-hc-silu: the scale and the SiLU below as one CUDA kernel (with --moe-stream-hc-q8 it also writes the
+        // q8_1 copy the up matvec reads)
         if (mstream && mstream->p1.hc_silu) {
-            qwen4exp_fuse_tag(lo, GGML_FUSE_TAG_SCALE_SILU);
+            qwen4exp_fuse_tag(lo, GGML_FUSE_TAG_SCALE_SILU | (mstream->p1.hc_q8 ? GGML_FUSE_TAG_Q8_1 : 0));
         }
     }
     lo = ggml_silu(ctx0, lo);

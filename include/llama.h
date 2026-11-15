@@ -472,6 +472,8 @@ extern "C" {
                                                 //      reads them, not first, so the CPU gathers them while the GPU runs (same output)
         int32_t      moe_stream_hc_silu;        // 1 = hyper-connection models: a mix's scale and SiLU tagged so the CUDA backend
                                                 //      runs them as one kernel (same output), 0 = off
+        int32_t      moe_stream_hc_q8;          // 1 = hyper-connection models: a mix's grouped norm (and, with moe_stream_hc_silu,
+                                                //      its SiLU) write the q8_1 copies the CUDA matvecs read (same output), 0 = off
         int32_t      moe_stream_gpu_share_q8;   // 1 = CUDA matvecs that read the same input bytes in one graph
                                                 //      share one q8_1 copy of it (same output), 0 = off
         int32_t      moe_stream_vram_experts;   // the first N experts of the list file of every streamed layer are kept in
