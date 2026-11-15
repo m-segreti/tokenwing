@@ -39,6 +39,12 @@ def rec_masks(r, L, X, dd, W, ne):
     return T, rs, vr, miss
 
 
+def no_rows(Gs):
+    """Gs [NF, n_embd, n_embd]: True when a fit that leaves one fold out would have no rows (its ridge system would be singular)"""
+    tot = Gs.sum(0)
+    return any(np.trace(tot - Gs[f]) == 0 for f in range(NF))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -126,6 +132,9 @@ def main():
             if not dds:
                 continue
             if not has_hc_norm:
+                if no_rows(A["G"]):
+                    print("source layer %d: no recorded guess input in a cross-validation fit, its pairs are not written" % L, flush=True)
+                    continue
                 Gt = A["G"].sum(0)
                 Ct = np.concatenate([A["C"][dd].sum(0) for dd in dds], 1)
                 sse = np.zeros((len(dds), len(LAM_REL)))
@@ -154,6 +163,9 @@ def main():
                             Bfold[(L, dds[k_], f)] = Bf[:, j * ne:(j + 1) * ne].astype(np.float32)
             else:
                 for dd in dds:
+                    if no_rows(A["G"][dd]):
+                        print("pair (%d, %d): no recorded guess input in a cross-validation fit, not written" % (L + dd, dd), flush=True)
+                        continue
                     Gt = A["G"][dd].sum(0)
                     Ct = A["C"][dd].sum(0)
                     sse = np.zeros(len(LAM_REL))
@@ -211,6 +223,9 @@ def main():
                     if g[1][2] < g[0][2]:
                         per[key]["fails"] = True
                         ok = False
+                if "all" not in per:
+                    print("pair (%d, %d): no held-out rows for the gate, not written" % (X, dd), flush=True)
+                    continue
                 np.save("%s/Bt_%d_%d.npy" % (work, X, dd), np.ascontiguousarray(Bfin[(L, dd)].T))
                 st["pairs"]["%d,%d" % (X, dd)] = {"lam_rel": lamsel[(L, dd)], "gate_pass": ok,
                                                   "gate_pass_pooled_only": not per["all"].get("fails", False), "held_out": per}
