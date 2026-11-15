@@ -4962,6 +4962,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-stream-rs-inplace"}, "0|1",
+        "qwen4exp delta-net layers, reply graphs of one sequence whose recurrent state stays in its own cache row: the delta "
+        "step reads the state straight from that row instead of a gathered copy (a 3 MB copy per layer on Qwen3.8-Flash-Next) "
+        "and writes the new state back into it; a layer with --moe-stream-cpu-state-inplace keeps that path; the same values "
+        "(default: 0)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {   // clamped with a warning
+                const int v0 = value;
+                value = std::min(std::max(value, 0), 1);
+                LOG_WRN("--moe-stream-rs-inplace must be 0 or 1: %d -> %d\n", v0, value);
+            }
+            params.moe_stream_rs_inplace = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-gpu-share-q8"}, "0|1",
         "CUDA: matvecs (one to eight rows) that read exactly the same input bytes in one graph compute share one "
         "q8_1 copy of the input instead of quantizing it again each (e.g. 6 per Ling KDA layer -> 1); the same bits. "

@@ -391,6 +391,9 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
 
+    // the state read in place: still one state, the cell's own
+    res &= !s_inplace || (mctx->get_n_rs() == 1 && mctx->s_copy(0) == (int32_t) mctx->get_head());
+
     return res;
 }
 
@@ -1178,6 +1181,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
+    // the state read in place: still one state, the cell's own
+    res &= !inp_rs->s_inplace || (mctx->get_recr()->get_n_rs() == 1 && mctx->get_recr()->s_copy(0) == (int32_t) mctx->get_recr()->get_head());
+
     return res;
 }
 
@@ -1225,6 +1231,9 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    // the state read in place: still one state, the cell's own
+    res &= !inp_rs->s_inplace || (mctx->get_recr()->get_n_rs() == 1 && mctx->get_recr()->s_copy(0) == (int32_t) mctx->get_recr()->get_head());
 
     return res;
 }
@@ -1312,6 +1321,9 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    // the state read in place: still one state, the cell's own
+    res &= !inp_rs->s_inplace || (mctx->get_recr()->get_n_rs() == 1 && mctx->get_recr()->s_copy(0) == (int32_t) mctx->get_recr()->get_head());
 
     return res;
 }

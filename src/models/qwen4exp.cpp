@@ -604,6 +604,17 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     rs_window_on = inp && mstream && mstream->p1.rs_window && mstream->ne_gpu_graph() && n_tokens == 1 &&
                    cparams.n_rs_seq == 0 && params.lm_phase == 0;
 
+    // --moe-stream-rs-inplace: a reply graph of one sequence whose state stays in its own cache row (the state copy maps row
+    // head to itself, no row to clear): the delta step reads its state from that row instead of a gathered copy, and writes the
+    // new state back into it after reading it. The graph input then allows a reuse only while that still holds
+    if (inp && mstream && mstream->p1.rs_inplace && n_tokens == 1 && ubatch.n_seqs == 1 && cparams.n_rs_seq == 0 &&
+            params.lm_phase == 0) {
+        llm_graph_input_rs * inp_rs = inp->get_recr();
+        const auto * mrs = inp_rs->mctx;
+        rs_inplace_on = mrs->get_n_rs() == 1 && mrs->get_rs_z() < 0 && mrs->s_copy(0) == (int32_t) mrs->get_head();
+        inp_rs->s_inplace = rs_inplace_on;
+    }
+
     for (int il = lm_b; il < lm_e; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = hc_stream_mean(ctx0, res_hc);
@@ -694,7 +705,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                         if (rs_rows.find(conv_all) == rs_rows.end()) {
                             rs_rows.emplace(conv_all, build_rs(inp_rs, conv_all, conv_all->ne[0], ubatch.n_seqs));
                         }
-                        if (rs_rows.find(ssm_all) == rs_rows.end()) {
+                        if (!rs_inplace_on && rs_rows.find(ssm_all) == rs_rows.end()) {   // (read in place: nothing to fetch)
                             rs_rows.emplace(ssm_all, build_rs(inp_rs, ssm_all, hparams.n_embd_s(), ubatch.n_seqs));
                         }
                     }
@@ -1371,7 +1382,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
             conv_kernel_size - 1, conv_channels, il, rs_window_on ? &conv_defer : nullptr);
 
     ggml_tensor * state = nullptr;
-    if (rs_window_on) {   // fetched in the window of the layer before (rs_rows holds it)
+    if (rs_inplace_on && !state_inplace(inp, il, n_seq_tokens, n_seqs)) {
+        // the cache row of this cell: the gather's only source row and the row the step writes the new state into
+        state = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                mctx_cur->get_head() * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+    }
+    if (state == nullptr && rs_window_on) {   // fetched in the window of the layer before (rs_rows holds it)
         const auto it = rs_rows.find(ssm_states_all);
         state = it != rs_rows.end() ? it->second : nullptr;
     }

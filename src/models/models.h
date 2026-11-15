@@ -2525,6 +2525,8 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         // --moe-stream-rs-window: on in this graph, and the delta-net layer's conv-state writes waiting for its window
         bool                       rs_window_on = false;
+        // --moe-stream-rs-inplace: on in this graph (one sequence, its state in its own row)
+        bool                       rs_inplace_on = false;
         std::vector<ggml_tensor *> conv_defer;
 
         ggml_tensor * build_inp_ple(

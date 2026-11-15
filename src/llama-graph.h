@@ -292,6 +292,10 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // a model read the ubatch's state straight from its cache row (one sequence whose state copy maps row head to itself):
+    // the graph can be reused only while that still holds
+    bool s_inplace = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
