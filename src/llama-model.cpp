@@ -4544,6 +4544,9 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_out_check        =*/ 16,     // every prompt call and every 16th reply call
         /*.moe_stream_vram_device      =*/ nullptr, // the first GPU holds the VRAM pool
         /*.moe_stream_gpu_layers_device =*/ nullptr, // whole layers' experts on their layer's own device
+        /*.quant_plugin                =*/ nullptr,
+        /*.moe_router_min_w            =*/ 0.0f,
+        /*.moe_router_k_min            =*/ 4,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
