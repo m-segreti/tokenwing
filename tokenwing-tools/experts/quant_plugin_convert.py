@@ -20,6 +20,8 @@ ACTION_KEEP = 0
 ACTION_REHEADER = 1
 ACTION_TRANSCODE = 2
 SPLIT_KEYS = ("split.no", "split.count", "split.tensors.count")
+# the plugin type name of each slot the file uses ("" for the others): the engine refuses a plugin with other names there
+TYPES_KEY = "tokenwing.quant_plugin.types"
 
 
 class _PluginTypeInfo(ctypes.Structure):
@@ -137,10 +139,12 @@ class QuantPluginBridge:
                         "converter_planned_aux_size", "converter_transcode_tensor", "converter_finalize_aux"):
             if not bool(getattr(self.api, fn_name)):
                 raise refuse_cls(f"--quant-plugin {plugin_path}: plugin does not implement {fn_name}")
+        self.type_names = [""] * PLUGIN_MAX_TYPES
         for idx in range(PLUGIN_MAX_TYPES):
             ti = _PluginTypeInfo()
             if self.api.get_type_info(idx, ctypes.byref(ti)) == 0 and ti.enabled:
                 gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(PLUGIN_EXT_BASE + idx)] = (int(ti.blck_size), int(ti.type_size))
+                self.type_names[idx] = (ti.type_name or b"").decode("utf-8", errors="replace")
 
     def last_error(self):
         if bool(self.api.last_error):
@@ -280,7 +284,12 @@ def _find_experts_planned(mmf, planned_tensors):
     return layers
 
 
-def _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, sums, blobs, merge_split):
+def _used_type_names(planned_tensors, type_names):
+    used = {int(pt.out_type) - PLUGIN_EXT_BASE for pt in planned_tensors}
+    return [type_names[i] if i in used else "" for i in range(PLUGIN_MAX_TYPES)]
+
+
+def _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, sums, blobs, merge_split, slot_names):
     w = gguf.GGUFWriter(Path("unused"), arch)
     for field in reader.fields.values():
         name = field.name
@@ -296,6 +305,8 @@ def _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, sums, blobs
     il_list = sorted(layers)
     w.add_key_value(mmf.SUMS_LAYERS_KEY, il_list, GGUFValueType.ARRAY, sub_type=GGUFValueType.UINT32)
     w.add_key_value(mmf.SUMS_VALUES_KEY, [v for il in il_list for v in sums[il]], GGUFValueType.ARRAY, sub_type=GGUFValueType.UINT64)
+    if any(slot_names):
+        w.add_array(TYPES_KEY, slot_names)
     for name in mmf.BLOB_NAMES:
         if name in blobs:
             off, size = blobs[name]
@@ -450,6 +461,7 @@ def convert_with_quant_plugin(mmf, src, out_path, tmp_path, plugin_path, blob_fi
               + (f" ({n_4k} of {3 * len(layers)} are not multiples of {mmf.IO_ALIGN})" if n_4k else f" and of {mmf.IO_ALIGN}"),
               flush=True)
 
+        slot_names = _used_type_names(planned_tensors, plugin.type_names)
         planned_aux = int(plugin.api.converter_planned_aux_size(conv))
         all_blob_sizes = dict(blob_sizes)
         if planned_aux > 0:
@@ -458,7 +470,7 @@ def convert_with_quant_plugin(mmf, src, out_path, tmp_path, plugin_path, blob_fi
         zero_sums = {il: [0] * 9 for il in layers}
         placeholder = {name: (0, all_blob_sizes[name]) for name in all_blob_sizes}
         init_hdr = _header_bytes(
-            _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, zero_sums, placeholder, merge_split),
+            _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, zero_sums, placeholder, merge_split, slot_names),
             hdr_tmp_path,
         )
         hlen = len(init_hdr)
@@ -483,7 +495,7 @@ def convert_with_quant_plugin(mmf, src, out_path, tmp_path, plugin_path, blob_fi
             raise mmf.Refuse(f"{os.path.dirname(out_path)} has {free / 1e9:.1f} GB free, the file needs {need / 1e9:.1f} GB")
 
         staged_hdr = _header_bytes(
-            _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, zero_sums, blobs, merge_split),
+            _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, zero_sums, blobs, merge_split, slot_names),
             hdr_tmp_path,
         )
         if len(staged_hdr) != hlen:
@@ -560,7 +572,7 @@ def convert_with_quant_plugin(mmf, src, out_path, tmp_path, plugin_path, blob_fi
         print(f"checksums of the first, middle and last expert of every layer ({n_jobs} processes) ...", flush=True)
         sums = mmf.compute_sums(tmp_path, layers, out_expert_offs, n_jobs)
         final_hdr = _header_bytes(
-            _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, sums, blobs, merge_split),
+            _build_plugin_writer(mmf, reader, arch, planned_tensors, layers, sums, blobs, merge_split, slot_names),
             hdr_tmp_path,
         )
         if len(final_hdr) != hlen:

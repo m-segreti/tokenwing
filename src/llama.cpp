@@ -371,6 +371,29 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        // A file made with a quant plugin names the plugin's type in each slot it uses (make_model_file.py --quant-plugin):
+        // another plugin's format in the same slot, with the same block size, would read the weights as garbage
+        if (ml.metadata != nullptr) {
+            const int64_t k_tn = gguf_find_key(ml.metadata, "tokenwing.quant_plugin.types");
+            if (k_tn >= 0 && gguf_get_kv_type(ml.metadata, k_tn) == GGUF_TYPE_ARRAY &&
+                    gguf_get_arr_type(ml.metadata, k_tn) == GGUF_TYPE_STRING) {
+                const size_t n = std::min<size_t>(gguf_get_arr_n(ml.metadata, k_tn), GGML_QUANT_PLUGIN_MAX_TYPES);
+                for (size_t i = 0; i < n; i++) {
+                    const char * want = gguf_get_arr_str(ml.metadata, k_tn, i);
+                    if (want == nullptr || want[0] == '\0') {
+                        continue;
+                    }
+                    const ggml_type t    = (ggml_type) (GGML_TYPE_EXT0 + i);
+                    const bool      have = ggml_quant_plugin_get() != nullptr && ggml_blck_size(t) > 0;
+                    if (!have || strcmp(ggml_type_name(t), want) != 0) {
+                        throw std::runtime_error(format("the model was made with the quant plugin type '%s' in slot %zu, but %s",
+                                want, i, have ? format("the loaded plugin has '%s' there", ggml_type_name(t)).c_str()
+                                              : "no loaded plugin provides it (--quant-plugin)"));
+                    }
+                }
+            }
+        }
+
         if (!params.no_alloc) {
             const ggml_quant_plugin_api * api = ggml_quant_plugin_get();
             if (api != nullptr && api->load_aux_blob != nullptr && ml.metadata != nullptr && !ml.file_paths.empty()) {

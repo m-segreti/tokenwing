@@ -231,6 +231,7 @@ def main():
                 rd = gguf.GGUFReader(str(merged_out))
                 assert "split.count" not in rd.fields
                 assert int(rd.fields["tokenwing.blob.quant_plugin_aux.size"].contents()) == 64
+                assert list(rd.fields["tokenwing.quant_plugin.types"].contents()) == ["ext0", "", "", "", "", ""]
                 exps = [t for t in rd.tensors if t.name.endswith("_exps.weight")]
                 assert len(exps) == 9 and all(t.tensor_type == gguf.GGMLQuantizationType.EXT0 for t in exps)
             finally:
