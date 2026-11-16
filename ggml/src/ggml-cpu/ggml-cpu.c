@@ -2054,6 +2054,22 @@ void ggml_cpu_moe_slots_skip_zero(const void * pool, int first_zero) {
     abort();
 }
 
+int ggml_cpu_moe_slots_get_first_zero(const void * data) {
+    const uintptr_t p = (uintptr_t) data;
+    for (int i = 0; i < g_ggml_moe_n_pools; i++) {
+        const uintptr_t b = (uintptr_t) g_ggml_moe_pools[i].pool;
+        if (p >= b && p < b + g_ggml_moe_pools[i].bytes) {
+            if (g_ggml_moe_pools[i].first_zero < 0 || g_ggml_moe_pools[i].slice_bytes == 0) {
+                return -1;
+            }
+            const int s0 = (int) ((p - b) / g_ggml_moe_pools[i].slice_bytes);
+            const int fz = g_ggml_moe_pools[i].first_zero - s0;
+            return fz > 0 ? fz : 0;
+        }
+    }
+    return -1;
+}
+
 // A gate / up pool's link to its down pool's flags (see later)
 void ggml_cpu_moe_slots_set_later(const void * pool, const uint32_t * later) {
     for (int i = 0; i < g_ggml_moe_n_pools; i++) {

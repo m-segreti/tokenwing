@@ -5199,13 +5199,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-cpu-repack"}, "BOOL",
-        "keep the expert pools in llama.cpp's repacked CPU layout, which lets the expert MUL_MAT_ID "
-        "use the repacked kernels: measured 2.2x on the expert matmul (0.187 -> 0.084 ms for 8 experts "
-        "and one token) at the cost of converting every read on an I/O thread (0.11-0.26 ms per expert). "
-        "Off by default, and only for decode: with a repacked pool a ubatch that needs waves (n_tokens "
-        ">= 512 and more distinct experts than the pool has slots) names only ~20 distinct experts per "
-        "ubatch-layer instead of ~390 and the text after the prompt is garbage. The "
-        "3x prefill that made this look attractive was that broken path, so it is not a speedup yet",
+        "keep the expert pools in llama.cpp's repacked CPU layout, letting expert MUL_MAT_ID use the repacked "
+        "CPU kernels across both decode and multi-wave prompt ubatches (measured 2.2x on the expert matmul at "
+        "the cost of converting each read on an I/O thread; default: 0)",
         [](common_params & params, int value) {
             params.moe_stream_cpu_repack = value;
         }

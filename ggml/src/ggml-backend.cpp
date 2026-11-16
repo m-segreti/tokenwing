@@ -1859,8 +1859,14 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                const struct ggml_tensor * src_base = src;
+                while (src_base->view_src != NULL) {
+                    src_base = src_base->view_src;
+                }
                 // check if a backend with higher prio wants to offload the op
-                if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+                if (sched->op_offload && src_backend_id == sched->n_backends - 1 &&
+                    ggml_backend_buffer_is_host(src->buffer) &&
+                    src_base->extra == NULL && src->buffer->iface.get_tensor != NULL) {
                     for (int b = 0; b < src_backend_id; b++) {
                         if (sched->op_offload_only >= 0 && b != sched->op_offload_only) {
                             continue;

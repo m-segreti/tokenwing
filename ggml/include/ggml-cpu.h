@@ -231,6 +231,7 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_moe_slots_take_wait_cb(const void * pool, int64_t * cb_us, int64_t * all_us);
     GGML_BACKEND_API void ggml_cpu_moe_slots_take_handoff(const void * pool, int64_t * sum_us, int64_t * n, int64_t * max_us);
     GGML_BACKEND_API void ggml_cpu_moe_slots_skip_zero(const void * pool, int first_zero);   // --moe-stream-cpu-skip-zero
+    GGML_BACKEND_API int  ggml_cpu_moe_slots_get_first_zero(const void * data);
     // --moe-stream-proj-ready 1: a gate / up pool learns its expert's down pool flags (`later`, the same slot index);
     // mul_mat_id then counts, once per expert and op, a projection whose compute starts while that expert's down has not landed.
     // take_early returns that count since the last take and resets it
