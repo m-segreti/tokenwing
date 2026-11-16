@@ -32,6 +32,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <intrin.h>
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -111,8 +112,18 @@ static double read_gbps(const std::string & path, int qd, double seconds, size_t
 }
 
 // The fast cores of a CPU with two kinds of cores, as a --cpu-range value ("0-15"), or "" when all cores are alike.
+// Intel only, on both systems: AMD's compact cores (Zen 5c next to Zen 5) also carry a lower efficiency class on Windows,
+// but they run the memory-bound expert matmul nearly as fast - pinning Ling to the 4 Zen 5 cores of a Ryzen AI 9 HX 370 measured
+// 25.8 tok/s against 35.1 on all cores. (The Linux branch reads Intel's cpu_core / cpu_atom files, so it never names AMD cores)
 static std::string fast_cpus() {
 #ifdef _WIN32
+    int id[4] = {};
+    __cpuid(id, 0);
+    char vendor[13] = {};
+    memcpy(vendor, &id[1], 4); memcpy(vendor + 4, &id[3], 4); memcpy(vendor + 8, &id[2], 4);
+    if (strcmp(vendor, "GenuineIntel") != 0) {
+        return "";
+    }
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
     std::vector<char> buf(len);
