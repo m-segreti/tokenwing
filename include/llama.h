@@ -594,6 +594,7 @@ extern "C" {
                                                 //      under ROCm/HIP, 0 = off
         int32_t      moe_stream_hip_sync;       // ROCm/HIP CPU-GPU handoff spin-poll before kernel wait (1 = auto 400 us, > 1 = spin window
                                                 //      in us, 0 = off)
+        float        moe_route_mass;            // (0, 1) = prune tail MoE experts once cumulative top-k mass reaches threshold (keeping >= 2), 0 = off
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -676,6 +677,8 @@ extern "C" {
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        float    moe_route_mass; // (0, 1) = prune tail MoE experts once cumulative top-k mass reaches threshold, 0 = from model / off
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)

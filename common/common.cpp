@@ -1951,6 +1951,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_plan_only        = params.moe_stream_plan_only;
     mparams.moe_stream_oracle           = params.moe_stream_oracle.empty() ? NULL : params.moe_stream_oracle.c_str();
     mparams.moe_stream_oracle_lead      = params.moe_stream_oracle_lead;
+    mparams.moe_route_mass              = params.moe_route_mass;
     mparams.quant_plugin                = params.quant_plugin.empty() ? NULL : params.quant_plugin.c_str();
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
@@ -1978,6 +1979,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.yarn_attn_factor  = params.yarn_attn_factor;
     cparams.yarn_beta_fast    = params.yarn_beta_fast;
     cparams.yarn_beta_slow    = params.yarn_beta_slow;
+    cparams.moe_route_mass    = params.moe_route_mass;
     cparams.yarn_orig_ctx     = params.yarn_orig_ctx;
     cparams.pooling_type      = params.pooling_type;
     cparams.attention_type    = params.attention_type;

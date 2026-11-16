@@ -90,7 +90,7 @@ static inline bool moe_wave_plan_build(moe_wave_plan & p, const std::vector<int3
         p.cnt[e] = -1;   // a mark: only the plan's experts are counted
     }
     for (int64_t i = 0; i < n; i++) {
-        if (p.cnt[ids[i]] != 0) {
+        if (ids[i] >= 0 && ids[i] < n_expert && p.cnt[ids[i]] != 0) {
             p.cnt[ids[i]] += p.cnt[ids[i]] < 0 ? 2 : 1;   // -1 -> 1 on the first pair
         }
     }
@@ -214,7 +214,7 @@ static inline bool moe_wave_plan_build(moe_wave_plan & p, const std::vector<int3
     std::vector<int32_t> seen((size_t) n_expert, 0);
     for (int64_t i = 0; i < n; i++) {
         const int32_t e = ids[i];
-        if (p.w_first[e] >= 0) {
+        if (e >= 0 && e < n_expert && p.w_first[e] >= 0) {
             p.pair_wave[(size_t) i] = (int16_t) (p.w_first[e] + (seen[e]++ < p.n_first[e] ? 0 : 1));
         }
     }
@@ -236,6 +236,13 @@ static inline bool moe_wave_plan_check(const moe_wave_plan & p, const std::vecto
     for (int64_t i = 0; i < n; i++) {
         const int32_t e = ids[i];
         const int32_t w = p.pair_wave[(size_t) i];
+        if (e == n_expert) {
+            if (w != -1) {
+                err = "pruned sentinel has wave " + std::to_string(w);
+                return false;
+            }
+            continue;
+        }
         if (!want[e]) {
             if (w != -1) {
                 err = "pair " + std::to_string(i) + " of an expert outside the plan has wave " + std::to_string(w);

@@ -2803,6 +2803,42 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
+    if (cparams.moe_route_mass > 0.0f && cparams.moe_route_mass < 1.0f && n_expert_used > 2) {
+        // Expand Softmax..Div..(Scale) contiguously first so ggml-cuda topk_moe_cuda fusion fires unchanged
+        ggml_build_forward_expand(gf, weights);
+
+        const uint32_t min_k       = 2;
+        const float    mass_thresh = cparams.moe_route_mass;
+
+        ggml_tensor * w2d        = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * w_sum_orig = ggml_clamp(ctx0, ggml_sum_rows(ctx0, w2d), 6.103515625e-5f, INFINITY);
+        ggml_tensor * w_rel      = ggml_div(ctx0, w2d, w_sum_orig);
+
+        ggml_tensor * prefix_inc = ggml_cumsum(ctx0, w_rel);
+        ggml_tensor * prefix_exc = ggml_sub(ctx0, prefix_inc, w_rel);
+
+        ggml_tensor * rank_1     = ggml_cumsum(ctx0, ggml_fill(ctx0, w_rel, 1.0f));
+        ggml_tensor * kmin_keep  = ggml_step(ctx0, ggml_scale_bias(ctx0, rank_1,     -1.0f, (float) min_k + 0.5f));
+        ggml_tensor * mass_keep  = ggml_step(ctx0, ggml_scale_bias(ctx0, prefix_exc, -1.0f, mass_thresh));
+        ggml_tensor * keep_mask  = ggml_clamp(ctx0, ggml_add(ctx0, kmin_keep, mass_keep), 0.0f, 1.0f);
+
+        w2d = ggml_mul(ctx0, w2d, keep_mask);
+        ggml_tensor * w_sum_kept = ggml_clamp(ctx0, ggml_sum_rows(ctx0, w2d), 6.103515625e-5f, INFINITY);
+        w2d = ggml_mul(ctx0, w2d, ggml_div(ctx0, w_sum_orig, w_sum_kept));
+        weights = ggml_reshape_3d(ctx0, w2d, 1, n_expert_used, n_tokens);
+        cb(weights, "ffn_moe_weights_mass_pruned", il);
+
+        const bool is_streamed = mstream != nullptr && mstream->layer(il) != nullptr &&
+                                 !weight_before_ffn && !up_exps_b && !gate_exps_b && !down_exps_b;
+        if (is_streamed) {
+            ggml_tensor * prune_mask = ggml_scale_bias(ctx0, keep_mask, -1.0f, 1.0f);
+            ggml_tensor * ids_f32    = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+            ids_f32 = ggml_add(ctx0, ggml_mul(ctx0, ids_f32, keep_mask), ggml_scale(ctx0, prune_mask, (float) n_expert));
+            selected_experts = ggml_cast(ctx0, ids_f32, GGML_TYPE_I32);
+            cb(selected_experts, "ffn_moe_topk_mass_pruned", il);
+        }
+    }
+
     weights_rt = weights;
 
     // The router's picks and weights go into the call's tensors at this ubatch's rows; no experts, no guess
@@ -2823,7 +2859,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // it runs in the GPU window and is ready for the VRAM pass and the join. Same ops on the same inputs.
     // MOE_STREAM_TEST_WEIGHTS_EARLY=1 (test only) keeps the old order for the A/B.
     static const bool weights_early_test = getenv("MOE_STREAM_TEST_WEIGHTS_EARLY") && atoi(getenv("MOE_STREAM_TEST_WEIGHTS_EARLY")) != 0;
-    const bool weights_deferred = !weights_early_test && mstream && mstream->p1.fused_route && hparams.n_expert_groups > 1 &&
+    const bool weights_deferred = !weights_early_test && !(cparams.moe_route_mass > 0.0f && cparams.moe_route_mass < 1.0f) &&
+            mstream && mstream->p1.fused_route && hparams.n_expert_groups > 1 &&
             n_tokens == 1 && mstream->ne_gpu_graph() && mstream->ne_rd_layer_on(il);
     bool weights_expanded = false;
 

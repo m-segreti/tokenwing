@@ -221,6 +221,7 @@ struct llama_moe_stream_p1 {
     bool        proj_ready     = false;   // --moe-stream-proj-ready 1: a ready flag per projection, gate / up read first
     int32_t     wordstart      = 0;       // --moe-stream-wordstart D (0 = off): word-start guesses from the last D
                                           //          layers before the first streamed one
+    float       route_mass     = 0.0f;    // --moe-route-mass M (0 = off): cumulative router probability mass threshold
     // VRAM follow: the moving VRAM expert set - the VRAM expert pool shared by all streamed layers and refilled while a
     // reply is written by AI-der's rule (qwen38_tier.c:743-793, tier.h:9-14); every number a setting, the defaults AI-der's shipped ones
     bool        vram_follow          = false;   // --moe-stream-vram-follow 1 (needs --moe-stream-vram-experts N)
@@ -559,7 +560,7 @@ struct llama_moe_stream_layer {
     int32_t               vx_fmt_li    = -1; // this layer's ordinal within its parent format group
     bool                  vp_built = false;   // the last one-token graph built this layer's device pass in its launch
     std::vector<int32_t>  vx_seen;    // remap scratch: the distinct VRAM-held experts of a call
-    bool vx_held(int32_t e) const { return !vx_slot.empty() && vx_slot[e] >= 0; }
+    bool vx_held(int32_t e) const { return e >= 0 && (size_t) e < vx_slot.size() && vx_slot[e] >= 0; }
 
     // stats, one set per phase: prompt processing and decode, so that ms/token means the same
     // thing on both sides of the phase change (the old single set divided the stall by all

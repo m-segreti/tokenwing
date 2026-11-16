@@ -7116,6 +7116,9 @@ void llama_moe_stream::oracle_check(llama_moe_stream_layer & sl, int64_t t0, con
 
         for (int64_t j = 0; j < k; j++) {
             const int32_t e = ids[t*k + j];
+            if (e == (int32_t) sl.n_expert) {
+                continue;
+            }
 
             bool found = false;
             for (uint32_t r = 0; r < oracle_k; r++) {
@@ -10537,6 +10540,9 @@ void llama_moe_stream::es_count(llama_moe_stream_layer & sl, const int32_t * ids
             w *= dec;
         }
         for (int64_t j = 0; j < n; j++) {
+            if (ids[j] == (int32_t) n_expert_total) {
+                continue;
+            }
             const int64_t t = k > 0 ? j/k : 0;
             sl.es_w[ids[j]] += std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife);
         }
@@ -10558,6 +10564,9 @@ void llama_moe_stream::es_count(llama_moe_stream_layer & sl, const int32_t * ids
     }
     for (int64_t j = 0; j < n; j++) {
         const int32_t e = ids[j];
+        if (e == (int32_t) n_expert_total) {
+            continue;
+        }
         const int32_t s = sl.expert_slot[e];
         const bool    vh = sl.vx_held(e);
         sl.es_p      += 1;
@@ -11139,6 +11148,9 @@ void llama_moe_stream::win_layer_start(llama_moe_stream_layer & sl, const int32_
     }
     for (int64_t j = 0; j < n; j++) {
         const int32_t e = ids[j];
+        if (e == (int32_t) n_expert_total) {
+            continue;
+        }
         const int64_t t = k > 0 ? j/k : 0;
         if (sl.win_score[e] == 0.0f && !sl.vx_held(e)) {
             sl.win_union += 1;   // counted on first pick (the floor keeps a picked score above 0); not the VRAM-held ones
@@ -11829,7 +11841,7 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         if (!sl.ws_named_word.empty()) {
             for (int64_t j = 0; j < n; j++) {
                 const int32_t e = ids[j];
-                if (sl.vx_held(e) || sl.ws_named_word[e] != w) {
+                if (e == (int32_t) sl.n_expert || sl.vx_held(e) || sl.ws_named_word[e] != w) {
                     continue;
                 }
                 const int32_t s = sl.expert_slot[e];
@@ -11838,7 +11850,7 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         }
         for (int64_t j = 0; j < n && sl.b0_n < (int32_t) sl.b0_e.size(); j++) {
             const int32_t e = ids[j];
-            if (sl.vx_held(e)) {
+            if (e == (int32_t) sl.n_expert || sl.vx_held(e)) {
                 continue;   // the VRAM expert pool computes it
             }
             const int32_t s = sl.expert_slot[e];
@@ -11985,6 +11997,9 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
 
         for (int64_t j = 0; j < k; j++) {
             const int32_t e = ids[t*k + j];
+            if (e == (int32_t) sl.n_expert) {
+                continue;
+            }
             GGML_ASSERT(e >= 0 && (uint32_t) e < sl.n_expert);
 
             if (sl.tok_stamp[e] == stamp) {
@@ -12000,6 +12015,9 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
     if (us_on && wave == 0 && (size_t) sl.il < us_cnt.size() && !us_cnt[sl.il].empty()) {   // the usage table, +1 per pick
         uint32_t * cnt = us_cnt[sl.il].data();
         for (int64_t i = 0; i < n; i++) {
+            if (ids[i] == (int32_t) sl.n_expert) {
+                continue;
+            }
             cnt[ids[i]] += cnt[ids[i]] < UINT32_MAX ? 1 : 0;
         }
         us_dirty = true;
@@ -12007,12 +12025,18 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
     if (!sl.vf_recent.empty() && wave == 0) {   // VRAM follow: AI-der's counts, +1 per pick (prompts and replies)
         for (int64_t i = 0; i < n; i++) {
             const int32_t e = ids[i];
+            if (e == (int32_t) sl.n_expert) {
+                continue;
+            }
             sl.vf_recent[e] += sl.vf_recent[e] < UINT32_MAX ? 1 : 0;
             sl.vf_long  [e] += sl.vf_long  [e] < UINT32_MAX ? 1 : 0;
         }
     }
     for (int64_t i = 0; i < n; i++) {
         const int32_t e = ids[i];
+        if (e == (int32_t) sl.n_expert) {
+            continue;
+        }
         GGML_ASSERT(e >= 0 && (uint32_t) e < sl.n_expert);
         // An expert the VRAM expert pool holds is computed by the GPU: it gets no RAM slot, no read and no place in a
         // wave, and its use is counted on its own (once per ubatch, at wave 0), not as a hit or a miss
@@ -12122,6 +12146,9 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         for (int64_t t = 0; t < n_tok; t++) {
             const float wt = std::exp2(-(float) (n_tok - 1 - t)/p1.prompt_end_halflife);
             for (int64_t j = 0; j < k; j++) {
+                if (ids[t*k + j] == (int32_t) sl.n_expert) {
+                    continue;
+                }
                 sl.p1_pe_w[ids[t*k + j]] += wt;
             }
         }
@@ -12220,6 +12247,9 @@ int64_t llama_moe_stream::remap_needed(llama_moe_stream_layer & sl, const int32_
         for (int64_t t = 0; t < n_tok; t++) {
             const float wt = p1_decay(n_tok - 1 - t);
             for (int64_t j = 0; j < k; j++) {
+                if (ids[t*k + j] == (int32_t) sl.n_expert) {
+                    continue;
+                }
                 sl.p1_dval[ids[t*k + j]] += wt;
             }
         }
@@ -12891,7 +12921,7 @@ void llama_moe_stream::remap_finish(llama_moe_stream_layer & sl, const int32_t *
 
         for (int64_t j = 0; j < k; j++) {
             const int32_t e  = ids[t*k + j];
-            const int32_t s  = sl.expert_slot[e];
+            const int32_t s  = (e >= 0 && (uint32_t) e < sl.n_expert) ? sl.expert_slot[e] : -1;
             const bool vx = sl.vx_held(e);   // the device pass computes this pair
             const bool pw = wplan && wp_tab.pair_wave[(size_t) (t*k + j)] == wave;
             const bool ok = s >= 0 && !vx && (!multi || (wplan ? pw : sl.slot_wave[s] == wave));
@@ -12925,11 +12955,11 @@ void llama_moe_stream::remap_finish(llama_moe_stream_layer & sl, const int32_t *
                         "also has RAM slot %d (it must never be read)", sl.il, (long long) t, (long long) n_tok,
                         decode_phase ? "decode" : "prompt", e, s);
             }
-            // a pair with no RAM slot in a one-wave call passes only if the VRAM expert pool computes it
+            // a pair with no RAM slot in a one-wave call passes only if the VRAM expert pool computes it (or it was pruned by --moe-route-mass)
             const bool t_drop1 = drop1 && t == 0 && j == 0;
             const bool t_drop3 = t*k + j == drop3_i;
             const bool vx_seen = vx && !t_drop3;
-            if (!multi && p1.slot_check && ((s < 0 && !vx_seen) || t_drop1)) {
+            if (!multi && p1.slot_check && e != (int32_t) sl.n_expert && ((s < 0 && !vx_seen) || t_drop1)) {
                 moe_stream_fail("slot check: layer %d, token %lld of %lld (%s): expert %d has no RAM slot in a one-wave call%s; "
                         "it would add 0 instead of the expert%s", sl.il, (long long) t, (long long) n_tok,
                         decode_phase ? "decode" : "prompt", e, vx ? " and the VRAM expert pool does not serve it" : "",
@@ -12979,7 +13009,7 @@ void llama_moe_stream::remap_finish(llama_moe_stream_layer & sl, const int32_t *
         // changed nothing the check counts, so the failure test could not bite)
         int64_t drop2_j = -1;
         for (int64_t j = 0; drop2 && j < k; j++) {
-            if (!sl.vx_held(ids[j])) {
+            if (ids[j] != (int32_t) sl.n_expert && !sl.vx_held(ids[j])) {
                 drop2_j = j;
                 break;
             }
@@ -12987,10 +13017,11 @@ void llama_moe_stream::remap_finish(llama_moe_stream_layer & sl, const int32_t *
         for (int64_t t = 0; t < n_tok; t++) {
             for (int64_t j = 0; j < k; j++) {
                 // The zero ids start at the start size in a low-only call, else at the layer's size
-                const bool seen = out_slots[t*k + j] < (int32_t) (sl.el_low_only ? n_slots : sl.n_slots) && !(drop2 && t == 0 && j == drop2_j);
+                const bool seen   = out_slots[t*k + j] < (int32_t) (sl.el_low_only ? n_slots : sl.n_slots) && !(drop2 && t == 0 && j == drop2_j);
                 // A VRAM-held pair is served by the device pass, once per ubatch: it counts at wave 0
-                const bool vx   = wave == 0 && sl.vx_held(ids[t*k + j]);
-                dbg_wave_cnt[(size_t) t] += (seen ? 1 : 0) + (vx ? 1 : 0);
+                const bool vx     = wave == 0 && sl.vx_held(ids[t*k + j]);
+                const bool pruned = wave == 0 && ids[t*k + j] == (int32_t) sl.n_expert;
+                dbg_wave_cnt[(size_t) t] += (seen ? 1 : 0) + (vx ? 1 : 0) + (pruned ? 1 : 0);
             }
         }
         if (wave == n_waves(n_tok) - 1) {
@@ -13242,12 +13273,13 @@ void llama_moe_stream::rec_stage_state(llama_moe_stream_layer & sl, const int32_
     rec_s_tsnap[il] = ggml_time_us();   // under the lock: events made before it are in the state read below, later ones are not
 
     for (size_t j = 0; j < kk; j++) {
-        const int32_t s = sl.expert_slot[ids[j]];
+        const int32_t e = ids[j];
+        const int32_t s = (e >= 0 && (uint32_t) e < sl.n_expert) ? sl.expert_slot[e] : -1;
 
         // 3 = held by the VRAM expert pool (present, computed by the GPU; never a miss and never a RAM hit)
         // A read drop stale cancelled is not in flight (it settles EMPTY): 0, as the engine counts it (n_miss)
         // 4 = a copy-back from the VRAM pool in flight (the engine counts n_cb_late, not a late guess)
-        rec_s_res[il*kk + j] = sl.vx_held(ids[j]) ? 3 : s < 0 ? 0 :
+        rec_s_res[il*kk + j] = e == (int32_t) sl.n_expert ? 1 : sl.vx_held(e) ? 3 : s < 0 ? 0 :
                                (sl.slot_state[s] == MOE_STREAM_SLOT_READY ? 1 : (sl.slot_cb[s] & 1) ? 4 : sl.pl_stale_cx[s] ? 0 : 2);
     }
 
@@ -13817,7 +13849,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
             for (int64_t t = 0; t < n_tok; t++) {
                 int64_t n_miss_tok = 0;
                 for (int64_t j = 0; j < n/n_tok; j++) {
-                    if (!sl->was_res[ids[t*(n/n_tok) + j]] && !sl->vx_held(ids[t*(n/n_tok) + j])) {   // a VRAM-held pair is present
+                    const int32_t e = ids[t*(n/n_tok) + j];
+                    if (e != (int32_t) sl->n_expert && !sl->was_res[e] && !sl->vx_held(e)) {   // a VRAM-held pair is present
                         n_miss_tok++;
                     }
                 }
@@ -13923,7 +13956,8 @@ static void llama_moe_stream_remap_after(llama_moe_stream * mgr, llama_moe_strea
         for (int64_t t = 0; t < n_tok; t++) {
             int64_t n_miss_tok = 0;
             for (int64_t j = 0; j < n/n_tok; j++) {
-                if (!sl->was_res[ids[t*(n/n_tok) + j]] && !sl->vx_held(ids[t*(n/n_tok) + j])) {   // a VRAM-held pair is present
+                const int32_t e = ids[t*(n/n_tok) + j];
+                if (e != (int32_t) sl->n_expert && !sl->was_res[e] && !sl->vx_held(e)) {   // a VRAM-held pair is present
                     n_miss_tok++;
                 }
             }
@@ -15110,7 +15144,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             const int64_t nb_gu = (int64_t) ggml_row_size(F.t_gate, F.ne_gate[0])*2*F.ne_gate[1];
             const int64_t nb_dn = (int64_t) ggml_row_size(F.t_down, F.ne_down[0])*F.ne_down[1];
             const int64_t nb_pl = std::max<int64_t>(1, nb_gu + nb_dn);
-            const int64_t vp_1l = vp ? (int64_t) n_expert_used*n_expert_total*(int64_t) sizeof(int32_t) : 0;   // (the id table's rows)
+            const int64_t vp_1l = vp ? (int64_t) n_expert_used*(n_expert_total + 1)*(int64_t) sizeof(int32_t) : 0;   // (the id table's rows + sentinel)
             const int64_t hi_pr = (int64_t) F.layers.size()*n_per_layer_max + (int64_t) n_zero + 2*((int64_t) n_slots + (int64_t) n_zero);
             const int64_t op_cap = probe_op_slices(F, hi_pr);
             if (op_cap <= (int64_t) n_zero) {
@@ -15178,7 +15212,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         bytes_per_n += (nb_gu + nb_dn)*(int64_t) G.layers.size();
         bytes_zero  += (nb_gu + nb_dn)*(int64_t) n_zero;
         if (vp) {   // the group's id table (with the fixed part, so the fit check counts it)
-            bytes_zero += (int64_t) n_expert_used*n_expert_total*(int64_t) G.layers.size()*(int64_t) sizeof(int32_t);
+            bytes_zero += (int64_t) n_expert_used*(n_expert_total + 1)*(int64_t) G.layers.size()*(int64_t) sizeof(int32_t);
         }
     }
 
@@ -15626,7 +15660,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
             ggml_set_name(G.vp_gate_up, "vram_experts.gate_up (held + zero)");
             ggml_set_name(G.vp_down,    "vram_experts.down (held + zero)");
             if (vp) {
-                G.vp_table = ggml_new_tensor_3d(G.ctx, GGML_TYPE_I32, n_expert_used, n_expert_total, (int64_t) G.layers.size());
+                G.vp_table = ggml_new_tensor_3d(G.ctx, GGML_TYPE_I32, n_expert_used, n_expert_total + 1, (int64_t) G.layers.size());
                 ggml_set_name(G.vp_table, "vram_experts.vp_table");
             }
             G.buf = ggml_backend_alloc_ctx_tensors_from_buft(G.ctx, buft);
@@ -16000,13 +16034,13 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     // The id tables from the filled vx_slot (with MOE_STREAM_VRAM_TEST_EMPTY every row names the zero slices)
     if (vp) {
         for (auto & G : vx_groups) {
-            std::vector<int32_t> tab((size_t) n_expert_used*n_expert_total*G.layers.size());
+            std::vector<int32_t> tab((size_t) n_expert_used*(n_expert_total + 1)*G.layers.size());
             for (size_t li = 0; li < G.layers.size(); li++) {
                 const auto & sl = *layers[G.layers[li]];
-                for (uint32_t e = 0; e < n_expert_total; e++) {
-                    const int32_t place = sl.vx_slot.empty() ? -1 : sl.vx_slot[e];
+                for (uint32_t e = 0; e <= n_expert_total; e++) {
+                    const int32_t place = sl.vx_held((int32_t) e) ? sl.vx_slot[e] : -1;
                     for (uint32_t j = 0; j < n_expert_used; j++) {
-                        tab[(li*n_expert_total + e)*n_expert_used + j] = place >= 0 ? place : G.z_end() + (int32_t) j;
+                        tab[(li*(n_expert_total + 1) + e)*n_expert_used + j] = place >= 0 ? place : G.z_end() + (int32_t) j;
                     }
                 }
             }
@@ -16015,7 +16049,7 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
         vp_test_stale = getenv("MOE_STREAM_TEST_VP_STALE_TABLE") ? std::max(0, atoi(getenv("MOE_STREAM_TEST_VP_STALE_TABLE"))) : 0;
         fprintf(stderr, "%s: vram-parallel (--moe-stream-vram-parallel %d): in a needed-early GPU-producer one-token decode graph each marked layer's "
                 "device pass runs in its GPU launch after \"router done\", during the CPU experts, its ids from a VRAM table "
-                "(%.1f KiB)%s\n", __func__, p1.vram_parallel_cross ? 2 : 1, (double) n_expert_used*n_expert_total*il_of_moe.size()*sizeof(int32_t)/1024.0,
+                "(%.1f KiB)%s\n", __func__, p1.vram_parallel_cross ? 2 : 1, (double) n_expert_used*(n_expert_total + 1)*il_of_moe.size()*sizeof(int32_t)/1024.0,
                 vp_test_stale > 0 ? format("; MOE_STREAM_TEST_VP_STALE_TABLE=%d (TEST ONLY): that incoming row write is skipped",
                 vp_test_stale).c_str() : "");
     }
@@ -16390,15 +16424,15 @@ void llama_moe_stream::vp_check() {
         ggml_backend_synchronize(vp_backend);   // the rows written on the compute stream have landed
     }
     for (const auto & G : vx_groups) {
-        std::vector<int32_t> tab((size_t) n_expert_used*n_expert_total*G.layers.size());
+        std::vector<int32_t> tab((size_t) n_expert_used*(n_expert_total + 1)*G.layers.size());
         ggml_backend_tensor_get(G.vp_table, tab.data(), 0, tab.size()*sizeof(int32_t));
         for (size_t li = 0; li < G.layers.size(); li++) {
             const auto & sl = *layers[G.layers[li]];
-            for (uint32_t e = 0; e < n_expert_total; e++) {
-                const int32_t place = sl.vx_slot.empty() ? -1 : sl.vx_slot[e];
+            for (uint32_t e = 0; e <= n_expert_total; e++) {
+                const int32_t place = sl.vx_held((int32_t) e) ? sl.vx_slot[e] : -1;
                 for (uint32_t j = 0; j < n_expert_used; j++) {
                     const int32_t want = place >= 0 ? place : G.z_end() + (int32_t) j;
-                    const int32_t have = tab[(li*n_expert_total + e)*n_expert_used + j];
+                    const int32_t have = tab[(li*(n_expert_total + 1) + e)*n_expert_used + j];
                     if (have != want) {
                         moe_stream_fail("vram-parallel table check: layer %d expert %u pair %u: the table names %d, vx_slot says %d",
                                 sl.il, e, j, have, want);
@@ -19811,7 +19845,7 @@ void llama_moe_stream_remap_vram(ggml_tensor * dst, const ggml_tensor * a, int i
     const int32_t   b0  = mgr->vx_id_base(sl->il);
 
     for (int64_t i = 0; i < n; i++) {
-        const int32_t s = sl->vx_slot.empty() ? -1 : sl->vx_slot[ids[i]];
+        const int32_t s = sl->vx_held(ids[i]) ? sl->vx_slot[ids[i]] : -1;
         if (s >= 0 && s < b0) {
             moe_stream_fail("layer %d expert %d is held in place %d, below the view (first place %d) of the graph that runs",
                     sl->il, ids[i], s, b0);

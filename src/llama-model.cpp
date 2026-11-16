@@ -2415,6 +2415,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.protect_named       = params.moe_stream_protect_named == 1;
         p1.wordstart           = params.moe_stream_wordstart;
         p1.proj_ready          = params.moe_stream_proj_ready == 1;
+        p1.route_mass          = params.moe_route_mass > 0.0f && params.moe_route_mass < 1.0f ? params.moe_route_mass : 0.0f;
+        if (p1.route_mass > 0.0f) {
+            p1.cpu_skip_zero      = true;
+            p1.gpu_skip_zero      = true;
+            p1.gpu_wave_skip_zero = true;
+        }
         p1.vram_follow          = params.moe_stream_vram_follow == 1;
         p1.vram_follow_tick     = (uint32_t) params.moe_stream_vram_follow_tick;
         p1.vram_follow_swaps    = (uint32_t) params.moe_stream_vram_follow_swaps;
@@ -4592,6 +4598,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_uma              =*/ 0,      // off (discrete RAM / VRAM pools)
         /*.moe_stream_hip_mmvq         =*/ 0,      // off
         /*.moe_stream_hip_sync         =*/ 0,      // off
+        /*.moe_route_mass              =*/ 0.0f,   // off
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

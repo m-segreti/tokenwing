@@ -4562,6 +4562,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-route-mass"}, "F",
+        "opt-in MoE router probability-mass tail-skip in (0, 1): prune low-weight tail experts once cumulative top-k "
+        "mass reaches F (keeping >= 2 experts per token) and renormalize the kept weights (default: 0 = off)",
+        [](common_params & params, const std::string & value) {
+            const float v = std::stof(value);
+            params.moe_route_mass = (v > 0.0f && v < 1.0f) ? v : 0.0f;
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-gpu-skip-zero"}, "0|1",
         "with --moe-stream-vram-experts: the GPU's one-token expert matmul writes 0 for the pairs that name one of the VRAM "
         "pool's all-zero slices instead of reading them (exactly the same output, less GPU memory traffic) (default: 0)",
