@@ -572,6 +572,8 @@ extern "C" {
         int32_t      moe_stream_copy_ahead;     // GPU prompts copy the next wave's / layer's experts into the VRAM tail ahead (and
                                                 //      one-wave prompts take the engine's tail-wave copy): 1 = two copy sets where every expert is
                                                 //      in RAM, one set elsewhere; 2 = one set everywhere; 0 = off
+        int32_t      moe_stream_tail_wave_w;    // > 0 = cap GPU tail wave width to N experts so narrow PCIe prompt waves fit in VRAM
+                                                //      even when RAM holds a full base wave, 0 = off
         int32_t      moe_stream_vram_lend_prompt; // 1 = a prompt's big GPU tensors take lent VRAM pool places (the compute
                                                 //      buffer shrinks, the pool grows); 0 = off (default)
         int32_t      moe_stream_vram_lend_short;  // prompt calls of at most this many tokens run in the real compute buffer (sized

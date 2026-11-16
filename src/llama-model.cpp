@@ -2396,6 +2396,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         p1.prompt_defer        = params.moe_stream_prompt_defer == 1;
         p1.prompt_split        = params.moe_stream_prompt_split == 1;
         p1.prompt_split_places = params.moe_stream_prompt_split_places >= 2 ? params.moe_stream_prompt_split_places : 128;
+        p1.tail_wave_w         = params.moe_stream_tail_wave_w > 0 ? params.moe_stream_tail_wave_w : 0;
         p1.gpu_wave_skip_zero  = params.moe_stream_gpu_wave_skip_zero == 1;
         p1.gpu_skip_zero       = params.moe_stream_gpu_skip_zero == 1;
         p1.plan                = params.moe_stream_plan == 1;
@@ -4581,6 +4582,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_stream_layer_major_batch =*/ 0,     // the raise goes up to the context size
         /*.moe_stream_vram_end_fill =*/ 0,         // off (the tail refilled at the first reply word)
         /*.moe_stream_copy_ahead    =*/ 0,         // off (no copy ahead; one-wave prompts take the scheduler's pool copy)
+        /*.moe_stream_tail_wave_w   =*/ 0,         // off (plain wave width)
         /*.moe_stream_vram_lend_prompt =*/ 0,      // off (the prompt's GPU tensors in the compute buffer)
         /*.moe_stream_vram_lend_short  =*/ 64,     // prompt calls of <= 64 tokens in the real compute buffer
         /*.moe_stream_timing           =*/ 0,      // no timing work

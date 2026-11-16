@@ -4496,6 +4496,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--moe-stream-tail-wave-w"}, "N",
+        "with --moe-stream-vram-free and --moe-stream-vram-follow 1: cap GPU tail-wave width to N experts (e.g. 64) "
+        "so narrow double-buffered PCIe prompt waves fit in VRAM even when RAM holds a full base wave (default: 0 = plain width)",
+        [](common_params & params, int value) {
+            params.moe_stream_tail_wave_w = std::max(0, value);
+        }
+    ));
+    add_opt(common_arg(
         {"--moe-stream-vram-chunk"}, "SIZE",
         "with --moe-stream-vram-experts / --moe-stream-vram-free: split the VRAM expert pool into buffers of "
         "consecutive layers of at most SIZE each (auto or 1 = 2GiB), for GPUs whose largest buffer is smaller than "
