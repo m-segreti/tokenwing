@@ -20,6 +20,7 @@ extern "C" bool ggml_op_can_inplace(enum ggml_op op);   // (ggml-alloc.c, GGML_A
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <csignal>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -727,6 +728,46 @@ static os_mem_cap os_mem_cap_get() {
 }
 #else
 static os_mem_cap os_mem_cap_get() { return os_mem_cap(); }   // macOS: no such limit
+#endif
+// Windows, under a job memory cap: an allocation refused late in the load (another program in the job, or the plan's estimate short of the
+// margin) can fail anywhere - a small malloc in ggml_init asserts, an unchecked one faults - so no single place can stop cleanly. When the
+// process dies (a crash, or abort from an assert) with less room under the cap than the plan's margin, one line says so with the numbers,
+// so the cause is not a mystery (the job keeps no record of a hard limit hit). Installed once by the RAM plan when there is a cap
+#ifdef _WIN32
+static const int64_t OS_CAP_DIE_ROOM = (int64_t) 1 << 30;   // = the Windows MOE_STREAM_CAP_MARGIN (defined below)
+static void os_cap_say_if_hit() {
+    static std::atomic<bool> said{false};
+    if (said.exchange(true)) {
+        return;
+    }
+    const os_mem_cap c = os_mem_cap_get();
+    if (!c.has || c.room() >= OS_CAP_DIE_ROOM) {
+        return;
+    }
+    fprintf(stderr, "moe-stream: out of memory under the process memory cap (the job object's %s, %lld MiB; in use %lld MiB): an allocation "
+            "was refused and the engine cannot go on. Raise the cap, or close what else runs in it\n",
+            c.has ? c.max_file.c_str() : "memory limit", (long long) (c.max >> 20), (long long) (c.cur >> 20));
+    fflush(stderr);
+}
+static LONG WINAPI os_cap_crash_filter(EXCEPTION_POINTERS * e) {
+    GGML_UNUSED(e);
+    os_cap_say_if_hit();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void os_cap_abort_handler(int sig) {
+    GGML_UNUSED(sig);
+    os_cap_say_if_hit();   // (abort goes on to end the process after this returns)
+}
+static void os_cap_install_crash_note() {
+    static bool done = false;
+    if (!done) {
+        done = true;
+        SetUnhandledExceptionFilter(os_cap_crash_filter);
+        signal(SIGABRT, os_cap_abort_handler);
+    }
+}
+#else
+static void os_cap_install_crash_note() {}
 #endif
 // The GPU memory a cap also charges: Windows counts a process's GPU allocations in its commit, so a job's commit limit covers them (Ling:
 // 31.3 GiB committed for 18.8 GiB of RAM + 10.7 GiB of VRAM). The engine fills the GPUs' free memory, so before it allocates there the free
@@ -2776,6 +2817,9 @@ llama_moe_stream::llama_moe_stream(
     const double pt_frac = os_page_table_fraction();
     // what the cap allows for pools + other_bytes together: (room - margin - the VRAM it also charges)/(1 + page tables); -1 = no cap
     const int64_t cap_gpu = own_cap.has ? os_cap_gpu_charge() : 0;
+    if (own_cap.has) {
+        os_cap_install_crash_note();
+    }
 #ifdef _WIN32
     // a job's commit limit counts the zero block too, although it holds no RAM (charged by the plan below only when it is written)
     const int64_t cap_zero = own_cap.has && zero_block_free(hugepages || pin) ? (int64_t) block_total*n_expert_use : 0;
