@@ -977,7 +977,7 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-// AMD: the largest scratch in bytes launch_fattn takes from the pool for its parallel blocks (GGML_HIP_FA_TMP_MAX_MIB, default
+// AMD and NVIDIA cards older than Volta: the largest scratch in bytes launch_fattn takes from the pool for its parallel blocks (GGML_HIP_FA_TMP_MAX_MIB, default
 // 64 MiB; 0 = no cap). Read once.
 static inline size_t ggml_cuda_fattn_amd_tmp_cap() {
     static const size_t cap = [] {
@@ -1230,7 +1230,9 @@ void launch_fattn(
         // block), which a card whose VRAM is planned to the last few hundred MiB does not have; there the output tiles alone fill
         // the GPU, so fewer blocks per tile cost little.
         // The scratch is kept under ggml_cuda_fattn_amd_tmp_cap() bytes (GGML_HIP_FA_TMP_MAX_MIB, default 64; 0 = no cap).
-        if (GGML_CUDA_CC_IS_AMD(cc) && parallel_blocks > 1) {
+        // NVIDIA cards older than Volta (GTX 10-series) take the same scratch in their tile kernels and ran out of memory on Ling's
+        // 7.7k-token prompt with an 8 GB card planned full; newer NVIDIA cards keep their parallel blocks
+        if ((GGML_CUDA_CC_IS_AMD(cc) || (GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA)) && parallel_blocks > 1) {
             const size_t per_block = size_t(ggml_nelements(KQV))*sizeof(float);
             const size_t cap       = ggml_cuda_fattn_amd_tmp_cap();
             if (cap > 0 && size_t(parallel_blocks)*per_block > cap) {
@@ -1239,7 +1241,7 @@ void launch_fattn(
                 static bool told = false;   // one line per process
                 if (!told) {
                     told = true;
-                    fprintf(stderr, "%s: AMD: flash attention of a %lld-row call runs %d parallel blocks instead of %d (their scratch "
+                    fprintf(stderr, "%s: flash attention of a %lld-row call runs %d parallel blocks instead of %d (their scratch "
                             "%.1f MiB would exceed GGML_HIP_FA_TMP_MAX_MIB %zu)\n", __func__, (long long) Q->ne[1], parallel_blocks,
                             pb_old, pb_old*per_block/1048576.0, cap >> 20);
                 }
