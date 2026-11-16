@@ -191,6 +191,33 @@ static bool ggml_cuda_p2p_enabled() {
     return enabled;
 }
 
+// Test only: GGML_CUDA_TEST_NO_PEER=1 treats every pair of devices as unable to copy straight to each other, so a machine with
+// direct copies runs the path through host memory that pairs without them take
+static bool ggml_cuda_test_no_peer() {
+    static const bool on = ggml_cuda_env_flag("GGML_CUDA_TEST_NO_PEER");
+    return on;
+}
+
+// Whether a copy between two physical devices may go straight from one to the other. CUDA's driver routes a peer copy
+// through host memory by itself when the pair has no direct path; HIP's crashed there (two RX 5700 XT without a direct
+// path), so on HIP a pair without one returns false and ggml copies through host memory, as a GGML_CUDA_NO_PEER_COPY build does.
+static bool ggml_cuda_direct_copy(int src_physical, int dst_physical) {
+#ifdef GGML_CUDA_NO_PEER_COPY
+    GGML_UNUSED(src_physical); GGML_UNUSED(dst_physical);
+    return false;
+#else
+    if (ggml_cuda_test_no_peer()) {
+        return false;
+    }
+#if defined(GGML_USE_HIP)
+    return ggml_cuda_info().peer[src_physical][dst_physical];
+#else
+    GGML_UNUSED(src_physical); GGML_UNUSED(dst_physical);
+    return true;
+#endif
+#endif
+}
+
 static int ggml_cuda_op_offload_min_batch() {
     static const int min_batch = ggml_cuda_env_int("GGML_OP_OFFLOAD_MIN_BATCH", 32);
     return min_batch;
@@ -424,6 +451,23 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
+
+    for (int id = 0; id < info.physical_device_count; ++id) {
+        for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
+            int can = 0;
+            if (id != id_other && cudaDeviceCanAccessPeer(&can, id, id_other) != cudaSuccess) {
+                (void) cudaGetLastError();
+                can = 0;
+            }
+            info.peer[id][id_other] = id != id_other && can && !ggml_cuda_test_no_peer();
+#if defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_PEER_COPY)
+            if (id < id_other && !info.peer[id][id_other]) {
+                GGML_LOG_INFO("%s: devices %d and %d cannot copy straight to each other: copies between them go through host memory\n",
+                              __func__, id, id_other);
+            }
+#endif
+        }
+    }
 
     if (ggml_cuda_p2p_enabled()) {
         for (int id = 0; id < info.physical_device_count; ++id) {
@@ -999,11 +1043,10 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
-#ifdef GGML_CUDA_NO_PEER_COPY
-            return false;
-#else
+            if (!ggml_cuda_direct_copy(src_physical, dst_physical)) {
+                return false;
+            }
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
-#endif
         }
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return true;
@@ -3005,11 +3048,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
-#ifdef GGML_CUDA_NO_PEER_COPY
-            return false;
-#else
+            if (!ggml_cuda_direct_copy(src_physical, dst_physical)) {
+                return false;
+            }
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
-#endif // GGML_CUDA_NO_PEER_COPY
         }
 
         // record event on src stream after the copy

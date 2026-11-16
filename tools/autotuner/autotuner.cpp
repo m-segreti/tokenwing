@@ -2,7 +2,8 @@
 // one JSON line. The streamed experts' CPU matmul reads quantized weights from RAM, so its speed is bound by the memory
 // system: the tool runs a quantized matrix-vector product over 0.6 GB of weights (more than any CPU cache) at 1, 2, ...
 // physical-core threads and reports the speed of each, the smallest thread count within 5 % of the best, and the
-// recommended -t. It also names the fast cores of a CPU with fast and slow cores (Intel's P-cores).
+// recommended -t. On a CPU with fast and slow cores (Intel's P-cores and E-cores) it measures again with the threads kept on
+// the fast cores (as --cpu-range does) and names them only when that is clearly faster than using all cores.
 //
 // With --file it also reads the model file directly (no file cache) at 1, 2, 4, 8, 16, 32 reads in flight, each the size
 // of one expert's projection in that model (the engine reads an expert as three such pieces), at random places, and
@@ -207,9 +208,15 @@ int main(int argc, char ** argv) {
         bytes += ggml_nbytes(t);
     }
 
-    std::vector<double> gbps(phys + 1, 0.0);
-    for (int t = 1; t <= phys; t++) {
+    // GB/s at t threads, the threads on the CPUs lo..hi only (as --cpu-range lo-hi places them) or anywhere (lo < 0)
+    auto measure = [&](int t, int lo, int hi) {
+        ggml_threadpool_params tp = ggml_threadpool_params_default(t);
+        for (int c = lo; lo >= 0 && c <= hi && c < GGML_MAX_N_THREADS; c++) {
+            tp.cpumask[c] = true;
+        }
+        ggml_threadpool_t pool = ggml_threadpool_new(&tp);
         ggml_backend_cpu_set_n_threads(be, t);
+        ggml_backend_cpu_set_threadpool(be, pool);
         ggml_backend_graph_compute(be, gf);   // warm-up (thread pool, pages)
         std::vector<double> runs;
         const auto t0 = std::chrono::steady_clock::now();
@@ -218,20 +225,50 @@ int main(int argc, char ** argv) {
             ggml_backend_graph_compute(be, gf);
             runs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count());
         } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds || runs.size() < 3);
+        ggml_backend_cpu_set_threadpool(be, nullptr);
+        ggml_threadpool_free(pool);
         std::nth_element(runs.begin(), runs.begin() + runs.size()/2, runs.end());
-        gbps[t] = bytes/runs[runs.size()/2]/1e9;   // the median run: a system hiccup does not move it
-    }
-    const double best = *std::max_element(gbps.begin(), gbps.end());
-    int sat = phys;
-    for (int t = 1; t <= phys; t++) {
-        if (gbps[t] >= 0.95*best) {
-            sat = t;
-            break;
+        return bytes/runs[runs.size()/2]/1e9;   // the median run: a system hiccup does not move it
+    };
+    // the fewest threads within 5 % of the best of gb[1..n]
+    auto saturation = [](const std::vector<double> & gb, int n) {
+        const double best = *std::max_element(gb.begin(), gb.end());
+        for (int t = 1; t <= n; t++) {
+            if (gb[t] >= 0.95*best) {
+                return t;
+            }
         }
+        return n;
+    };
+
+    std::vector<double> gbps(phys + 1, 0.0);
+    for (int t = 1; t <= phys; t++) {
+        gbps[t] = measure(t, -1, -1);
     }
+    const int sat = saturation(gbps, phys);
     // the engine's own threads (8 SSD readers, the guess helper) need cores too: at most all physical cores but two
     // (measured: 6 cores, -t 4 = 39 tok/s against -t 6 = 25)
-    const int threads = std::max(1, std::min(sat, phys - 2));
+    int threads = std::max(1, std::min(sat, phys - 2));
+
+    // fast cores only: kept when clearly faster than all cores at their own best thread counts (an i7-12800H ran Flint 13 %
+    // slower with 6 threads on its 6 P-cores than with 11 anywhere); the SSD readers stay free to run on the slow cores
+    const std::string fast_cores = fast_cpus();
+    std::string fast = fast_cores;
+    std::vector<double> gbps_fast;
+    if (!fast.empty()) {
+        const int lo = atoi(fast.c_str()), hi = atoi(fast.c_str() + fast.find('-') + 1);
+        const int n = std::min(phys, hi - lo + 1);
+        gbps_fast.assign(n + 1, 0.0);
+        for (int t = 1; t <= n; t++) {
+            gbps_fast[t] = measure(t, lo, hi);
+        }
+        const int tf = saturation(gbps_fast, n);
+        if (gbps_fast[tf] > 1.05*gbps[threads]) {
+            threads = tf;
+        } else {
+            fast.clear();
+        }
+    }
 
     // the cards the engine's backends see: discrete GPUs only (an integrated GPU shares the system's RAM)
     ggml_backend_load_all();
@@ -246,11 +283,18 @@ int main(int argc, char ** argv) {
         gpus += (gpus.empty() ? "" : ", ") + std::string("{\"name\": \"") + ggml_backend_dev_name(d) + "\", \"mib\": " + std::to_string(total >> 20) + "}";
     }
 
-    printf("{\"gpus\": [%s], \"physical_cores\": %d, \"threads\": %d, \"saturation\": %d, \"fast_cpus\": \"%s\", \"gbps\": [", gpus.c_str(), phys, threads, sat, fast_cpus().c_str());
+    printf("{\"gpus\": [%s], \"physical_cores\": %d, \"threads\": %d, \"saturation\": %d, \"fast_cpus\": \"%s\", \"gbps\": [", gpus.c_str(), phys, threads, sat, fast.c_str());
     for (int t = 1; t <= phys; t++) {
         printf("%s%.1f", t > 1 ? ", " : "", gbps[t]);
     }
     printf("]");
+    if (!gbps_fast.empty()) {
+        printf(", \"fast_cores\": \"%s\", \"gbps_fast\": [", fast_cores.c_str());
+        for (size_t t = 1; t < gbps_fast.size(); t++) {
+            printf("%s%.1f", t > 1 ? ", " : "", gbps_fast[t]);
+        }
+        printf("]");
+    }
     if (!file.empty()) {
         const int qds[] = { 1, 2, 4, 8, 16, 32 };
         const size_t piece = expert_piece(file);

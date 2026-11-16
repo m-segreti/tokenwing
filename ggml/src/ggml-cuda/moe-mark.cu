@@ -390,7 +390,9 @@ static __global__ void k_moe_test_spin(uint64_t ns) {
         if (t - t0 >= ns) {
             break;
         }
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA   // __nanosleep needs Volta or newer; older cards just spin
         __nanosleep(1000);
+#endif
     }
 }
 

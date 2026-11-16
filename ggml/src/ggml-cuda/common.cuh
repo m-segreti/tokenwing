@@ -1243,6 +1243,8 @@ struct ggml_cuda_device_info {
     cuda_device_info devices[GGML_CUDA_MAX_DEVICES] = {};
 
     std::array<float, GGML_CUDA_MAX_DEVICES> default_tensor_split = {};
+
+    bool peer[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};   // physical device i can copy straight to physical device j
 };
 
 const ggml_cuda_device_info & ggml_cuda_info();
