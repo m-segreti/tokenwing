@@ -263,11 +263,14 @@ static void * el_os_alloc_fresh(size_t n, bool & fresh, size_t commit = SIZE_MAX
 
 // The pools' zero slices hold no RAM. Pool memory from el_os_alloc_fresh already reads zero and costs no RAM until it
 // is written, so the start-up write of the zero block is skipped and the RAM plan does not charge it (0.864 GiB = 8 slots per layer on Ling).
-// Only where the OS layer really gives fresh memory (Linux; elsewhere the aligned allocation, not known zero - the write stays, to do) and
-// not for huge pages and not for --moe-stream-pin (cudaHostRegister pins every page of the pool, the zero block too; review finding). MOE_STREAM_TEST_ZERO_WRITE=1 (test only, read once) restores the old behaviour: normal allocation, block written, charged.
+// Only where the OS layer really gives fresh memory (Linux, and Windows: committed VirtualAlloc pages read zero and take RAM only when
+// touched; elsewhere the aligned allocation, not known zero - the write stays) and not for huge pages and not for --moe-stream-pin
+// (cudaHostRegister pins every page of the pool, the zero block too; review finding). Windows still charges the block's commit to a job's
+// memory cap (the plan's cap room keeps it). MOE_STREAM_TEST_ZERO_WRITE=1 (test only, read once) restores the old behaviour: normal
+// allocation, block written, charged.
 static bool zero_block_free(bool hugepages) {
     static const bool test_write = getenv("MOE_STREAM_TEST_ZERO_WRITE") && atoi(getenv("MOE_STREAM_TEST_ZERO_WRITE")) != 0;
-#if defined(__linux__) && !defined(MOE_STREAM_TEST_NO_LINUX)
+#if (defined(__linux__) && !defined(MOE_STREAM_TEST_NO_LINUX)) || defined(_WIN32)
     return !hugepages && !test_write;
 #else
     (void) hugepages;
@@ -2773,7 +2776,13 @@ llama_moe_stream::llama_moe_stream(
     const double pt_frac = os_page_table_fraction();
     // what the cap allows for pools + other_bytes together: (room - margin - the VRAM it also charges)/(1 + page tables); -1 = no cap
     const int64_t cap_gpu = own_cap.has ? os_cap_gpu_charge() : 0;
-    const int64_t zero_cap_room = own_cap.has ? std::max<int64_t>(0, (int64_t) ((double) (own_cap.room() - MOE_STREAM_CAP_MARGIN - cap_gpu)/(1.0 + pt_frac))) : -1;
+#ifdef _WIN32
+    // a job's commit limit counts the zero block too, although it holds no RAM (charged by the plan below only when it is written)
+    const int64_t cap_zero = own_cap.has && zero_block_free(hugepages || pin) ? (int64_t) block_total*n_expert_use : 0;
+#else
+    const int64_t cap_zero = 0;
+#endif
+    const int64_t zero_cap_room = own_cap.has ? std::max<int64_t>(0, (int64_t) ((double) (own_cap.room() - MOE_STREAM_CAP_MARGIN - cap_gpu - cap_zero)/(1.0 + pt_frac))) : -1;
     if (n_streamed > 0 && mem_available > 0) {
         fprintf(stderr, "%s: RAM limit: MemAvailable %lld MiB - keep-free %lld MiB = %lld MiB; %s; decided by: %s\n", __func__,
                 (long long) (mem_available >> 20), (long long) (ram_free >> 20), (long long) (((int64_t) mem_available - ram_free) >> 20),
