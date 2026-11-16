@@ -21207,7 +21207,13 @@ void llama_moe_stream::el_move_zero(llama_moe_stream_layer & sl, uint32_t zb) {
     for (uint32_t i = zb; i < zb + k; i++) {   // the new zero block: written zero (the slices of the old block already are), ready for good
         bool wr = (i < old || i >= old + k) && !sl.el_zero_known[i] && sl.el_res[i];   // a slot holding no RAM reads zero
         bool released = false;
-        if (wr && zero_block_free(hugepages || pin)) {   // give its pages back instead of writing zeros (the platform says when it is known zero)
+        // give its pages back instead of writing zeros (the platform says when it is known zero) - not on Windows: a returned page is
+        // decommitted there and reading it as a zero slice faults (the commit above made the slot readable; it is written instead)
+#ifdef _WIN32
+        if (false) {
+#else
+        if (wr && zero_block_free(hugepages || pin)) {
+#endif
             el_release_slot(sl, (int32_t) i);
             released = true;
             wr = !sl.el_zero_known[i];
