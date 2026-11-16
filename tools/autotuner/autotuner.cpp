@@ -1,18 +1,22 @@
-// llama-tune: measures the parts of this PC that decide TokenWing's CPU settings, without loading a model, and prints
+// autotuner: measures the parts of this PC that decide TokenWing's CPU settings, without loading a model, and prints
 // one JSON line. The streamed experts' CPU matmul reads quantized weights from RAM, so its speed is bound by the memory
 // system: the tool runs a quantized matrix-vector product over 0.6 GB of weights (more than any CPU cache) at 1, 2, ...
 // physical-core threads and reports the speed of each, the smallest thread count within 5 % of the best, and the
 // recommended -t. It also names the fast cores of a CPU with fast and slow cores (Intel's P-cores).
 //
-// With --file it also reads the model file directly (no file cache) at 1, 2, 4, 8, 16 reads in flight, 2 MiB each at
-// random places, and recommends the engine's SSD reader count (--moe-stream-io-threads): the fewest within 5 % of the best.
+// With --file it also reads the model file directly (no file cache) at 1, 2, 4, 8, 16, 32 reads in flight, each the size
+// of one expert's projection in that model (the engine reads an expert as three such pieces), at random places, and
+// recommends the engine's SSD reader count (--moe-stream-io-threads): the fewest within 5 % of the best.
+// It also lists the graphics cards the engine's backends see (CUDA, ROCm, Vulkan ...) with their memory, so the caller
+// can choose by card without a vendor's own library.
 //
-//   llama-tune [--seconds S] [--file MODEL.gguf]
+//   autotuner [--seconds S] [--file MODEL.gguf]
 
 #include "common.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <chrono>
@@ -33,10 +37,29 @@
 #include <unistd.h>
 #endif
 
-// GB/s of direct reads of `path`: `qd` threads, each reading 2 MiB blocks at random 4 KiB-aligned places, for `seconds`.
-// -1 when the file cannot be read that way.
-static double read_gbps(const std::string & path, int qd, double seconds) {
-    const size_t blk = 2u << 20;
+// The bytes of one expert's projection in a model file (its first expert tensor / its experts), rounded up to 4 KiB;
+// 2 MiB when the file has no expert tensors or cannot be read
+static size_t expert_piece(const std::string & path) {
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+    gguf_context * g = gguf_init_from_file(path.c_str(), gp);
+    size_t piece = 2u << 20;
+    if (g && meta) {
+        for (ggml_tensor * t = ggml_get_first_tensor(meta); t; t = ggml_get_next_tensor(meta, t)) {
+            if (strstr(t->name, "_exps.weight") && t->ne[2] > 1) {
+                piece = (ggml_nbytes(t)/(size_t) t->ne[2] + 4095)/4096*4096;
+                break;
+            }
+        }
+    }
+    if (meta) { ggml_free(meta); }
+    if (g) { gguf_free(g); }
+    return piece;
+}
+
+// GB/s of direct reads of `path`: `qd` threads, each reading `blk`-byte pieces at random 4 KiB-aligned places, for
+// `seconds`. -1 when the file cannot be read that way.
+static double read_gbps(const std::string & path, int qd, double seconds, size_t blk) {
     std::vector<double> got(qd, 0.0);
     std::vector<std::thread> th;
     bool ok = true;
@@ -160,7 +183,7 @@ int main(int argc, char ** argv) {
     ggml_backend_t be = ggml_backend_cpu_init();
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
     if (!be || !buf) {
-        fprintf(stderr, "llama-tune: cannot allocate the test matrices\n");
+        fprintf(stderr, "autotuner: cannot allocate the test matrices\n");
         return 1;
     }
     ggml_backend_buffer_clear(buf, 0);   // zero blocks: the same bytes are read as with real weights, and no NaN / denormal
@@ -195,23 +218,38 @@ int main(int argc, char ** argv) {
     // (measured: 6 cores, -t 4 = 39 tok/s against -t 6 = 25)
     const int threads = std::max(1, std::min(sat, phys - 2));
 
-    printf("{\"physical_cores\": %d, \"threads\": %d, \"saturation\": %d, \"fast_cpus\": \"%s\", \"gbps\": [", phys, threads, sat, fast_cpus().c_str());
+    // the cards the engine's backends see: discrete GPUs only (an integrated GPU shares the system's RAM)
+    ggml_backend_load_all();
+    std::string gpus;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(d, &free, &total);
+        gpus += (gpus.empty() ? "" : ", ") + std::string("{\"name\": \"") + ggml_backend_dev_name(d) + "\", \"mib\": " + std::to_string(total >> 20) + "}";
+    }
+
+    printf("{\"gpus\": [%s], \"physical_cores\": %d, \"threads\": %d, \"saturation\": %d, \"fast_cpus\": \"%s\", \"gbps\": [", gpus.c_str(), phys, threads, sat, fast_cpus().c_str());
     for (int t = 1; t <= phys; t++) {
         printf("%s%.1f", t > 1 ? ", " : "", gbps[t]);
     }
     printf("]");
     if (!file.empty()) {
-        const int qds[] = { 1, 2, 4, 8, 16 };
-        double rd[5], rbest = 0;
-        for (int j = 0; j < 5; j++) {
-            rd[j] = read_gbps(file, qds[j], 0.4);
+        const int qds[] = { 1, 2, 4, 8, 16, 32 };
+        const size_t piece = expert_piece(file);
+        double rd[6], rbest = 0;
+        for (int j = 0; j < 6; j++) {
+            rd[j] = read_gbps(file, qds[j], 0.4, piece);
             rbest = std::max(rbest, rd[j]);
         }
         int io = 8;   // the engine's default, kept when the file cannot be read directly
-        for (int j = 0; j < 5 && rbest > 0; j++) {
-            if (rd[j] >= 0.95*rbest) { io = std::max(4, qds[j]); break; }   // at least 4: needed reads and guesses share them
+        for (int j = 0; j < 6 && rbest > 0; j++) {
+            // at least 4: needed reads and guesses share them; at most 16: the engine was never measured with more readers
+            if (rd[j] >= 0.95*rbest) { io = std::min(16, std::max(4, qds[j])); break; }
         }
-        printf(", \"io_threads\": %d, \"read_gbps\": [%.2f, %.2f, %.2f, %.2f, %.2f]", io, rd[0], rd[1], rd[2], rd[3], rd[4]);
+        printf(", \"io_threads\": %d, \"piece_kib\": %zu, \"read_gbps\": [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f]", io, piece >> 10, rd[0], rd[1], rd[2], rd[3], rd[4], rd[5]);
     }
     printf("}\n");
 

@@ -1,5 +1,5 @@
-set(TARGET llama-tune)
-add_executable(${TARGET} tune.cpp)
+set(TARGET autotuner)
+add_executable(${TARGET} autotuner.cpp)
 target_link_libraries(${TARGET} PRIVATE llama-common ggml ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
