@@ -936,6 +936,9 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        if (k_rot) {
+            mctx->get_idx()->set_input_k_rot(k_rot);
+        }
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
     }
@@ -962,6 +965,7 @@ public:
     }
 
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
+    ggml_tensor * k_rot         = nullptr; // F32 [idx_dim, idx_dim] optional Hadamard rotation for quantized mem_idx
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
     ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
@@ -988,6 +992,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+    inp->k_rot      = mctx_idx->build_input_k_rot(ctx0, (int32_t) hparams.indexer_head_size);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
     inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
@@ -998,6 +1003,9 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->tail_idxs);
 
     // set_input fills them all, so keep them allocated even when no op reads them
+    if (inp->k_rot) {
+        ggml_build_forward_expand(gf, inp->k_rot);
+    }
     ggml_build_forward_expand(gf, inp->pool_cells);
     ggml_build_forward_expand(gf, inp->pool_idxs);
     ggml_build_forward_expand(gf, inp->pool_mask);
@@ -1043,6 +1051,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // cache rows store raw key | pooled key: pooling precedes norm and rotation, so the raw key gets neither
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     cb(k_raw, "indexer_k_raw", il);
+    if (inp_kpool->k_rot) {
+        k_raw = ggml_reshape_2d(ctx0, llama_mul_mat_hadamard(ctx0, k_raw, inp_kpool->k_rot), idx_dim, n_tokens);
+    }
 
     ggml_tensor * pzero  = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, idx_dim, n_tokens), 0.0f);
     ggml_tensor * packed = ggml_reshape_3d(ctx0, ggml_concat(ctx0, k_raw, pzero, 0), 2*idx_dim, 1, n_tokens);
@@ -1062,6 +1073,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         pooled_new = pooled_new ? ggml_add(ctx0, pooled_new, slice) : ggml_cont(ctx0, slice);
     }
     pooled_new = ggml_scale(ctx0, pooled_new, 1.0f/(float) kpool);
+    if (inp_kpool->k_rot) {
+        pooled_new = ggml_reshape_2d(ctx0, llama_mul_mat_hadamard(ctx0, pooled_new, inp_kpool->k_rot), idx_dim, n_new);
+    }
     pooled_new = build_norm(pooled_new, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
     pooled_new = ggml_reshape_3d(ctx0, pooled_new, idx_dim, 1, n_new);
@@ -1069,6 +1083,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
     pooled_new = ggml_reshape_2d(ctx0, pooled_new, idx_dim, n_new);
+    if (inp_kpool->k_rot) {
+        pooled_new = ggml_reshape_2d(ctx0, llama_mul_mat_hadamard(ctx0, pooled_new, inp_kpool->k_rot), idx_dim, n_new);
+    }
     cb(pooled_new, "indexer_pool_k_new", il);
 
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
@@ -1084,6 +1101,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     q = ggml_rope_multi(ctx0, q, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
+    if (inp_kpool->k_rot) {
+        q = ggml_reshape_3d(ctx0, llama_mul_mat_hadamard(ctx0, q, inp_kpool->k_rot), idx_dim, n_idx_h, n_tokens);
+    }
     cb(q, "indexer_q", il);
 
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
