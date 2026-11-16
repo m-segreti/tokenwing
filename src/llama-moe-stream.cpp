@@ -449,7 +449,7 @@ static int64_t os_proc_rss() {
 // that holds the memory controller - cgroup v2 (memory.max, memory.current, memory.peak) or v1 (memory.limit_in_bytes, memory.usage_in_bytes,
 // memory.max_usage_in_bytes; Docker on a v1 host). The use leaves out the file cache the kernel can drop without swap (os_cg_freeable): a
 // model another program read earlier stays in the cgroup's cache, counted in its use, and the kernel frees it before it kills anything.
-// Windows = the job object's process / job memory limit minus its use (to do, stub = no cap); macOS has no such limit (stub = no cap).
+// Windows = the job object's process / job commit limit minus its committed use; macOS has no such limit (stub = no cap).
 struct os_mem_cap {
     bool        has = false;
     int64_t     max = 0, cur = 0, peak = -1;   // the tightest level: its limit, its use, its peak use (-1 = not offered)
@@ -692,14 +692,69 @@ static os_mem_cap os_mem_cap_get() {
     }
     return r;
 }
+#elif defined(_WIN32)
+// Windows: the commit limits of the job the process runs in (run-my-ai sets JOB_OBJECT_LIMIT_JOB_MEMORY), the tighter of the job-wide and
+// the per-process one. Commit is what the limit counts, so the use is committed memory: the job's (JobObjectMemoryUsageInformation), else
+// this process's private bytes. shortcut: only the innermost job is read; a tighter limit on an outer (nesting) job is missed
+static os_mem_cap os_mem_cap_get() {
+    os_mem_cap r;
+    BOOL in_job = FALSE;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+    if (!IsProcessInJob(GetCurrentProcess(), nullptr, &in_job) || !in_job ||
+            !QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &li, sizeof(li), nullptr)) {
+        return r;
+    }
+    PROCESS_MEMORY_COUNTERS_EX pc{};
+    const int64_t own = K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &pc, sizeof(pc)) ? (int64_t) pc.PrivateUsage : -1;
+    const auto take = [&](int64_t mx, int64_t cu, int64_t pk, const char * what) {
+        if (mx > 0 && cu >= 0 && (!r.has || mx - cu < r.max - r.cur)) {
+            r.has = true; r.max = mx; r.cur = cu; r.peak = pk; r.path = "job object"; r.max_file = what;
+        }
+    };
+    const DWORD fl = li.BasicLimitInformation.LimitFlags;
+    if (fl & JOB_OBJECT_LIMIT_JOB_MEMORY) {
+        struct { ULONG64 job_memory, peak_job_memory; } mu{};   // JOBOBJECT_MEMORY_USAGE_INFORMATION (class 28), not in every SDK
+        const bool got = QueryInformationJobObject(nullptr, (JOBOBJECTINFOCLASS) 28, &mu, sizeof(mu), nullptr) != 0;
+        take((int64_t) li.JobMemoryLimit, got ? (int64_t) mu.job_memory : own, (int64_t) li.PeakJobMemoryUsed, "job memory limit");
+    }
+    if (fl & JOB_OBJECT_LIMIT_PROCESS_MEMORY) {
+        take((int64_t) li.ProcessMemoryLimit, own, (int64_t) li.PeakProcessMemoryUsed, "process memory limit");
+    }
+    return r;
+}
 #else
-static os_mem_cap os_mem_cap_get() { return os_mem_cap(); }   // to do: Windows job-object limit; macOS: no such limit
+static os_mem_cap os_mem_cap_get() { return os_mem_cap(); }   // macOS: no such limit
 #endif
+// The GPU memory a cap also charges: Windows counts a process's GPU allocations in its commit, so a job's commit limit covers them (Ling:
+// 31.3 GiB committed for 18.8 GiB of RAM + 10.7 GiB of VRAM). The engine fills the GPUs' free memory, so before it allocates there the free
+// VRAM of every discrete GPU is what will come off the cap's room. Linux / macOS: 0 (a cgroup does not count VRAM)
+static int64_t os_cap_gpu_charge() {
+#ifdef _WIN32
+    int64_t s = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            size_t f = 0, t = 0;
+            ggml_backend_dev_memory(d, &f, &t);
+            s += (int64_t) f;
+        }
+    }
+    return s;
+#else
+    return 0;
+#endif
+}
 // the page tables the cgroup charges for resident memory: one 8-byte entry per page (0.195 % at 4 KiB pages)
 static double os_page_table_fraction() { return 8.0/(double) os_page_size(); }
 // one margin under the cap for the kernel memory the cgroup charges besides page tables (slab, kernel stacks, sockets: tens of MiB) and for
 // the rest-of-process estimate (0.25 GiB)
+// Windows: 1 GiB - a job's commit limit also counts what the plan does not see (the CUDA driver's host memory, the VRAM filled after the
+// plan beyond the free VRAM it measured)
+#ifdef _WIN32
+static const int64_t MOE_STREAM_CAP_MARGIN = (int64_t) 1 << 30;
+#else
 static const int64_t MOE_STREAM_CAP_MARGIN = (int64_t) 256 << 20;
+#endif
 
 // The OS layer: DISCARDABLE expert slots - the OS takes their pages itself, when and as much as an app needs RAM; a later use
 // locks them back (or finds them taken: the expert is read again). Linux: Chromium's MADV_FREE discardable memory (base/memory/
@@ -2716,16 +2771,18 @@ llama_moe_stream::llama_moe_stream(
     // The process's own memory cap (cgroup v2 or v1: the tightest level up the tree); MOE_STREAM_TEST_NO_CAP=1 (test only) ignores it
     const os_mem_cap own_cap = (getenv("MOE_STREAM_TEST_NO_CAP") && atoi(getenv("MOE_STREAM_TEST_NO_CAP")) != 0) ? os_mem_cap() : os_mem_cap_get();
     const double pt_frac = os_page_table_fraction();
-    // what the cap allows for pools + other_bytes together: (room - margin)/(1 + page tables); -1 = no cap
-    const int64_t zero_cap_room = own_cap.has ? std::max<int64_t>(0, (int64_t) ((double) (own_cap.room() - MOE_STREAM_CAP_MARGIN)/(1.0 + pt_frac))) : -1;
+    // what the cap allows for pools + other_bytes together: (room - margin - the VRAM it also charges)/(1 + page tables); -1 = no cap
+    const int64_t cap_gpu = own_cap.has ? os_cap_gpu_charge() : 0;
+    const int64_t zero_cap_room = own_cap.has ? std::max<int64_t>(0, (int64_t) ((double) (own_cap.room() - MOE_STREAM_CAP_MARGIN - cap_gpu)/(1.0 + pt_frac))) : -1;
     if (n_streamed > 0 && mem_available > 0) {
         fprintf(stderr, "%s: RAM limit: MemAvailable %lld MiB - keep-free %lld MiB = %lld MiB; %s; decided by: %s\n", __func__,
                 (long long) (mem_available >> 20), (long long) (ram_free >> 20), (long long) (((int64_t) mem_available - ram_free) >> 20),
-                own_cap.has ? format("process cap '%s' %s %lld MiB - in use %lld MiB%s = room %lld MiB, less the %lld MiB margin and %.3f %% page tables = %lld MiB",
+                own_cap.has ? format("process cap '%s' %s %lld MiB - in use %lld MiB%s = room %lld MiB, less the %lld MiB margin%s and %.3f %% page tables = %lld MiB",
                         own_cap.path.c_str(), own_cap.max_file.c_str(), (long long) (own_cap.max >> 20), (long long) (own_cap.cur >> 20),
                         own_cap.cache >= OS_CG_CACHE_SHOWN ? format(" (not counted: %lld MiB of file cache the kernel can free)", (long long) (own_cap.cache >> 20)).c_str() : "",
-                        (long long) (own_cap.room() >> 20),
-                        (long long) (MOE_STREAM_CAP_MARGIN >> 20), 100.0*pt_frac, (long long) (zero_cap_room >> 20)).c_str()
+                        (long long) (own_cap.room() >> 20), (long long) (MOE_STREAM_CAP_MARGIN >> 20),
+                        cap_gpu > 0 ? format(", the %lld MiB of free VRAM the cap also charges", (long long) (cap_gpu >> 20)).c_str() : "",
+                        100.0*pt_frac, (long long) (zero_cap_room >> 20)).c_str()
                             : "no process memory cap",
                 own_cap.has && zero_cap_room < (int64_t) mem_available - ram_free ? "the process cap" : "MemAvailable");
     }
