@@ -117,6 +117,7 @@ static double read_gbps(const std::string & path, int qd, double seconds, size_t
 // 25.8 tok/s against 35.1 on all cores. (The Linux branch reads Intel's cpu_core / cpu_atom files, so it never names AMD cores)
 static std::string fast_cpus() {
 #ifdef _WIN32
+#if defined(_M_X64) || defined(_M_IX86)
     int id[4] = {};
     __cpuid(id, 0);
     char vendor[13] = {};
@@ -124,6 +125,9 @@ static std::string fast_cpus() {
     if (strcmp(vendor, "GenuineIntel") != 0) {
         return "";
     }
+#else
+    return "";   // ARM: no x86 vendor to check; its big / little cores are not named (the threads stay unpinned)
+#endif
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
     std::vector<char> buf(len);
