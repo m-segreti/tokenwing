@@ -1,6 +1,0 @@
-<|im_start|>system
-Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
-<|im_start|>user
-Hey! I've had a genuinely weird afternoon. I went to the corner shop for milk and came home with a tub of ice cream, a bag of flour, and no milk. How does that even happen? Tell me your theory.<|im_end|>
-<|im_start|>assistant
-<think>

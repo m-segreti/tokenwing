@@ -10,6 +10,8 @@
   <a href="https://discord.gg/BfpvUFp58">Discord</a>
 </p>
 
+<p align="center"><b>Downloads for Windows and Linux open on Nov 17 at 9:30 PM IST (4:00 PM UTC).</b></p>
+
 TokenWing is the engine inside [Run My AI](https://github.com/runmyai/run-my-ai). It streams the routed experts of MoE models from NVMe, so models far larger than your memory run at a usable speed. It is built on [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 ## How it works

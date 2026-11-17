@@ -1,6 +1,0 @@
-<|im_start|>system
-Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>
-<|im_start|>user
-Write a short story, about 600 words, about a lighthouse keeper on a remote island who starts receiving letters addressed to nobody at that address. Keep the tone quiet and slightly unsettling, and end without explaining the mystery.<|im_end|>
-<|im_start|>assistant
-<think>
