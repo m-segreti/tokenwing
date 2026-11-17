@@ -1,8 +1,16 @@
-// autotuner: deterministic, zero-model-load hardware & storage profiler for TokenWing.
+// autotuner: measures the parts of this PC that decide TokenWing's settings, without loading a model, and prints one
+// JSON line. The streamed experts' CPU matmul reads quantized weights from RAM, so its speed is bound by the memory system:
+// a quantized matrix-vector product over more weights than any CPU cache holds runs at 1, 2, ... physical-core threads on a
+// quiet CPU, and the reply thread count (-t) is the smallest within 5 % of the best, less the cores the engine's other work
+// needs (the SSD readers' measured CPU time, and one for the thread that drives the GPU). Prompts are compute-bound, so their
+// count (-tb) is every physical core but the GPU thread's. On CPUs with two kinds of cores (Intel P / E cores, ARM big /
+// little, several memory nodes) it measures again on one thread per fast core and names them (--cpu-mask, and --cpu-range
+// when they are numbered in one run from 0) only when that is clearly faster.
 //
-// Measures the host's CPU memory-system scaling, hybrid P/E & NUMA core layout, cache-bypassed SSD queue-depth curve
-// (with OS reader CPU-core accounting), and backend GPUs (discrete + unified-memory APUs), then prints one JSON line
-// on stdout with recommended flags (-t, -tb, --cpu-mask / --cpu-range, --moe-stream-io-threads, ubatch, GPU list).
+// With --file it reads the model file directly (no file cache) at 1, 2, 4 ... 32 reads in flight, each the size of one
+// expert's projection in that model, in three alternating passes, and recommends the SSD reader count
+// (--moe-stream-io-threads): the fewest within 5 % of the best. It also lists the graphics cards the engine's backends see
+// (discrete ones, and the integrated ones apart) with their memory and the speed they read quantized weights at.
 //
 //   autotuner [--seconds S] [--file MODEL.gguf] [--self-test]
 
@@ -105,53 +113,6 @@ struct ThreadAffinityGuard {
 #endif
 };
 
-// Reads Linux cgroup v2 (`memory.max` - `memory.current`) RAM headroom in MiB, or 0 if unbounded / absent.
-static uint64_t parse_cgroup_avail_ram_mib(const std::string & cgroup_dir) {
-    std::ifstream fmax(cgroup_dir + "/memory.max");
-    std::string smax;
-    if (!(fmax >> smax) || smax.empty() || smax == "max") return 0;
-    const uint64_t max_b = std::strtoull(smax.c_str(), nullptr, 10);
-    if (max_b == 0 || max_b >= (1ull << 60)) return 0;
-    uint64_t cur_b = 0;
-    std::ifstream fcur(cgroup_dir + "/memory.current");
-    fcur >> cur_b;
-    return max_b > cur_b ? ((max_b - cur_b) >> 20) : 1;
-}
-
-static uint64_t host_avail_ram_mib() {
-#ifdef _WIN32
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof(ms);
-    uint64_t avail = GlobalMemoryStatusEx(&ms) ? (uint64_t) (ms.ullAvailPhys >> 20) : 0;
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
-    if (QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli), nullptr)) {
-        const size_t cap = (jeli.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_JOB_MEMORY)
-                               ? jeli.JobMemoryLimit
-                               : ((jeli.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) ? jeli.ProcessMemoryLimit : 0);
-        if (cap > 0) avail = avail > 0 ? std::min<uint64_t>(avail, (uint64_t) (cap >> 20)) : (uint64_t) (cap >> 20);
-    }
-    return avail;
-#elif defined(__APPLE__)
-    uint64_t mem = 0;
-    size_t len = sizeof(mem);
-    if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) return (mem >> 20) * 3 / 4;
-    return 0;
-#else
-    uint64_t avail = 0;
-    std::ifstream f("/proc/meminfo");
-    std::string k;
-    uint64_t kb = 0;
-    while (f >> k >> kb) {
-        if (k == "MemAvailable:") { avail = kb >> 10; break; }
-        std::string rest;
-        std::getline(f, rest);
-    }
-    const uint64_t cg_mib = parse_cgroup_avail_ram_mib("/sys/fs/cgroup");
-    if (cg_mib > 0) avail = (avail > 0) ? std::min(avail, cg_mib) : cg_mib;
-    return avail;
-#endif
-}
-
 static double median_of(std::vector<double> v) {
     if (v.empty()) return 0.0;
     std::sort(v.begin(), v.end());
@@ -174,11 +135,8 @@ static std::string json_escape(const std::string & s) {
 // because exact tensor byte sizes are derived from sorted GGUF data offsets rather than ggml_blck_size().
 struct GgufModelInfo {
     size_t   piece_bytes   = 2u << 20;   // median 4 KiB-aligned single expert projection (gate, up, or down)
-    size_t   expert_bytes  = 0;          // median bytes of one full expert (3 projections)
     uint32_t n_experts     = 0;
     uint32_t n_used        = 0;
-    uint32_t n_moe_layers  = 0;
-    bool     has_ple       = false;      // per-layer token embedding present (reserves 1 GiB VEH ring on Windows)
     bool     parsed        = false;
 };
 
@@ -204,14 +162,6 @@ static FILE * open_cfile_ro(const std::string & path, uint64_t * out_size) {
 static GgufModelInfo inspect_gguf(const std::string & path) {
     GgufModelInfo info;
     if (path.empty()) return info;
-
-    // Companion shard check (e.g. Qwen3.8 ...-00001-of-00002.gguf keeps its 27 GiB PLE table in shard 2).
-    const auto shard_pos = path.find("-00001-of-00002.gguf");
-    if (shard_pos != std::string::npos) {
-        std::string shard2 = path.substr(0, shard_pos) + "-00002-of-00002.gguf";
-        uint64_t s2 = 0;
-        if (FILE * f2 = open_cfile_ro(shard2, &s2)) { fclose(f2); if (s2 > (1ull << 30)) info.has_ple = true; }
-    }
 
     uint64_t file_size = 0;
     FILE * f = open_cfile_ro(path, &file_size);
@@ -299,9 +249,6 @@ static GgufModelInfo inspect_gguf(const std::string & path) {
         for (uint32_t d = 0; d < n_dims; d++) { if (!rd(&ne[d], 8)) { fclose(f); return info; } }
         if (!rd(&ttype, 4) || !rd(&rt.offset, 8)) { fclose(f); return info; }
         rt.ne2 = ne[2];
-        if (rt.name.find("per_layer_token_embd") != std::string::npos || rt.name.find("ple_") != std::string::npos) {
-            info.has_ple = true;
-        }
         rt.is_exp = (rt.name.find("_exps.weight") != std::string::npos && rt.ne2 > 1);
         offsets.push_back(rt.offset);
         tensors.push_back(std::move(rt));
@@ -324,7 +271,6 @@ static GgufModelInfo inspect_gguf(const std::string & path) {
     offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
 
     std::vector<double> pieces;
-    uint32_t gate_cnt = 0;
     for (const auto & rt : tensors) {
         if (!rt.is_exp) continue;
         auto it = std::upper_bound(offsets.begin(), offsets.end(), rt.offset);
@@ -333,15 +279,12 @@ static GgufModelInfo inspect_gguf(const std::string & path) {
         const size_t p = (size_t) (((tbytes / rt.ne2) + 4095ull) / 4096ull * 4096ull);
         if (p >= 4096 && p <= (64u << 20)) pieces.push_back((double) p);
         if (info.n_experts == 0) info.n_experts = (uint32_t) rt.ne2;
-        if (rt.name.find("ffn_gate_exps.weight") != std::string::npos) gate_cnt++;
     }
 
     info.parsed = true;
-    info.n_moe_layers = gate_cnt;
     if (!pieces.empty()) {
         const size_t med = ((size_t) std::llround(median_of(pieces)) + 4095u) / 4096u * 4096u;
         info.piece_bytes  = std::max<size_t>(4096u, med);
-        info.expert_bytes = info.piece_bytes * 3;
     }
     return info;
 }
@@ -840,112 +783,6 @@ static StorageProbe probe_storage(const std::string & path, size_t piece, int ph
     return res;
 }
 
-// Gaussian Top-k persistence model (4-node Gauss-Legendre on c in (0,1) x 65 normal quantiles) for analytical
-// batch-union `D(r)` and RAM-slot miss pricing when deciding `-ub` (prefill ubatch arena vs decode expert slots).
-static double norm_cdf(double x) {
-    return 0.5 * (1.0 + std::erf(x * 0.7071067811865475244));
-}
-
-static double norm_inv(double p) {
-    p = std::min(1.0 - 1e-12, std::max(1e-12, p));
-    double lo = -8.0, hi = 8.0;
-    for (int i = 0; i < 48; i++) {
-        const double mid = 0.5 * (lo + hi);
-        if (norm_cdf(mid) < p) lo = mid; else hi = mid;
-    }
-    return 0.5 * (lo + hi);
-}
-
-struct MoEBatchModel {
-    static constexpr int NC = 4, NG = 65;
-    double w[NC] = { 0.1739274225687269, 0.3260725774312731, 0.3260725774312731, 0.1739274225687269 };
-    double p_choose[NC][NG] = {};
-    uint32_t E = 0, k = 0;
-
-    void init(uint32_t experts, uint32_t used) {
-        E = experts; k = std::min(experts, std::max(1u, used));
-        static constexpr double c_nodes[NC] = { 0.0694318442029737, 0.3300094782075719, 0.6699905217924281, 0.9305681557970263 };
-        const double tau = norm_inv(1.0 - (double) k / (double) E);
-        for (int ic = 0; ic < NC; ic++) {
-            const double sc = std::sqrt(c_nodes[ic]), s1 = std::sqrt(1.0 - c_nodes[ic]);
-            for (int ig = 0; ig < NG; ig++) {
-                const double g = norm_inv(((double) ig + 0.5) / (double) NG);
-                p_choose[ic][ig] = std::min(1.0 - 1e-6, std::max(1e-9, norm_cdf((sc * g - tau) / s1)));
-            }
-        }
-    }
-
-    // Expected unique experts touched across a ubatch of `r` tokens in one layer.
-    double batch_union(int r) const {
-        if (E == 0 || r <= 0) return 0.0;
-        if (r == 1) return (double) k;
-        double acc = 0.0;
-        for (int ic = 0; ic < NC; ic++) {
-            double u = 0.0;
-            for (int ig = 0; ig < NG; ig++) u += 1.0 - std::pow(1.0 - p_choose[ic][ig], (double) r);
-            acc += w[ic] * (u / (double) NG);
-        }
-        return (double) E * acc;
-    }
-
-    // Expected fraction of routed decode activations missing a cache of `slots` experts out of `E`.
-    double miss_rate(int slots) const {
-        if (E == 0 || slots <= 0) return 1.0;
-        if ((uint32_t) slots >= E) return 0.0;
-        const int cut_bins = std::max(1, std::min(NG - 1, (int) std::llround((1.0 - (double) slots / (double) E) * NG)));
-        const double q = (double) k / (double) E;
-        double acc = 0.0;
-        for (int ic = 0; ic < NC; ic++) {
-            double m = 0.0;
-            for (int ig = 0; ig < cut_bins; ig++) m += p_choose[ic][ig];
-            acc += w[ic] * ((m / (double) NG) / q);
-        }
-        return std::min(1.0, std::max(0.0, acc));
-    }
-};
-
-// Jointly prices prefill chunk size `-ub` in {512, 1024, 2048} against decode RAM expert slots on constrained hosts.
-static int recommend_ubatch(const GgufModelInfo & gm, const StorageProbe & sp, uint64_t avail_ram_mib, bool has_gpu) {
-    if (!gm.parsed || gm.n_experts <= 1 || gm.n_moe_layers == 0 || gm.expert_bytes == 0 || avail_ram_mib == 0) {
-        return 2048;
-    }
-#ifdef _WIN32
-    const uint64_t os_margin_mib = 1024 + (gm.has_ple ? 1024 : 0);   // 1 GiB Win32 headroom + 1 GiB PLE VEH page ring
-#else
-    const uint64_t os_margin_mib = 512;
-#endif
-    if (avail_ram_mib <= os_margin_mib + 1024) return 512;
-    const double net_bytes = (double) (avail_ram_mib - os_margin_mib) * (double) (1ull << 20);
-    const double layer_exp_bytes = (double) gm.n_moe_layers * (double) gm.expert_bytes;
-
-    // When available RAM comfortably holds >= 60% of all experts, `-ub 2048` wins outright without starving decode slots.
-    if (net_bytes >= 0.60 * layer_exp_bytes * (double) gm.n_experts) return 2048;
-
-    MoEBatchModel mm;
-    mm.init(gm.n_experts, gm.n_used ? gm.n_used : 8);
-    const double lam_s = sp.readable ? (sp.latency_us * 1e-6) : 0.00012;
-    const double bw_Bps = (sp.readable ? std::max(0.2, sp.rd_gbps[5]) : 3.0) * 1e9;
-    const double t_exp_miss = 3.0 * lam_s + (double) gm.expert_bytes / bw_Bps;   // 3 ranges (gate, up, down)
-
-    static constexpr int cands[3] = { 512, 1024, 2048 };
-    int best_ub = 2048;
-    double best_cost = 1e30;
-    for (int ub : cands) {
-        // Approximate host scratch arena growth with ubatch (~0.35 MiB/token on CPU waves, ~0.12 MiB/token with GPU waves).
-        const double scratch_bytes = (double) ub * (has_gpu ? 128.0 * 1024.0 : 350.0 * 1024.0);
-        const int slots = (int) std::max(0.0, std::floor((net_bytes - scratch_bytes) / std::max(1.0, layer_exp_bytes)));
-        const double m_dec = mm.miss_rate(slots);
-        // Session cost: 256 decode steps + 4096-token prefill across streamed layers.
-        const double t_dec_256 = 256.0 * (double) gm.n_moe_layers * ((double) (gm.n_used ? gm.n_used : 8) * m_dec) * t_exp_miss;
-        const double chunks_4k = 4096.0 / (double) ub;
-        const double pre_misses = std::max(0.0, mm.batch_union(ub) - (double) std::min<uint32_t>(gm.n_experts, (uint32_t) slots));
-        const double t_pre_4k = chunks_4k * (double) gm.n_moe_layers * (pre_misses * (double) gm.expert_bytes / bw_Bps);
-        const double cost = t_dec_256 + t_pre_4k;
-        if (cost < best_cost) { best_cost = cost; best_ub = ub; }
-    }
-    return best_ub;
-}
-
 // Populates Q4_K blocks (144 bytes each: fp16 d, fp16 dmin, 12B scales, 128B nibbles) with deterministic non-zero bits
 // so OS zero-page / Windows Memory Compression cannot compress the buffer, while keeping all FP16 scales normal & finite.
 static void fill_q4k_noncompressible(void * dst, size_t nbytes, uint64_t seed) {
@@ -963,6 +800,43 @@ static void fill_q4k_noncompressible(void * dst, size_t nbytes, uint64_t seed) {
             memcpy(blk + off, &s, std::min<size_t>(8, 144 - off));
         }
     }
+}
+
+// GB/s one GPU reads quantized weights at: four 4096 x 28672 Q4_K matrices (~66 MB each, more than any GPU cache) times a
+// vector on that GPU, the median of the runs in `seconds`. 0 when the GPU cannot take them. The engine fills the fastest
+// memory first, so the caller ranks the cards by this
+static double gpu_gbps(ggml_backend_dev_t d, double seconds) {
+    const int64_t K = 4096, N = 28672, M = 4;
+    ggml_init_params ip = { /*.mem_size =*/ 16*ggml_tensor_overhead() + ggml_graph_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    size_t bytes = 0;
+    for (int i = 0; i < M; i++) {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, K, N);
+        bytes += ggml_nbytes(w);
+        ggml_build_forward_expand(gf, ggml_mul_mat(ctx, w, x));
+    }
+    double gbps = 0;
+    ggml_backend_t be = ggml_backend_dev_init(d, nullptr);
+    ggml_backend_buffer_t buf = be ? ggml_backend_alloc_ctx_tensors(ctx, be) : nullptr;
+    if (buf) {
+        ggml_backend_buffer_clear(buf, 0);
+        ggml_backend_graph_compute(be, gf);   // warm-up
+        std::vector<double> runs;
+        const auto t0 = std::chrono::steady_clock::now();
+        do {
+            const auto a = std::chrono::steady_clock::now();
+            ggml_backend_graph_compute(be, gf);
+            ggml_backend_synchronize(be);
+            runs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count());
+        } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds || runs.size() < 3);
+        gbps = bytes/median_of(std::move(runs))/1e9;
+        ggml_backend_buffer_free(buf);
+    }
+    if (be) { ggml_backend_free(be); }
+    ggml_free(ctx);
+    return gbps;
 }
 
 } // namespace
@@ -987,16 +861,6 @@ static int run_self_test() {
                 return 1;
             }
         }
-    }
-
-    // 2. Verify MoEBatchModel(512, 10) analytical union & miss behavior (Qwen3.8 geometry).
-    MoEBatchModel mm;
-    mm.init(512, 10);
-    const double u1 = mm.batch_union(1), u8 = mm.batch_union(8), u512 = mm.batch_union(512);
-    const double m128 = mm.miss_rate(128), m256 = mm.miss_rate(256);
-    if (std::fabs(u1 - 10.0) > 1e-6 || !(u8 > 45.0 && u8 < 58.0) || !(u512 > 260.0 && u512 < 315.0) || !(m128 > m256 && m256 > 0.0)) {
-        fprintf(stderr, "autotuner self-test FAIL: MoEBatchModel u8=%.2f u512=%.2f m128=%.4f m256=%.4f\n", u8, u512, m128, m256);
-        return 1;
     }
 
     // 3. Verify zero-plugin GGUF v3 offset reader on a synthetic EXT0 (type 112) expert tensor header.
@@ -1050,13 +914,10 @@ static int run_self_test() {
         write_txt(fx / "sys/cpu_atom/cpus", "2-9,16-23");
         for (int c = 0; c < 24; c++) write_txt(fx / ("sys/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list"), std::to_string(c));
         write_txt(fx / "cg/cpu.max", "max 100000");
-        write_txt(fx / "cg/memory.max", "17179869184");      // 16 GiB limit
-        write_txt(fx / "cg/memory.current", "1073741824");   // 1 GiB used -> 15360 MiB avail
 
         CpuTopology t_arl;
         parse_sysfs_cpu_topology((fx / "sys").string(), (fx / "cg").string(), {}, t_arl);
-        if (t_arl.physical_cores != 24 || !t_arl.fast_range.empty() || t_arl.fast_mask != "0xfc03" ||
-            parse_cgroup_avail_ram_mib((fx / "cg").string()) != 15360) {
+        if (t_arl.physical_cores != 24 || !t_arl.fast_range.empty() || t_arl.fast_mask != "0xfc03") {
             fprintf(stderr, "autotuner self-test FAIL: ArrowLake/cgroup phys=%d range='%s' mask='%s'\n",
                     t_arl.physical_cores, t_arl.fast_range.c_str(), t_arl.fast_mask.c_str());
             fs::remove_all(fx);
@@ -1106,8 +967,7 @@ static int run_self_test() {
         fs::remove_all(fx);
     }
 
-    printf("{\"self_test\": \"PASS\", \"u8\": %.2f, \"u512\": %.1f, \"ext0_piece_kib\": %zu, \"fixtures\": 4}\n",
-           u8, u512, gi.piece_bytes >> 10);
+    printf("{\"self_test\": \"PASS\", \"ext0_piece_kib\": %zu, \"fixtures\": 4}\n", gi.piece_bytes >> 10);
     return 0;
 }
 
@@ -1136,29 +996,21 @@ int main(int argc, char ** argv) {
     // Load all compiled/dynamic backends once up front (supports both static builds and GGML_BACKEND_DL=ON).
     ggml_backend_load_all();
 
-    struct GpuEntry { std::string name; size_t mib = 0; bool integrated = false; };
-    std::vector<GpuEntry> discrete_gpus, uma_gpus;
+    // the cards the engine's backends see: discrete GPUs, and apart from them the integrated ones (they share the system's RAM;
+    // the memory they report is the part of it they can use - a DGX Spark's GB10 and a Strix Halo run the models far faster on it)
+    std::vector<std::pair<ggml_backend_dev_t, size_t>> gpu_devs, igpu_devs;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
         const auto dtype = ggml_backend_dev_type(d);
         if (dtype != GGML_BACKEND_DEVICE_TYPE_GPU && dtype != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
         size_t free_b = 0, total_b = 0;
         ggml_backend_dev_memory(d, &free_b, &total_b);
-        const size_t mib = total_b >> 20;
-#ifdef __APPLE__
-        // Apple Silicon Metal exposes GGML_BACKEND_DEVICE_TYPE_GPU even though memory is unified with system RAM.
-        if (mib >= 4096) uma_gpus.push_back({ ggml_backend_dev_name(d), mib, true });
-#else
-        if (dtype == GGML_BACKEND_DEVICE_TYPE_GPU) {
-            discrete_gpus.push_back({ ggml_backend_dev_name(d), mib, false });
-        } else if (mib >= 4096) {
-            // Unified-memory accelerators >= 4 GiB (e.g. DGX Spark GB10, AMD Strix Halo 96 GiB, Ryzen AI APUs).
-            uma_gpus.push_back({ ggml_backend_dev_name(d), mib, true });
-        }
-#endif
+        (dtype == GGML_BACKEND_DEVICE_TYPE_GPU ? gpu_devs : igpu_devs).push_back({ d, total_b >> 20 });
     }
-    const bool has_discrete_gpu = !discrete_gpus.empty();
-    const auto & reported_gpus  = !discrete_gpus.empty() ? discrete_gpus : uma_gpus;
+    // a thread drives the GPU whenever the engine runs on one: a discrete card, or an integrated GPU large enough to run the
+    // model (24 GiB, the caller's rule)
+    bool runs_on_gpu = !gpu_devs.empty();
+    for (const auto & g : igpu_devs) runs_on_gpu = runs_on_gpu || g.second >= 24576;
 
     // 1. Metadata + synchronized multi-pass Direct-I/O storage curve (measures both knee io_threads and OS io_cpu_cores).
     const GgufModelInfo gm = inspect_gguf(file);
@@ -1270,7 +1122,7 @@ int main(int argc, char ** argv) {
 
     // Analytical core reservation: OS-measured Direct-I/O reader CPU cores + GPU submission/spin thread.
     const int io_reserve  = sp.readable ? std::max(1, (int) std::ceil(sp.io_cpu_cores)) : 1;
-    const int gpu_reserve = (has_discrete_gpu || !uma_gpus.empty()) ? 1 : 0;
+    const int gpu_reserve = runs_on_gpu ? 1 : 0;
     int threads = std::max(1, std::min(sat, phys - io_reserve - gpu_reserve));
 
     // Hybrid P-core test (1 primary hardware thread per physical P-core -> prevents SMT sibling collisions and handles
@@ -1298,25 +1150,24 @@ int main(int argc, char ** argv) {
 
     // Prompt prefill (`-tb`) is compute-bound (tiled GEMM / iqk), so it scales across all physical cores minus GPU driver.
     const int threads_batch = std::max(threads, std::max(1, phys - gpu_reserve));
-    const uint64_t avail_ram_mib = host_avail_ram_mib();
-    const int ubatch = recommend_ubatch(gm, sp, avail_ram_mib, !reported_gpus.empty());
+    auto list_json = [&](const std::vector<std::pair<ggml_backend_dev_t, size_t>> & devs) {
+        std::string out;
+        for (const auto & g : devs) {
+            char gb[32];
+            snprintf(gb, sizeof(gb), "%.0f", gpu_gbps(g.first, seconds));
+            out += (out.empty() ? "" : ", ") + std::string("{\"name\": \"") + json_escape(ggml_backend_dev_name(g.first)) +
+                   "\", \"mib\": " + std::to_string(g.second) + ", \"gbps\": " + gb + "}";
+        }
+        return out;
+    };
+    const std::string gpus = list_json(gpu_devs), igpus = list_json(igpu_devs);
 
-    std::string gpus_json;
-    for (const auto & g : reported_gpus) {
-        gpus_json += (gpus_json.empty() ? "" : ", ") +
-                     std::string("{\"name\": \"") + json_escape(g.name) +
-                     "\", \"mib\": " + std::to_string(g.mib) +
-                     ", \"integrated\": " + (g.integrated ? "true" : "false") + "}";
-    }
-
-    printf("{\"version\": 2, \"gpus\": [%s], \"physical_cores\": %d, \"logical_cores\": %d, "
+    printf("{\"gpus\": [%s], \"igpus\": [%s], \"physical_cores\": %d, \"logical_cores\": %d, "
            "\"threads\": %d, \"threads_batch\": %d, \"saturation\": %d, "
-           "\"fast_cpus\": \"%s\", \"fast_mask\": \"%s\", \"cache_escaped\": %s, "
-           "\"avail_ram_mib\": %llu, \"ubatch\": %d, \"has_ple\": %s, \"gbps\": [",
-           gpus_json.c_str(), phys, topo.logical_cores,
+           "\"fast_cpus\": \"%s\", \"fast_mask\": \"%s\", \"cache_escaped\": %s, \"gbps\": [",
+           gpus.c_str(), igpus.c_str(), phys, topo.logical_cores,
            threads, threads_batch, sat,
-           fast_out.c_str(), fast_mask_out.c_str(), cache_escaped ? "true" : "false",
-           (unsigned long long) avail_ram_mib, ubatch, gm.has_ple ? "true" : "false");
+           fast_out.c_str(), fast_mask_out.c_str(), cache_escaped ? "true" : "false");
     for (int t = 1; t <= phys; t++) {
         printf("%s%.1f", t > 1 ? ", " : "", gbps[t]);
     }
