@@ -339,20 +339,23 @@ int main(int argc, char ** argv) {
 
     load.reset();
 
-    // the cards the engine's backends see: discrete GPUs only (an integrated GPU shares the system's RAM)
+    // the cards the engine's backends see: discrete GPUs, and apart from them the integrated ones (they share the system's RAM;
+    // the memory they report is the part of it they can use - a DGX Spark's GB10 and a Strix Halo run the models far faster on it)
     ggml_backend_load_all();
-    std::string gpus;
+    std::string gpus, igpus;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t d = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(d) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+        const auto type = ggml_backend_dev_type(d);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
             continue;
         }
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(d, &free, &total);
-        gpus += (gpus.empty() ? "" : ", ") + std::string("{\"name\": \"") + ggml_backend_dev_name(d) + "\", \"mib\": " + std::to_string(total >> 20) + "}";
+        std::string & list = type == GGML_BACKEND_DEVICE_TYPE_GPU ? gpus : igpus;
+        list += (list.empty() ? "" : ", ") + std::string("{\"name\": \"") + ggml_backend_dev_name(d) + "\", \"mib\": " + std::to_string(total >> 20) + "}";
     }
 
-    printf("{\"gpus\": [%s], \"physical_cores\": %d, \"threads\": %d, \"saturation\": %d, \"fast_cpus\": \"%s\", \"side_load\": %s, \"gbps\": [", gpus.c_str(), phys, threads, sat, fast.c_str(), readable ? "true" : "false");
+    printf("{\"gpus\": [%s], \"igpus\": [%s], \"physical_cores\": %d, \"threads\": %d, \"saturation\": %d, \"fast_cpus\": \"%s\", \"side_load\": %s, \"gbps\": [", gpus.c_str(), igpus.c_str(), phys, threads, sat, fast.c_str(), readable ? "true" : "false");
     for (int t = 1; t <= phys; t++) {
         printf("%s%.1f", t > 1 ? ", " : "", gbps[t]);
     }
