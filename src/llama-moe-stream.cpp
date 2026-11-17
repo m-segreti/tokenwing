@@ -2708,6 +2708,9 @@ llama_moe_stream::llama_moe_stream(
                         per.c_str());
             }
             sel = keep;
+            if (p1.wl_by_device) {
+                wl_dropped = dropped;   // llama_model moves these layers whole to the pool's GPU
+            }
         }
         gpu_layers_pick = sel;
 

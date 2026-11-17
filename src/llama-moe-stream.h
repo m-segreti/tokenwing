@@ -2792,6 +2792,10 @@ struct llama_moe_stream {
     // remap op, no prefetch: the stock build_moe_ffn path over all n_expert experts)
     std::vector<int32_t>   gpu_layers;
     std::vector<int32_t>   gpu_layers_pick;   // the same layers in the order they were picked (a list's own order)
+    // --moe-stream-gpu-layers-device: the named whole layers that did not fit on their GPU. They are streamed, and llama_model moves
+    // each of them completely (attention, its context memory) to the pool's GPU, so no layer has its attention on one card and its
+    // experts on another
+    std::vector<int32_t>   wl_dropped;
     // More than one GPU. pool_dev: the GPU of the VRAM expert pool (--moe-stream-vram-device, else the first GPU of the model; null =
     // none), set at load before the per-device check; pool_dev_set: the flag named it (the prompt matmuls of the RAM pools then run on that
     // GPU only). whole_dev[il]: the device that holds whole layer il's experts (--moe-stream-gpu-layers-device, else the layer's own device).

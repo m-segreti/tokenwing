@@ -2515,6 +2515,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     ms.whole_dev[il] = whole_dev_flag[il] != nullptr ? whole_dev_flag[il] : pimpl->dev_layer[il].dev;
                 }
             }
+            // A named whole layer that did not fit on its GPU runs completely on the pool's GPU (its experts are streamed there):
+            // left on its card, its attention would sit on one GPU and its experts on another, a hand-over there and back in every
+            // layer, and that card's prompt buffers have no room (it is full of whole layers)
+            if (!ms.wl_dropped.empty() && ms_pool_dev != nullptr) {
+                int on_pool = -1;   // a layer already on the pool's GPU: its device and buffer types are copied
+                for (size_t i = 0; i < pimpl->dev_layer.size(); i++) {
+                    if (pimpl->dev_layer[i].dev == ms_pool_dev) { on_pool = (int) i; break; }
+                }
+                std::string moved;
+                for (const int32_t il : ms.wl_dropped) {
+                    if (on_pool >= 0 && il >= 0 && il < n_layer_all && pimpl->dev_layer[il].dev != ms_pool_dev) {
+                        pimpl->dev_layer[il] = pimpl->dev_layer[on_pool];
+                        moved += format("%s%d", moved.empty() ? "" : ",", il);
+                    }
+                }
+                if (!moved.empty()) {
+                    fprintf(stderr, "%s: layer(s) %s did not fit whole on their GPU: they run completely on %s, the pool's GPU (attention and "
+                            "context memory too)\n", __func__, moved.c_str(), ggml_backend_dev_name(ms_pool_dev));
+                }
+            }
             // MOE_STREAM_TEST_WHOLE_OTHER_CARD=L1,L2,.. (test only): these whole layers count as being on another GPU for the choice of the
             // layer a reload gives up (their weights stay where they are)
             if (const char * e = getenv("MOE_STREAM_TEST_WHOLE_OTHER_CARD")) {
