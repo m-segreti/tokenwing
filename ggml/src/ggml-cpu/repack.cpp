@@ -4865,6 +4865,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         ggml_barrier(params->threadpool);
 
+        const int zero_a = ggml_cpu_moe_slots_get_first_zero(src0->data);
+
         // compute each matrix multiplication in sequence
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             const int64_t cne1 = matrix_row_counts[cur_a];
@@ -4903,10 +4905,16 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
                 const int64_t i1 = id;               // selected expert index
                 const int64_t i2 = i12;              // row
 
+                float * dst_col = (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start;
+                if (zero_a >= 0 && cur_a >= zero_a) {
+                    memset(dst_col, 0, (size_t) (src0_cur_end - src0_cur_start) * sizeof(float));
+                    continue;
+                }
+
                 const auto * src1_col = (const char *) wdata + (i11 * nbw1 + i12 * nbw2);
 
                 gemv<BLOC_TYPE, INTER_SIZE, NB_COLS, PARAM_TYPE>(
-                    ne00, (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, ne01,
+                    ne00, dst_col, ne01,
                     src0_cur + src0_cur_start * nb01, src1_col, 1, src0_cur_end - src0_cur_start);
             }
         }
@@ -5221,11 +5229,15 @@ static bool ggml_backend_cpu_repack_buffer_type_is_host(ggml_backend_buffer_type
 namespace ggml::cpu::repack {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
+        const struct ggml_tensor * src0 = op->src[0];
+        while (src0 && src0->view_src) {
+            src0 = src0->view_src;
+        }
         if (    op->op == GGML_OP_MUL_MAT &&
-                op->src[0]->buffer &&
+                src0 && src0->buffer &&
                 (ggml_n_dims(op->src[0]) == 2) &&
-                op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
-                ggml_repack_get_optimal_repack_type(op->src[0])
+                src0->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
+                ggml_repack_get_optimal_repack_type(src0)
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
@@ -5238,10 +5250,10 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             //}
             // may be possible if Q8_0 packed...
         } else if (op->op == GGML_OP_MUL_MAT_ID
-                && op->src[0]->buffer
+                && src0 && src0->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
-                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
-                && ggml_repack_get_optimal_repack_type(op->src[0])
+                && src0->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+                && ggml_repack_get_optimal_repack_type(src0)
                 ) {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
@@ -5258,8 +5270,12 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {
         if (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) {
-            if (op->src[0]->buffer && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
-                return (ggml::cpu::tensor_traits *) op->src[0]->extra;
+            const struct ggml_tensor * src0 = op->src[0];
+            while (src0 && src0->view_src) {
+                src0 = src0->view_src;
+            }
+            if (src0 && src0->buffer && src0->buffer->buft == ggml_backend_cpu_repack_buffer_type()) {
+                return (ggml::cpu::tensor_traits *) src0->extra;
             }
         }
         return nullptr;

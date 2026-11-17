@@ -4031,7 +4031,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // size, which the start-size view a GPU offload copies does not hold (256+ slots per layer: a 32-row piece is one wave)
                 // and in every call where the tail rule says so (RAM slots >= 8 x the offload minimum batch:
                 // a one-wave ubatch's GPU copy would be a whole start-size view that the reserve does not cover)
-                if (n_waves > 1 || (mstream->win_host_call && mstream->el_has_gpu) || (n_waves == 1 && mstream->onewave_host(n_tokens))) {
+                if (n_waves > 1 || mstream->cpu_repack_on.load() || (mstream->win_host_call && mstream->el_has_gpu) || (n_waves == 1 && mstream->onewave_host(n_tokens))) {
                     // the experts of this wave are loaded while the graph computes, so the device may
                     // not run their matmuls: the pool it would copy once per graph is filled wave by
                     // wave. llama_context keeps ops that read host weights on the host for this graph.

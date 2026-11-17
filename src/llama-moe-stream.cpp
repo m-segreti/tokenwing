@@ -2269,13 +2269,7 @@ llama_moe_stream::llama_moe_stream(
                     sidecar_data_path(json_path_in).c_str(), sidecar_layout.c_str()));
     }
 
-    // The zero skip lives in ggml-cpu's plain mul_mat_id; a repacked pool runs repack.cpp's own kernel, which
-    // would compute the zero slices anyway and make the flag a silent no-op
-    if (p1.cpu_skip_zero && (cpu_repack || sidecar_layout != "plain")) {
-        off("--moe-stream-cpu-skip-zero 1", format("the plain layout (--moe-stream-cpu-repack 0 and a plain sidecar, this one is '%s'): the "
-            "repacked expert matmul has its own kernel, which has no zero skip", sidecar_layout.c_str()).c_str());
-        p1.cpu_skip_zero = false;
-    }
+    // Zero-skip runs in both plain mul_mat_id (ggml-cpu.c) and repacked forward_mul_mat_id (repack.cpp).
 
     std::vector<moe_stream_block> blocks(n_layer_in);
     std::vector<uint8_t>          have(n_layer_in, 0);

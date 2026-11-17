@@ -3154,6 +3154,9 @@ struct llama_moe_stream {
     int64_t              ds_built_skip = 0, ds_built_keep = 0;
     int64_t graph_chunk      = 0;      // llama_context: a layer-major expert graph's chunk rows, 0 = none
     bool experts_on_cpu(int64_t n_tok) const {
+        if (cpu_repack_on.load()) {
+            return true;
+        }
         if (uma_gpu_pool) {
             return false;
         }
