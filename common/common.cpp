@@ -1930,6 +1930,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.moe_stream_layer_major_batch    = params.moe_stream_layer_major_batch;
     mparams.moe_stream_vram_end_fill        = params.moe_stream_vram_end_fill;
     mparams.moe_stream_copy_ahead           = params.moe_stream_copy_ahead;
+    mparams.moe_stream_tail_wave_w          = params.moe_stream_tail_wave_w;
     mparams.moe_stream_vram_lend_prompt     = params.moe_stream_vram_lend_prompt;
     mparams.moe_stream_vram_lend_short      = params.moe_stream_vram_lend_short;
     mparams.moe_stream_timing               = params.moe_stream_timing;

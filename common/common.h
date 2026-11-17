@@ -922,6 +922,7 @@ struct common_params {
     int32_t     moe_stream_layer_major_batch = 0; // the cap of the engine's n_batch raise (0 = the context size)
     int32_t     moe_stream_vram_end_fill     = 0; // the GPU tail refilled at a prompt's end (0 = off, 1, 2)
     int32_t     moe_stream_copy_ahead        = 0; // GPU prompts copy the next layer's experts ahead (0 = off, 1)
+    int32_t     moe_stream_tail_wave_w       = 0; // > 0 = cap GPU tail wave width to N experts (0 = off)
     int32_t     moe_stream_vram_lend_prompt  = 0; // a prompt's big GPU tensors in lent VRAM pool places (0 = off, 1)
     int32_t     moe_stream_vram_lend_short   = 64; // prompt calls of at most N tokens in the real compute buffer
     int32_t     moe_stream_timing            = 0; // 1 = measure where a call's time goes (host, device, copies, syncs), report it per word

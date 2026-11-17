@@ -244,6 +244,7 @@ struct llama_moe_stream_p1 {
     // --moe-stream-async-h2d 1 - CPU -> GPU split inputs in the GPU's pinned host buffer as async
     // H2D copies on the GPU's stream, no host wait (llama-context turns it on in the scheduler: one GPU, no pipeline parallelism)
     bool        async_h2d            = false;
+    int32_t     tail_wave_w          = 0;       // --moe-stream-tail-wave-w N (0 = off): narrow GPU-staged PCIe wave width
     int64_t     vram_chunk           = 0;       // --moe-stream-vram-chunk SIZE (1 = auto <= 2 GiB, > 1 = bytes, 0 = off)
     bool        uma                  = false;   // --moe-stream-uma 1
     ggml_backend_dev_t uma_dev       = nullptr; // active unified-memory GPU device selected at model load
@@ -1609,6 +1610,7 @@ struct llama_moe_stream {
     // Three pieces for --moe-stream-g1-ahead; nothing calls them
     // unless that setting or the test switches below are on
     uint32_t tailw_wave_w = 0;   // (c) the wave width of a tail-wave graph (graph and remap op alike), 0 = the plain width; option A sets the half places
+    int n_waves_narrow(int64_t n_tok) const;
     // (a) which experts of a list are READY in this layer's RAM: slots[i] = the slot of es[i], -1 = not READY (absent, being read,
     // cancelled, switched off, a low-only call's slot above the start size - wave_plan's misses). (b) keep_wave >= 0: every READY one is
     // kept for that wave of this call (no eviction, no window move, no drop) until that wave's remap op of this layer, or the call's end.

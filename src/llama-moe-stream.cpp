@@ -2642,14 +2642,15 @@ llama_moe_stream::llama_moe_stream(
                                   : std::max<int64_t>(0, std::min<int64_t>(ram_budget > 0 ? ram_budget : INT64_MAX,
                                                                            mem_available - std::max<int64_t>(0, ram_free) - other_bytes))/one_place;
                     slots = std::max<int64_t>(3*(int64_t) mi.n_expert_used, std::min<int64_t>(slots, n_expert));
+                    const int64_t tw   = p1.tail_wave_w > 0 ? std::min<int64_t>(slots, p1.tail_wave_w) : slots;
                     const int64_t rows = std::min<int64_t>(n_expert, p1.wl_ubatch*(int64_t) mi.n_expert_used);
-                    if (rows > slots || (p1.copy_ahead > 0 && slots >= (int64_t) n_expert)) {   // (a GPU-wave graph can run)
+                    if (rows > tw || (p1.copy_ahead > 0 && slots >= (int64_t) n_expert)) {   // (a GPU-wave graph can run)
                         int64_t mode_b = 0;
                         int32_t mode_n = 0;
                         for (const auto & [b, c] : n_of_size) {
                             if (c > mode_n) { mode_b = b; mode_n = c; }
                         }
-                        tail_n = slots + (int64_t) mi.n_expert_used;
+                        tail_n = tw + (int64_t) mi.n_expert_used;
                         tail_b = tail_n*mode_b;
                     }
                 }
@@ -3419,7 +3420,13 @@ llama_moe_stream::llama_moe_stream(
     // Test-only switches for the window, read once
     lm_test_clobber = getenv("MOE_STREAM_TEST_WIN_CLOBBER") && atoi(getenv("MOE_STREAM_TEST_WIN_CLOBBER")) != 0;
     lm_test_reads   = getenv("MOE_STREAM_TEST_LM_READS")    && atoi(getenv("MOE_STREAM_TEST_LM_READS"))    != 0;
-    tailw_want         = tailw_want || (getenv("MOE_STREAM_TEST_WIN_GATHER") && atoi(getenv("MOE_STREAM_TEST_WIN_GATHER")) != 0) ||
+    if (p1.tail_wave_w > 0) {
+        tailw_wave_w = (uint32_t) p1.tail_wave_w;
+    }
+    if (getenv("MOE_STREAM_TEST_TAIL_WAVE_W") && atoi(getenv("MOE_STREAM_TEST_TAIL_WAVE_W")) > 0) {
+        tailw_wave_w = (uint32_t) atoi(getenv("MOE_STREAM_TEST_TAIL_WAVE_W"));
+    }
+    tailw_want         = tailw_want || tailw_wave_w > 0 || (getenv("MOE_STREAM_TEST_WIN_GATHER") && atoi(getenv("MOE_STREAM_TEST_WIN_GATHER")) != 0) ||
                       p1.copy_ahead;   // copy-ahead runs in the tail waves' gather
     tailw_test_off     = getenv("MOE_STREAM_TEST_WIN_NOGATHER") && atoi(getenv("MOE_STREAM_TEST_WIN_NOGATHER")) != 0;
     tailw_test_move    = getenv("MOE_STREAM_TEST_WIN_TAIL_MOVE")  && atoi(getenv("MOE_STREAM_TEST_WIN_TAIL_MOVE"))  != 0;
@@ -3433,10 +3440,7 @@ llama_moe_stream::llama_moe_stream(
         fprintf(stderr, "%s: TEST ONLY: prompt split's pieces on (MOE_STREAM_TEST_PROMPT_SPLIT=%d, MOE_STREAM_TEST_PROMPT_SPLIT_BORROW=%d)\n", __func__, psplit_test,
                 psplit_test_borrow);
     }
-    if (getenv("MOE_STREAM_TEST_TAIL_WAVE_W") && atoi(getenv("MOE_STREAM_TEST_TAIL_WAVE_W")) > 0) {
-        tailw_wave_w = (uint32_t) atoi(getenv("MOE_STREAM_TEST_TAIL_WAVE_W"));
-    }
-    if (ahead_test || tailw_wave_w > 0) {
+    if (ahead_test || (tailw_wave_w > 0 && p1.tail_wave_w == 0)) {
         fprintf(stderr, "%s: TEST ONLY: %s%s%u\n", __func__, ahead_test ? "MOE_STREAM_TEST_AHEAD (every wave op keeps the next wave's "
                 "READY experts), " : "", "tail wave width ", tailw_wave_w);
     }
@@ -9516,12 +9520,9 @@ void llama_moe_stream::rs_restamp(llama_moe_stream_layer & sl) {
 
 // the number of waves a ubatch of n_tok tokens can need: the ubatch selects at most
 // n_tok*k distinct experts and never more than the n_expert of a layer, and one wave holds n_slots
-int llama_moe_stream::n_waves(int64_t n_tok) const {
-    const int nb = n_waves_base(n_tok);
-    // A tail-wave graph's waves at tailw_wave_w (half the places), so the graph and its remap ops count the same waves.
-    // A ubatch of one wave at the full width stays one wave (no tail waves), so every "> 1" / "== 1" test reads the same either way
-    if (tailw_wave_w == 0 || nb <= 1 || !tailw_graph(n_tok)) {
-        return nb;
+int llama_moe_stream::n_waves_narrow(int64_t n_tok) const {
+    if (tailw_wave_w == 0) {
+        return n_waves_base(n_tok);
     }
     int64_t n_max = (int64_t) n_expert_total - (vx_test_empty || (p1.vram_follow && !vf_old_waves) ? 0 : (int64_t) p1.vram_experts);
     if (n_tok > 0) {
@@ -9530,6 +9531,14 @@ int llama_moe_stream::n_waves(int64_t n_tok) const {
     const uint32_t ns = std::min<uint32_t>(el_wave_w > 0 ? el_wave_w : n_slots, tailw_wave_w);
     const int n_bound = n_max <= 0 ? 1 : (int) ((n_max + ns - 1)/ns);
     return max_waves > 0 ? std::max(1, std::min(n_bound, (int) max_waves)) : n_bound;
+}
+
+int llama_moe_stream::n_waves(int64_t n_tok) const {
+    const int nb = n_waves_base(n_tok);
+    if (tailw_wave_w == 0 || !tailw_graph(n_tok)) {
+        return nb;
+    }
+    return n_waves_narrow(n_tok);
 }
 
 int llama_moe_stream::n_waves_base(int64_t n_tok) const {
@@ -15349,7 +15358,10 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
     else if (!p1.vram_follow)          { tail_why = "needs --moe-stream-vram-follow 1 (the follower refills the places)"; }
     else if (vx_test_empty)            { tail_why = "MOE_STREAM_VRAM_TEST_EMPTY"; }
     else if (el_on || sh_on)           { tail_why = "elastic RAM / moving shares"; }
-    else if (n_ubatch < (int64_t) gpu_waves || (n_waves(n_ubatch) <= 1 && !(p1.copy_ahead && ca_all_held))) { tail_why = "no GPU-wave graph can run (the ubatch is under --moe-stream-gpu-waves or needs one wave)"; }
+    else if (n_ubatch < (int64_t) gpu_waves ||
+             (n_waves_base(n_ubatch) <= 1 && !(tailw_wave_w > 0 && n_waves_narrow(n_ubatch) > 1) && !(p1.copy_ahead && ca_all_held))) {
+        tail_why = "no GPU-wave graph can run (the ubatch is under --moe-stream-gpu-waves or needs one wave)";
+    }
     else {
         // The tail lives in ONE pool group's tensors - the group with the most streamed layers (Ling: its only group); a GPU-wave
         // pool copy of any layer, whatever its format, gets its bytes there (tail_copy_hook places it by byte offset), so the tail is sized for
@@ -15399,7 +15411,8 @@ bool llama_moe_stream::vx_setup(ggml_backend_dev_t dev, ggml_backend_buffer_type
                    : !shape ? "a pool slice is not one VRAM place (merged gate|up or another type)" : "";
             tailw_ready = tailw_why.empty();
             if (tailw_ready) {
-                T = std::min<int64_t>(T, (int64_t) n_slots + n_zero);
+                const uint32_t tw = tailw_wave_w > 0 ? std::min<uint32_t>(n_slots, tailw_wave_w) : n_slots;
+                T = std::min<int64_t>(T, (int64_t) tw + n_zero);
             } else {
                 fprintf(stderr, "%s: tail waves (the gather copy) are off: %s - GPU waves keep the scheduler's pool copy\n", __func__, tailw_why.c_str());
             }
@@ -17204,7 +17217,7 @@ bool llama_moe_stream::vf_switch(std::unique_lock<std::mutex> & lock, vf_job_t &
 // "waves on the GPU": gpu-waves on, enough tokens, no repacked pool, and the ubatch needs waves at all)
 bool llama_moe_stream::tail_graph(int64_t n_tok) const {
     return tail_on && gpu_waves > 0 && n_tok >= (int64_t) gpu_waves && !cpu_repack_on.load() &&
-           (n_waves_base(n_tok) > 1 || ca_one_wave);   // (n_waves asks tailw_graph) (copy-ahead: one-wave prompts take tail waves)
+           (n_waves_base(n_tok) > 1 || (tailw_ready && tailw_wave_w > 0 && n_waves_narrow(n_tok) > 1) || ca_one_wave);
 }
 
 // a call (one llama_decode) of n_tok_all tokens: its biggest ubatch is min(n_tok_all, n_ubatch)
