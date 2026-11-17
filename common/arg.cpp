@@ -5199,9 +5199,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--moe-stream-cpu-repack"}, "BOOL",
-        "keep the expert pools in llama.cpp's repacked CPU layout, letting expert MUL_MAT_ID use the repacked "
-        "CPU kernels across both decode and multi-wave prompt ubatches (measured 2.2x on the expert matmul at "
-        "the cost of converting each read on an I/O thread; default: 0)",
+        "keep the expert pools in llama.cpp's repacked CPU layout, so the expert MUL_MAT_ID uses the repacked CPU "
+        "kernels (decode and multi-wave prompts). Every read is converted on an I/O thread, a repacked pool is never "
+        "copied to the GPU, and the engine's own CPU expert kernels are not used: measured slower than the default on "
+        "Ling-3.0-flash and Flint (GPU machine: replies -22 %, long prompts 3-8x slower; CPU-only: replies -8 %) (default: 0)",
         [](common_params & params, int value) {
             params.moe_stream_cpu_repack = value;
         }
