@@ -211,6 +211,44 @@ static std::string fast_cpus() {
 #endif
 }
 
+// GB/s one GPU reads quantized weights at: four 4096 x 28672 Q4_K matrices (~66 MB each, more than any GPU cache) times a
+// vector on that GPU, the median of the runs in `seconds`. 0 when the GPU cannot take them. The engine fills the fastest
+// memory first, so the caller ranks the cards by this
+static double gpu_gbps(ggml_backend_dev_t d, double seconds) {
+    const int64_t K = 4096, N = 28672, M = 4;
+    ggml_init_params ip = { /*.mem_size =*/ 16*ggml_tensor_overhead() + ggml_graph_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
+    ggml_cgraph * gf = ggml_new_graph(ctx);
+    size_t bytes = 0;
+    for (int i = 0; i < M; i++) {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, K, N);
+        bytes += ggml_nbytes(w);
+        ggml_build_forward_expand(gf, ggml_mul_mat(ctx, w, x));
+    }
+    double gbps = 0;
+    ggml_backend_t be = ggml_backend_dev_init(d, nullptr);
+    ggml_backend_buffer_t buf = be ? ggml_backend_alloc_ctx_tensors(ctx, be) : nullptr;
+    if (buf) {
+        ggml_backend_buffer_clear(buf, 0);
+        ggml_backend_graph_compute(be, gf);   // warm-up
+        std::vector<double> runs;
+        const auto t0 = std::chrono::steady_clock::now();
+        do {
+            const auto a = std::chrono::steady_clock::now();
+            ggml_backend_graph_compute(be, gf);
+            ggml_backend_synchronize(be);
+            runs.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count());
+        } while (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds || runs.size() < 3);
+        std::nth_element(runs.begin(), runs.begin() + runs.size()/2, runs.end());
+        gbps = bytes/runs[runs.size()/2]/1e9;
+        ggml_backend_buffer_free(buf);
+    }
+    if (be) { ggml_backend_free(be); }
+    ggml_free(ctx);
+    return gbps;
+}
+
 int main(int argc, char ** argv) {
     double seconds = 0.15;   // timed work per thread count
     std::string file;
@@ -352,7 +390,10 @@ int main(int argc, char ** argv) {
         size_t free = 0, total = 0;
         ggml_backend_dev_memory(d, &free, &total);
         std::string & list = type == GGML_BACKEND_DEVICE_TYPE_GPU ? gpus : igpus;
-        list += (list.empty() ? "" : ", ") + std::string("{\"name\": \"") + ggml_backend_dev_name(d) + "\", \"mib\": " + std::to_string(total >> 20) + "}";
+        char gb[32];
+        snprintf(gb, sizeof(gb), "%.0f", gpu_gbps(d, seconds));
+        list += (list.empty() ? "" : ", ") + std::string("{\"name\": \"") + ggml_backend_dev_name(d) + "\", \"mib\": " + std::to_string(total >> 20) +
+                ", \"gbps\": " + gb + "}";
     }
 
     printf("{\"gpus\": [%s], \"igpus\": [%s], \"physical_cores\": %d, \"threads\": %d, \"saturation\": %d, \"fast_cpus\": \"%s\", \"side_load\": %s, \"gbps\": [", gpus.c_str(), igpus.c_str(), phys, threads, sat, fast.c_str(), readable ? "true" : "false");
