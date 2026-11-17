@@ -1451,11 +1451,14 @@ uint32_t llama_kv_cache::get_n_rot_v(bool rule_default) const {
     return (rule_default ? attn_rot_v_default : attn_rot_v) ? 64 : 0;
 }
 
-ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx, int32_t n_rot_override) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        const int nrot = (int) get_n_rot_k();
+        const int nrot = n_rot_override > 0 ? (int) n_rot_override : (int) get_n_rot_k();
+        if (!attn_rot_hadamard.count(nrot)) {
+            return nullptr;
+        }
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -2980,8 +2983,8 @@ ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, con
     return kv->build_input_v_idxs(ctx, ubatch);
 }
 
-ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
-    return kv->build_input_k_rot(ctx);
+ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx, int32_t n_rot_override) const {
+    return kv->build_input_k_rot(ctx, n_rot_override);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) const {

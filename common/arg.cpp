@@ -2707,6 +2707,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--kv-hadamard"}, "0|1",
+        "enable (1) or disable (0) orthonormal Walsh-Hadamard outlier rotation on quantized KV and sparse indexer caches",
+        [](common_params & params, int value) {
+            params.kv_hadamard = value != 0 ? 1 : 0;
+        }
+    ).set_env("LLAMA_ARG_KV_HADAMARD"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

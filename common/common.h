@@ -350,6 +350,7 @@ struct common_params_speculative_draft {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    int32_t   kv_hadamard  = -1;            // -1 = auto, 0 = force off, 1 = force on Walsh-Hadamard KV rotation
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -596,6 +597,7 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    int32_t   kv_hadamard  = -1;            // -1 = auto, 0 = force off, 1 = force on Walsh-Hadamard KV rotation
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

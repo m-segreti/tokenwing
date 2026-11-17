@@ -10,6 +10,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
+#include "../src/llama-ext.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1363,6 +1364,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
+    }
+
+    if (params.kv_hadamard >= 0) {
+        llama_model_set_attn_rot(model, params.kv_hadamard != 0);
     }
 
     pimpl->model.reset(model);
