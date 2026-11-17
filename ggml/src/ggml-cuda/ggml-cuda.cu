@@ -210,7 +210,8 @@ static bool ggml_cuda_direct_copy(int src_physical, int dst_physical) {
         return false;
     }
 #if defined(GGML_USE_HIP)
-    return ggml_cuda_info().peer[src_physical][dst_physical];
+    // both ways: the driver may answer differently per direction, and either card may drive the copy
+    return ggml_cuda_info().peer[src_physical][dst_physical] && ggml_cuda_info().peer[dst_physical][src_physical];
 #else
     GGML_UNUSED(src_physical); GGML_UNUSED(dst_physical);
     return true;
