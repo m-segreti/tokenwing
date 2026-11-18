@@ -11,7 +11,7 @@
   <a href="https://github.com/sponsors/HarinManiK">❤️ Sponsor</a>
 </p>
 
-<p align="center"><b>Downloads for Windows and Linux open on Nov 17 at 9:30 PM IST (4:00 PM UTC).</b></p>
+<p align="center"><b>Download:</b> the build for your GPU from the <a href="https://github.com/runmyai/tokenwing/releases/latest">latest release</a>, or get <a href="https://runmyai.org/download.html">Run My AI</a>, which sets it up for you.</p>
 
 TokenWing is the engine inside [Run My AI](https://github.com/runmyai/run-my-ai). It streams the routed experts of MoE models from NVMe, so models far larger than your memory run at a usable speed. It is built on [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
@@ -57,7 +57,7 @@ You could technically run even a trillion-parameter model, if the math checks ou
 | **SSD** | NVMe, PCIe 3.0 or above. |
 | **Memory** | We're targeting 35-40B-class models on 16 GB RAM CPU-only builds, and 120B-class models on at least 24 GB of RAM and 8 GB of VRAM. With less it still runs, only slower. |
 | **GPU** | NVIDIA or AMD, one or several, or CPU only. |
-| **System** | Windows or Linux. macOS on Apple Silicon comes after launch. |
+| **System** | Windows or Linux. macOS on Apple Silicon is coming soon. |
 
 ## Models
 
@@ -65,7 +65,7 @@ You could technically run even a trillion-parameter model, if the math checks ou
 |---|---|---|
 | [Flint 40B](https://huggingface.co/runmyai/Flint-40B-TokenWing) | Coding model by Recursive. 40B total, about 2.5B active per token. | Q4_K_XL, about 25 GB |
 | [Ling 3.0 Flash](https://huggingface.co/runmyai/Ling-3.0-Flash-TokenWing) | 124B total, 5.1B active per token. 262k context. | MXFP4, about 70 GB |
-| Qwen 4 if it's out by Nov 17, or Qwen 3.8 Flash Next | | Qwen 3.8 Flash Next: ISTA IQ3_S and UD-Q4_K_XL |
+| [Qwen 3.8 Flash Next](https://huggingface.co/runmyai/Qwen3.8-Flash-Next-TokenWing) | By Qwen. | 3.5 bpw by Grawnch, about 84 GB with its n-gram table |
 
 ## Features
 
