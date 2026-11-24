@@ -420,7 +420,10 @@ static void gguf_merge(const split_params & split_params) {
 
     auto * ctx_out = gguf_init_empty();
 
-    std::vector<uint8_t> read_data;
+    // Keep merging bounded even when a model contains a single enormous tensor.
+    // BF16 MoE models can have tensors larger than host RAM, so allocating one
+    // buffer per tensor makes an otherwise sequential copy impossible.
+    std::vector<uint8_t> read_data(16 * 1024 * 1024);
     std::vector<ggml_context *> ctx_metas;
     std::vector<gguf_context *> ctx_ggufs;
 
@@ -542,16 +545,19 @@ static void gguf_merge(const split_params & split_params) {
 
             auto n_bytes = ggml_nbytes(t);
 
-            if (read_data.size() < n_bytes) {
-                read_data.resize(n_bytes);
-            }
-
             auto offset = gguf_get_data_offset(ctx_gguf) + gguf_get_tensor_offset(ctx_gguf, i_tensor);
             f_input.seekg(offset);
-            f_input.read((char *)read_data.data(), n_bytes);
+            size_t remaining = n_bytes;
+            while (remaining > 0) {
+                const size_t chunk = std::min(remaining, read_data.size());
+                f_input.read((char *) read_data.data(), chunk);
+                if (!split_params.dry_run) {
+                    fout.write((const char *) read_data.data(), chunk);
+                }
+                remaining -= chunk;
+            }
             if (!split_params.dry_run) {
-                // write tensor data + padding
-                fout.write((const char *)read_data.data(), n_bytes);
+                // write tensor padding after all chunks
                 zeros(fout, GGML_PAD(n_bytes, GGUF_DEFAULT_ALIGNMENT) - n_bytes);
             }
         }
