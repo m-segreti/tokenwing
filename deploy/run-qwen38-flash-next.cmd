@@ -5,6 +5,7 @@ if not defined CONTAINER_NAME set "CONTAINER_NAME=morrigan-tokenwing-qwen38"
 if not defined MODEL_DIR set "MODEL_DIR=E:\tokenwing\models\qwen38-flash-next"
 if not defined CACHE_DIR set "CACHE_DIR=E:\tokenwing\cache\qwen38-flash-next"
 if not defined MODEL_FILE set "MODEL_FILE=Qwen3.8-Flash-Next-WV-v5-3.5bpw.tokenwing-00001-of-00002.gguf"
+if not defined MMPROJ_FILE set "MMPROJ_FILE=mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
 if not defined HOST_PORT set "HOST_PORT=8084"
 if not defined USE_CONTROL_SIDECARS set "USE_CONTROL_SIDECARS=1"
 
@@ -40,6 +41,9 @@ docker run -d ^
   --health-start-period 30m ^
   morrigan/tokenwing:c702b7e-cuda13-sm86 ^
   -m /models/%MODEL_FILE% ^
+  --mmproj /models/%MMPROJ_FILE% ^
+  --no-mmproj-offload ^
+  --image-min-tokens 1024 ^
   --load-mode dio ^
   -fit off ^
   -ngl 99 ^
@@ -57,7 +61,7 @@ docker run -d ^
   --cache-disk-checkpoints 2 ^
   --ctx-checkpoints 2 ^
   --moe-stream model ^
-  --moe-stream-ram-free 1GiB ^
+  --moe-stream-ram-free 2GiB ^
   --moe-stream-overlap 1 ^
   --moe-stream-pred-shared 1 ^
   --moe-stream-chunk-prefetch 512 ^
